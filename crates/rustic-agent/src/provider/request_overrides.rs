@@ -29,7 +29,12 @@ pub fn apply_request_overrides(body: &mut Value, ov: &RequestParamOverrides, dia
     apply_scalar(body, &ov.top_p, dialect, "top_p");
     apply_reasoning_effort(body, &ov.reasoning_effort, dialect);
     apply_thinking_budget(body, &ov.thinking_budget, dialect);
-    apply_scalar(body, &ov.parallel_tool_calls, dialect, "parallel_tool_calls");
+    apply_scalar(
+        body,
+        &ov.parallel_tool_calls,
+        dialect,
+        "parallel_tool_calls",
+    );
     apply_tool_choice(body, &ov.tool_choice, dialect);
     apply_scalar(body, &ov.stop, dialect, "stop");
     for name in &ov.omit_params {
@@ -93,7 +98,10 @@ fn apply_max_tokens(body: &mut Value, ov: &RequestParamOverrides, dialect: BodyD
                 }
             }
             MaxTokensKey::MaxTokens => {
-                if let Some(v) = body.as_object_mut().and_then(|o| o.remove("max_completion_tokens")) {
+                if let Some(v) = body
+                    .as_object_mut()
+                    .and_then(|o| o.remove("max_completion_tokens"))
+                {
                     body["max_tokens"] = v;
                 }
             }
@@ -142,7 +150,9 @@ fn apply_reasoning_effort(body: &mut Value, ov: &ParamOverride, dialect: BodyDia
                 set_path(body, "reasoning.effort", value.clone());
             }
         }
-        (ParamOverride::Send { value }, OpenAiResponses) => set_path(body, "reasoning.effort", value.clone()),
+        (ParamOverride::Send { value }, OpenAiResponses) => {
+            set_path(body, "reasoning.effort", value.clone())
+        }
         // Claude / Gemini expose effort through thinking budgets, not an effort enum.
         (_, Claude | Gemini) => {}
     }
@@ -163,7 +173,11 @@ fn apply_thinking_budget(body: &mut Value, ov: &ParamOverride, dialect: BodyDial
             }
         }
         (ParamOverride::Send { value }, Gemini) => {
-            set_path(body, "generationConfig.thinkingConfig.thinkingBudget", value.clone());
+            set_path(
+                body,
+                "generationConfig.thinkingConfig.thinkingBudget",
+                value.clone(),
+            );
         }
         (_, OpenAiChat | OpenAiResponses) => {}
     }
@@ -249,7 +263,9 @@ fn deep_merge(base: &mut Value, extra: &Value) {
         (Value::Object(b), Value::Object(e)) => {
             for (k, v) in e {
                 match b.get_mut(k) {
-                    Some(existing) if existing.is_object() && v.is_object() => deep_merge(existing, v),
+                    Some(existing) if existing.is_object() && v.is_object() => {
+                        deep_merge(existing, v)
+                    }
                     _ => {
                         b.insert(k.clone(), v.clone());
                     }
@@ -274,7 +290,9 @@ pub fn unsupported_param_from_error(err: &str) -> Option<String> {
         "unknown field:",
         "extra inputs are not permitted",
     ];
-    let start = markers.iter().find_map(|m| lower.find(m).map(|i| i + m.len()))?;
+    let start = markers
+        .iter()
+        .find_map(|m| lower.find(m).map(|i| i + m.len()))?;
     let rest = &err[start..];
     let ident: String = rest
         .chars()
@@ -332,7 +350,10 @@ mod tests {
         o.temperature = ParamOverride::Omit;
         o.top_p = ParamOverride::Send { value: json!(0.9) };
         apply_request_overrides(&mut body, &o, BodyDialect::Gemini);
-        assert_eq!(body, json!({ "temperature": 0.7, "generationConfig": { "topP": 0.9 } }));
+        assert_eq!(
+            body,
+            json!({ "temperature": 0.7, "generationConfig": { "topP": 0.9 } })
+        );
     }
 
     #[test]
@@ -352,7 +373,9 @@ mod tests {
     fn tool_choice_maps_to_claude_shape() {
         let mut body = json!({});
         let mut o = ov();
-        o.tool_choice = ParamOverride::Send { value: json!("required") };
+        o.tool_choice = ParamOverride::Send {
+            value: json!("required"),
+        };
         apply_request_overrides(&mut body, &o, BodyDialect::Claude);
         assert_eq!(body, json!({ "tool_choice": { "type": "any" } }));
     }
@@ -360,10 +383,17 @@ mod tests {
     #[test]
     fn parses_unsupported_parameter_errors() {
         let e = "OpenAI API error 400 Bad Request: { \"error\": { \"message\": \"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.\" } }";
-        assert_eq!(unsupported_param_from_error(e).as_deref(), Some("max_tokens"));
-        assert_eq!(suggested_replacement_param(e).as_deref(), Some("max_completion_tokens"));
         assert_eq!(
-            unsupported_param_from_error("Unrecognized request argument supplied: top_k").as_deref(),
+            unsupported_param_from_error(e).as_deref(),
+            Some("max_tokens")
+        );
+        assert_eq!(
+            suggested_replacement_param(e).as_deref(),
+            Some("max_completion_tokens")
+        );
+        assert_eq!(
+            unsupported_param_from_error("Unrecognized request argument supplied: top_k")
+                .as_deref(),
             Some("top_k")
         );
         assert!(unsupported_param_from_error("rate limit exceeded").is_none());

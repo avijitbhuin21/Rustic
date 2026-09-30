@@ -8,7 +8,8 @@
 use crate::state::AppState;
 use crate::sync_ext::MutexExt;
 use rustic_agent::{
-    LoadProjectScopeResult, McpConnectResult, McpScope, McpServerWithStatus, ToolDef,
+    LoadProjectScopeResult, McpConnectResult, McpProjectSaveResult, McpProjectServerView, McpScope,
+    McpServerWithStatus, ToolDef,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -162,7 +163,11 @@ pub async fn list_mcp_servers(
             let _ = mcp.load_project_scope_gated(&p);
         }
         let _ = mcp.connect_all();
-        Ok(mcp.list_servers_with_status())
+        Ok(if project_id.is_none() {
+            mcp.list_pool_servers_with_status()
+        } else {
+            mcp.list_servers_with_status()
+        })
     })
     .await
     .map_err(|e| format!("list_mcp_servers task panicked: {}", e))?
@@ -313,4 +318,157 @@ pub async fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result
     })
     .await
     .map_err(|e| format!("remove_mcp_server task panicked: {}", e))?
+}
+
+/// One workspace project as seen by the per-project MCP UI.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpProjectRow {
+    pub project_id: String,
+    pub project_name: String,
+    pub root_path: String,
+    pub view: Option<McpProjectServerView>,
+    pub error: Option<String>,
+}
+
+/// Result of adding a server: pool connection test plus per-project writes.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAddResult {
+    pub pool: McpSaveResult,
+    pub projects: Vec<McpProjectAddOutcome>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpProjectAddOutcome {
+    pub project_id: String,
+    pub project_name: String,
+    pub result: Option<McpProjectSaveResult>,
+    pub error: Option<String>,
+}
+
+/// (id, name, root) for every project open in the workspace.
+fn workspace_projects(state: &State<'_, AppState>) -> Vec<(String, String, PathBuf)> {
+    state
+        .workspace
+        .lock_safe()
+        .list_projects()
+        .into_iter()
+        .map(|p| (p.id.to_string(), p.name.clone(), p.root_path.clone()))
+        .collect()
+}
+
+/// Add one server to the global pool, write it into the selected projects'
+/// `.mcp.json`/`.gemini`/`.codex` files, and disable it in the rest.
+#[tauri::command]
+pub async fn add_mcp_pool_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    entry: serde_json::Value,
+    project_ids: Vec<String>,
+) -> Result<McpAddResult, String> {
+    let user_path = resolve_scope_path(&app, &state, McpScope::User, None)?;
+    let projects = workspace_projects(&state);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
+    tokio::task::spawn_blocking(move || -> Result<McpAddResult, String> {
+        let mut mcp = mcp_arc.lock_safe();
+        mcp.set_user_path(user_path.clone());
+        let _ = mcp.load_scope(McpScope::User, &user_path);
+        mcp.add_pool_server(&name, &entry)
+            .map_err(|e| e.to_string())?;
+        let pool = match mcp.test_server(&format!("user-{}", name)) {
+            Ok(tools) => McpSaveResult {
+                name: name.clone(),
+                connected: true,
+                tool_count: tools.len(),
+                error: None,
+            },
+            Err(e) => McpSaveResult {
+                name: name.clone(),
+                connected: false,
+                tool_count: 0,
+                error: Some(e.to_string()),
+            },
+        };
+        let mut outcomes = Vec::new();
+        for (pid, pname, root) in projects {
+            let selected = project_ids.contains(&pid);
+            let res = mcp
+                .save_project_server(&root, &name, None, selected, false)
+                .map_err(|e| e.to_string());
+            outcomes.push(McpProjectAddOutcome {
+                project_id: pid,
+                project_name: pname,
+                result: res.as_ref().ok().cloned(),
+                error: res.err(),
+            });
+        }
+        Ok(McpAddResult {
+            pool,
+            projects: outcomes,
+        })
+    })
+    .await
+    .map_err(|e| format!("add_mcp_pool_server task panicked: {}", e))?
+}
+
+/// Per-project view of one pool server across every open project.
+#[tauri::command]
+pub async fn get_mcp_server_projects(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Vec<McpProjectRow>, String> {
+    let user_path = resolve_scope_path(&app, &state, McpScope::User, None)?;
+    let projects = workspace_projects(&state);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
+    tokio::task::spawn_blocking(move || -> Result<Vec<McpProjectRow>, String> {
+        let mut mcp = mcp_arc.lock_safe();
+        mcp.set_user_path(user_path.clone());
+        let _ = mcp.load_scope(McpScope::User, &user_path);
+        Ok(projects
+            .into_iter()
+            .map(|(pid, pname, root)| {
+                let res = mcp.project_server_view(&root, &name);
+                McpProjectRow {
+                    project_id: pid,
+                    project_name: pname,
+                    root_path: root.display().to_string(),
+                    view: res.as_ref().ok().cloned(),
+                    error: res.err().map(|e| e.to_string()),
+                }
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("get_mcp_server_projects task panicked: {}", e))?
+}
+
+/// Save one project's config for a server (or disable it) and test the connection.
+#[tauri::command]
+pub async fn save_mcp_project_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    project_id: String,
+    entry: Option<serde_json::Value>,
+    enabled: bool,
+) -> Result<McpProjectSaveResult, String> {
+    let user_path = resolve_scope_path(&app, &state, McpScope::User, None)?;
+    let root = resolve_scope_path(&app, &state, McpScope::Project, Some(&project_id))?
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| "Project root not found".to_string())?;
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
+    tokio::task::spawn_blocking(move || {
+        let mut mcp = mcp_arc.lock_safe();
+        mcp.set_user_path(user_path.clone());
+        let _ = mcp.load_scope(McpScope::User, &user_path);
+        mcp.save_project_server(&root, &name, entry.as_ref(), enabled, true)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("save_mcp_project_server task panicked: {}", e))?
 }

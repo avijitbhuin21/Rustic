@@ -25,7 +25,7 @@ import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
-import { Section, isTauri } from './shared';
+import { Section, isTauri, useExtensionsChanged } from './shared';
 
 // ─── Skills ──────────────────────────────────────────────────────────────────
 
@@ -141,6 +141,7 @@ export function SkillsSection() {
     } catch { setItems([]); }
   };
   useEffect(() => { refresh(); }, []);
+  useExtensionsChanged(refresh);
 
   const openPreview = async (name) => {
     try {
@@ -238,6 +239,7 @@ export function WorkflowsSection() {
     } catch { setItems([]); }
   };
   useEffect(() => { refresh(); }, []);
+  useExtensionsChanged(refresh);
 
   const openPreview = async (name) => {
     try { const body = await invoke('get_workflow_body', { name }); setPreview({ title: name, body }); }
@@ -495,6 +497,7 @@ export function RulesSection() {
     } catch { setItems([]); }
   };
   useEffect(() => { refresh(); }, [projectRoot]);
+  useExtensionsChanged(refresh);
 
   const openPreview = async (name) => {
     try { const body = await invoke('get_rule_body', { name }); setPreview({ title: name, body }); }

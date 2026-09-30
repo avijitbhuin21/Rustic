@@ -170,7 +170,9 @@ fn reorder_projects(ctx: &ServerContext, project_ids: Vec<String>) -> Result<(),
     Ok(())
 }
 
-fn prune_missing_projects(ctx: &ServerContext) -> Result<Vec<rustic_core::workspace::project::Project>, ApiError> {
+fn prune_missing_projects(
+    ctx: &ServerContext,
+) -> Result<Vec<rustic_core::workspace::project::Project>, ApiError> {
     let missing: Vec<_> = {
         let ws = ctx.state().workspace.lock_safe();
         ws.projects

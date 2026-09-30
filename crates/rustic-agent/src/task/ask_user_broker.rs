@@ -65,26 +65,72 @@ impl AskUserBroker {
             request_id: request_id.clone(),
             questions,
         });
-        match tokio::time::timeout(Duration::from_secs(86_400), rx).await {
+        // If this future is dropped (the run was cancelled — e.g. a peer
+        // message interrupted the turn), the guard removes the stale entry
+        // and tells the UI to close the card, so it can't linger as a second
+        // "running" popup whose answer would be silently lost.
+        let mut guard = PendingGuard {
+            broker: self,
+            event_tx,
+            task_id,
+            request_id: &request_id,
+            armed: true,
+        };
+        let out = match tokio::time::timeout(Duration::from_secs(86_400), rx).await {
             Ok(Ok(response)) => Some(response),
-            _ => {
-                let mut pending = self.pending.lock().unwrap();
-                pending.remove(&request_id);
-                None
-            }
+            _ => None,
+        };
+        if out.is_some() {
+            guard.armed = false;
         }
+        out
     }
 
-    /// Resolve the pending request with the user's answers. Silently
-    /// no-ops if the request_id isn't pending (already responded, timed
-    /// out, or never existed).
-    pub fn respond(&self, request_id: &str, response: AskUserResponse) {
+    /// Resolve the pending request with the user's answers. Returns `false`
+    /// when the request is no longer waiting (already answered, cancelled,
+    /// timed out, or unknown) so the host can tell the user.
+    pub fn respond(&self, request_id: &str, response: AskUserResponse) -> bool {
         let sender = {
             let mut pending = self.pending.lock().unwrap();
             pending.remove(request_id)
         };
-        if let Some(tx) = sender {
-            let _ = tx.send(response);
+        match sender {
+            Some(tx) => tx.send(response).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Number of requests still waiting for an answer.
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+}
+
+/// Cleans up a pending ask_user entry when its waiting future ends without an answer.
+struct PendingGuard<'a> {
+    broker: &'a AskUserBroker,
+    event_tx: &'a EventTx,
+    task_id: &'a str,
+    request_id: &'a str,
+    armed: bool,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let removed = self
+            .broker
+            .pending
+            .lock()
+            .map(|mut p| p.remove(self.request_id).is_some())
+            .unwrap_or(false);
+        if removed {
+            let _ = self.event_tx.try_send(TaskEvent::AskUserCancelled {
+                task_id: self.task_id.to_string(),
+                request_id: self.request_id.to_string(),
+            });
         }
     }
 }
@@ -125,5 +171,51 @@ mod tests {
         let resp = handle.await.expect("join").expect("response");
         assert_eq!(resp.answers["q1"], "hello");
         assert!(!resp.cancelled);
+    }
+
+    #[tokio::test]
+    async fn dropped_request_cleans_up_and_late_answer_is_not_delivered() {
+        let broker = std::sync::Arc::new(AskUserBroker::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TaskEvent>(16);
+        let broker_for_task = broker.clone();
+        let handle = tokio::spawn(async move {
+            broker_for_task
+                .request(
+                    &tx,
+                    "task-1",
+                    json!([{"id": "q1", "text": "?", "kind": "free_text"}]),
+                )
+                .await
+        });
+        let request_id = match rx.recv().await.expect("event") {
+            TaskEvent::AskUserRequest { request_id, .. } => request_id,
+            _ => panic!("expected AskUserRequest"),
+        };
+        assert_eq!(broker.pending_count(), 1);
+        handle.abort();
+        let _ = handle.await;
+        match rx.recv().await.expect("cancel event") {
+            TaskEvent::AskUserCancelled {
+                request_id: id,
+                task_id,
+            } => {
+                assert_eq!(id, request_id);
+                assert_eq!(task_id, "task-1");
+            }
+            _ => panic!("expected AskUserCancelled"),
+        }
+        assert_eq!(broker.pending_count(), 0, "stale entry must be removed");
+        let delivered = broker.respond(
+            &request_id,
+            AskUserResponse {
+                answers: json!({"q1": "late"}),
+                cancelled: false,
+                images: Vec::new(),
+            },
+        );
+        assert!(
+            !delivered,
+            "answer to an interrupted question must report non-delivery"
+        );
     }
 }

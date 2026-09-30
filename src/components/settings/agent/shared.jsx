@@ -37,6 +37,17 @@ import { ToolsSection } from './tools-section';
 // settings sections import it from './shared'.
 export const isTauri = isTauriAvailable;
 
+/** Re-run `onChange` whenever the agent installs/uninstalls an extension (issue #11). */
+export function useExtensionsChanged(onChange) {
+  const ref = useRef(onChange);
+  ref.current = onChange;
+  useEffect(() => {
+    const handler = () => ref.current?.();
+    window.addEventListener('rustic:extensions-changed', handler);
+    return () => window.removeEventListener('rustic:extensions-changed', handler);
+  }, []);
+}
+
 // Provider errors come back as `HTTP 401: {"error":{"message":"…"}}` (or a
 // bare string). Pull out the human part so the user reads "Incorrect API key
 // provided" instead of a wall of raw JSON.

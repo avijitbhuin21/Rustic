@@ -57,7 +57,9 @@ fn parse_seconds(params: &Value) -> std::result::Result<f64, String> {
     }
     .ok_or_else(|| format!("`seconds` must be a number, got {raw}"))?;
     if !secs.is_finite() || secs < 0.0 {
-        return Err(format!("`seconds` must be a finite non-negative number, got {secs}"));
+        return Err(format!(
+            "`seconds` must be a finite non-negative number, got {secs}"
+        ));
     }
     Ok(secs)
 }

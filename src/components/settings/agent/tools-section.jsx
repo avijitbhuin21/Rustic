@@ -26,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 import { Section, isTauri, slugify, useAiConfig } from './shared';
+import { SearchableSelect } from '@/components/ui/searchable-select';
 import { SubAgentSection } from './subagent-section';
 
 // ─── Tools ───────────────────────────────────────────────────────────────────
@@ -159,30 +160,21 @@ export function MediaToolDialog({ open, onClose, title, badge, hint, providers, 
           </div>
           <div>
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Model</div>
-            <Select value={model} onValueChange={setModel} disabled={!providerKey}>
-              <SelectTrigger className="h-8 text-xs">
-                <SelectValue placeholder={
-                  !providerKey
-                    ? 'Pick a provider first'
-                    : modelsLoading
-                      ? 'Loading models…'
-                      : 'Pick a model…'
-                } />
-              </SelectTrigger>
-              <SelectContent>
-                {/* Surface the saved model even when it isn't in the fetched
-                    list (custom id, fetch failed) so the trigger isn't blank. */}
-                {model && !(providerModels || []).includes(model) && (
-                  <SelectItem key={model} value={model}>{model}</SelectItem>
-                )}
-                {(providerModels || []).map((m) => (
-                  <SelectItem key={m} value={m}>{m}</SelectItem>
-                ))}
-                {providerKey && !modelsLoading && (providerModels || []).length === 0 && !model && (
-                  <div className="px-2 py-1.5 text-xs text-muted-foreground">No models returned.</div>
-                )}
-              </SelectContent>
-            </Select>
+            <SearchableSelect
+              value={model}
+              onValueChange={setModel}
+              disabled={!providerKey}
+              options={providerModels || []}
+              placeholder={
+                !providerKey
+                  ? 'Pick a provider first'
+                  : modelsLoading
+                    ? 'Loading models…'
+                    : 'Pick a model…'
+              }
+              searchPlaceholder="Search models…"
+              emptyText={modelsLoading ? 'Loading models…' : 'No models returned.'}
+            />
           </div>
           <div>
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Max per call (1–{maxLimit})</div>

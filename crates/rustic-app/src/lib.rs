@@ -17,6 +17,7 @@ pub mod config;
 pub mod context;
 pub mod external_agents;
 pub mod github_download;
+pub mod meta_sync;
 pub mod notebook_kernel;
 pub mod path_scope;
 pub mod preview_ops;
@@ -24,6 +25,7 @@ pub mod search_ops;
 pub mod secrets;
 pub mod state;
 pub mod sync_ext;
+pub mod transfer;
 pub mod watcher;
 
 pub use bootstrap::{bootstrap, Bootstrapped};

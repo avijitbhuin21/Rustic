@@ -24,6 +24,10 @@ use serde_json::{json, Value};
 
 /// Route an extension-tool call to its handler, enforcing the shared gates.
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    // Read-only: allowed in every mode and for sub-agents.
+    if name == "list_extensions" {
+        return list_extensions(context).await;
+    }
     if context.agent_depth >= 1 {
         return Ok(ToolOutput::text(
             "SUBAGENT_FORBIDDEN: sub-agents cannot install or uninstall extensions. \
@@ -59,14 +63,24 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
 pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
+            name: "list_extensions".to_string(),
+            description: "List what is installed before changing it: skills, workflows and rules \
+                 (with project/global scope; rules also show whether they are active here), the \
+                 global MCP server pool with connection status, and the MCP servers active in this \
+                 project. Read-only."
+                .to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolDef {
             name: "install_extension".to_string(),
-            description: "Install a skill or workflow so it is available immediately and in \
-                 future tasks. Two sources: `content` (you author the markdown yourself — \
-                 preferred, auto-approved at project scope) or `url` (pull from the web — \
-                 ALWAYS requires explicit user consent). Global scope also requires consent. \
-                 The markdown must start with `---` frontmatter containing `name:` (matching \
-                 the `name` param) and `description:`. After install, load it with \
-                 read_skill / read_workflow."
+            description: "Install (or, with overwrite=true, update in place) a skill, workflow or \
+                 rule so it is available immediately and in future tasks. Two sources: `content` \
+                 (you author the markdown yourself — preferred, auto-approved at project scope) or \
+                 `url` (pull from the web — ALWAYS requires explicit user consent). Global scope \
+                 also requires consent. The markdown must start with `---` frontmatter containing \
+                 `name:` (matching the `name` param) and `description:`. Skills/workflows load via \
+                 read_skill / read_workflow; rules are injected into the system prompt (project \
+                 rules always, global rules where activated)."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -74,7 +88,7 @@ pub fn definitions() -> Vec<ToolDef> {
                 "properties": {
                     "kind": {
                         "type": "string",
-                        "enum": ["skill", "workflow"],
+                        "enum": ["skill", "workflow", "rule"],
                         "description": "What to install."
                     },
                     "name": {
@@ -93,6 +107,15 @@ pub fn definitions() -> Vec<ToolDef> {
                     "url": {
                         "type": "string",
                         "description": "http(s) URL of a markdown file to install. Requires user consent; state where you found it. Mutually exclusive with `content`."
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Update an existing extension with the same name (old copy moved to ~/.rustic/trash/). Default false."
+                    },
+                    "activate": {
+                        "type": "string",
+                        "enum": ["project", "global", "none"],
+                        "description": "Global rules only: where the rule is active. project = this project (default), global = every project, none = installed but off."
                     }
                 }
             }),
@@ -116,7 +139,7 @@ pub fn definitions() -> Vec<ToolDef> {
                     "scope": {
                         "type": "string",
                         "enum": ["project", "user"],
-                        "description": "project = <project>/.mcp.json (committed, default); user = global mcp.json shared across projects."
+                        "description": "project = this project only: written to <project>/.mcp.json, .gemini/settings.json and .codex/config.toml (git-ignored) so Claude Code / Gemini CLI / Codex see it too (default); user = global pool shared by every project."
                     },
                     "transport": {
                         "type": "object",
@@ -127,8 +150,8 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "uninstall_extension".to_string(),
-            description: "Uninstall a skill, workflow, or MCP server. Never destructive: \
-                 skills/workflows are moved to ~/.rustic/trash/ (restore by moving back) and \
+            description: "Uninstall a skill, workflow, rule, or MCP server. Never destructive: \
+                 skills/workflows/rules are moved to ~/.rustic/trash/ (restore by moving back) and \
                  MCP server configs are backed up there before removal."
                 .to_string(),
             parameters: json!({
@@ -137,7 +160,7 @@ pub fn definitions() -> Vec<ToolDef> {
                 "properties": {
                     "kind": {
                         "type": "string",
-                        "enum": ["skill", "workflow", "mcp_server"],
+                        "enum": ["skill", "workflow", "rule", "mcp_server"],
                         "description": "What to uninstall."
                     },
                     "name": {
@@ -147,12 +170,83 @@ pub fn definitions() -> Vec<ToolDef> {
                     "scope": {
                         "type": "string",
                         "enum": ["project", "global", "user"],
-                        "description": "Disambiguates when the same name exists in two scopes. skills/workflows: project|global; MCP: project|user."
+                        "description": "Disambiguates when the same name exists in two scopes. skills/workflows/rules: project|global; MCP: project|user."
                     }
                 }
             }),
         },
     ]
+}
+
+/// Inventory of skills, workflows, rules and MCP servers visible to this project.
+async fn list_extensions(context: &ToolContext) -> Result<ToolOutput> {
+    let root = context.project_root.clone();
+    let skills: Vec<Value> = crate::skills::discover_skills(&root)
+        .into_iter()
+        .map(|s| json!({ "name": s.name, "scope": format!("{:?}", s.scope).to_lowercase() }))
+        .collect();
+    let workflows: Vec<Value> = crate::workflows::discover_workflows(&root)
+        .into_iter()
+        .map(|w| {
+            let scope = if w.path.starts_with(&root) {
+                "project"
+            } else {
+                "global"
+            };
+            json!({ "name": w.name, "scope": scope })
+        })
+        .collect();
+    let mut rules: Vec<Value> = crate::rules::discover_project_rules(&root)
+        .into_iter()
+        .map(|r| json!({ "name": r.name, "scope": "project", "active": true }))
+        .collect();
+    for r in crate::rules::discover_global_rules() {
+        let state = crate::rules::rule_state(&r.name, &root);
+        rules.push(json!({
+            "name": r.name,
+            "scope": "global",
+            "active": state != crate::rules::RuleState::Inactive,
+            "activation": format!("{:?}", state).to_lowercase(),
+        }));
+    }
+    let mcp = match context.mcp_manager.as_ref() {
+        Some(mgr) => {
+            let mgr = std::sync::Arc::clone(mgr);
+            let root2 = root.clone();
+            tokio::task::spawn_blocking(move || {
+                let m = mgr.lock().unwrap();
+                let pool: Vec<Value> = m
+                    .list_pool_servers_with_status()
+                    .into_iter()
+                    .map(|s| json!({ "name": s.config.name, "status": s.status }))
+                    .collect();
+                let active = m.effective_ids_for_project(&root2);
+                let here: Vec<Value> = m
+                    .list_servers()
+                    .into_iter()
+                    .filter(|c| active.contains(&c.id))
+                    .map(|c| {
+                        let source = if c.scope == McpScope::User {
+                            "pool"
+                        } else {
+                            "project override"
+                        };
+                        json!({ "name": c.name, "source": source })
+                    })
+                    .collect();
+                json!({ "pool": pool, "active_in_this_project": here })
+            })
+            .await
+            .unwrap_or(Value::Null)
+        }
+        None => Value::Null,
+    };
+    let body =
+        json!({ "skills": skills, "workflows": workflows, "rules": rules, "mcp_servers": mcp });
+    Ok(ToolOutput::text(
+        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
+        false,
+    ))
 }
 
 fn str_param(params: &Value, key: &str) -> Option<String> {
@@ -201,12 +295,16 @@ async fn request_consent(
 
 async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let kind = str_param(&params, "kind").unwrap_or_default();
-    if kind != "skill" && kind != "workflow" {
+    if kind != "skill" && kind != "workflow" && kind != "rule" {
         return Ok(ToolOutput::text(
-            "INVALID_PARAMS: kind must be \"skill\" or \"workflow\"",
+            "INVALID_PARAMS: kind must be \"skill\", \"workflow\" or \"rule\"",
             true,
         ));
     }
+    let overwrite = params
+        .get("overwrite")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let Some(name) = str_param(&params, "name") else {
         return Ok(ToolOutput::text("INVALID_PARAMS: name is required", true));
     };
@@ -248,6 +346,7 @@ async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolO
     // and its advertised name must match what the user consented to.
     let fm_name = match kind.as_str() {
         "skill" => crate::skills::parse_skill_frontmatter(&content).map(|(n, _, _)| n),
+        "rule" => crate::rules::parse_rule_frontmatter(&content).map(|(n, _)| n),
         _ => crate::workflows::parse_workflow_frontmatter(&content).map(|(n, _)| n),
     };
     match fm_name {
@@ -294,11 +393,13 @@ async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolO
     let base = if scope == "project" {
         match kind.as_str() {
             "skill" => context.project_root.join(".rustic/skills"),
+            "rule" => crate::rules::project_rules_dir(&context.project_root),
             _ => context.project_root.join(".rustic/workflows"),
         }
     } else {
         let dir = match kind.as_str() {
             "skill" => crate::skills::global_skills_dir(),
+            "rule" => crate::rules::global_rules_dir(),
             _ => crate::workflows::global_workflows_dir(),
         };
         match dir {
@@ -322,11 +423,20 @@ async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolO
 
     let installed_path = if kind == "skill" {
         let dir = base.join(&name);
+        if dir.exists() && overwrite {
+            if let Err(e) = move_to_trash(&dir) {
+                return Ok(ToolOutput::text(
+                    format!("INSTALL_FAILED: could not back up existing skill: {}", e),
+                    true,
+                ));
+            }
+        }
         if dir.exists() {
             return Ok(ToolOutput::text(
                 format!(
-                    "ALREADY_EXISTS: a skill named `{}` already exists at {}. Uninstall it \
-                     first (uninstall_extension) or pick a different name.",
+                    "ALREADY_EXISTS: a skill named `{}` already exists at {}. Pass \
+                     overwrite=true to update it in place (the old copy goes to ~/.rustic/trash/), \
+                     or pick a different name.",
                     name,
                     dir.display()
                 ),
@@ -344,11 +454,21 @@ async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolO
         dir.join("SKILL.md")
     } else {
         let file = base.join(format!("{}.md", name));
+        if file.exists() && overwrite {
+            if let Err(e) = move_to_trash(&file) {
+                return Ok(ToolOutput::text(
+                    format!("INSTALL_FAILED: could not back up existing {}: {}", kind, e),
+                    true,
+                ));
+            }
+        }
         if file.exists() {
             return Ok(ToolOutput::text(
                 format!(
-                    "ALREADY_EXISTS: a workflow named `{}` already exists at {}. Uninstall \
-                     it first (uninstall_extension) or pick a different name.",
+                    "ALREADY_EXISTS: a {} named `{}` already exists at {}. Pass \
+                     overwrite=true to update it in place (the old copy goes to ~/.rustic/trash/), \
+                     or pick a different name.",
+                    kind,
                     name,
                     file.display()
                 ),
@@ -359,9 +479,23 @@ async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolO
         {
             return Ok(ToolOutput::text(format!("INSTALL_FAILED: {}", e), true));
         }
-        let sidecar = workflow_provenance_path(&file);
-        if let Ok(text) = serde_json::to_string_pretty(&prov) {
-            let _ = std::fs::write(sidecar, text);
+        if kind == "workflow" {
+            let sidecar = workflow_provenance_path(&file);
+            if let Ok(text) = serde_json::to_string_pretty(&prov) {
+                let _ = std::fs::write(sidecar, text);
+            }
+        }
+        // Global rules only apply where activated. Default: this project.
+        if kind == "rule" && scope == "global" {
+            let activate = str_param(&params, "activate").unwrap_or_else(|| "project".to_string());
+            let state = match activate.as_str() {
+                "global" => crate::rules::RuleState::Global,
+                "none" => crate::rules::RuleState::Inactive,
+                _ => crate::rules::RuleState::Project,
+            };
+            if let Err(e) = crate::rules::set_rule_state(&name, state, &context.project_root) {
+                tracing::warn!("failed to activate rule {}: {}", name, e);
+            }
         }
         file
     };
@@ -377,16 +511,26 @@ async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolO
         None,
     ));
 
-    let available: Vec<String> = if kind == "skill" {
-        crate::skills::discover_skills(&context.project_root)
+    let available: Vec<String> = match kind.as_str() {
+        "skill" => crate::skills::discover_skills(&context.project_root)
             .into_iter()
             .map(|s| s.name)
-            .collect()
-    } else {
-        crate::workflows::discover_workflows(&context.project_root)
+            .collect(),
+        "rule" => {
+            let mut all = crate::rules::discover_project_rules(&context.project_root);
+            all.extend(crate::rules::discover_global_rules());
+            all.into_iter().map(|r| r.name).collect()
+        }
+        _ => crate::workflows::discover_workflows(&context.project_root)
             .into_iter()
             .map(|w| w.name)
-            .collect()
+            .collect(),
+    };
+
+    let note = match kind.as_str() {
+        "skill" => format!("Available immediately via read_skill(\"{}\"). Tell the user what you installed and why.", name),
+        "workflow" => format!("Available immediately via read_workflow(\"{}\"). Tell the user what you installed and why.", name),
+        _ => "Rules are injected into the system prompt from the next turn (project rules always; global rules where activated). Tell the user what you added and why.".to_string(),
     };
 
     let body = json!({
@@ -397,11 +541,8 @@ async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolO
         "source": source,
         "sha256": sha256,
         "path": installed_path.display().to_string(),
-        "note": format!(
-            "Available immediately via {}(\"{}\"). Tell the user what you installed and why.",
-            if kind == "skill" { "read_skill" } else { "read_workflow" },
-            name
-        ),
+        "overwritten": overwrite,
+        "note": note,
         "all_available": available,
     });
     Ok(ToolOutput::text(
@@ -476,18 +617,41 @@ async fn add_mcp_server(params: Value, context: &ToolContext) -> Result<ToolOutp
         return Ok(denied);
     }
 
-    // Ensure the project-scope path is wired even if this project had no
-    // .mcp.json when the manager was bootstrapped.
-    let project_mcp_path = context.project_root.join(".mcp.json");
+    // project = write into this project's .mcp.json / .gemini / .codex
+    // (git-ignored) and connect with that config; user = add to the global
+    // pool so every project gets it (issue #11, per-project MCP model).
+    let root = context.project_root.clone();
+    let entry = transport_val.clone();
     let mgr_clone = std::sync::Arc::clone(mgr);
     let name_for_block = name.clone();
-    let add_result = tokio::task::spawn_blocking(move || {
-        let mut m = mgr_clone.lock().unwrap();
-        if scope == McpScope::Project && m.path_for(McpScope::Project).is_none() {
-            m.set_project_path(project_mcp_path);
-        }
-        m.add_server(scope, &name_for_block, transport)
-    })
+    let add_result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(String, std::result::Result<Vec<crate::provider::ToolDef>, String>)> {
+            let mut m = mgr_clone.lock().unwrap();
+            match scope {
+                McpScope::User => {
+                    m.add_pool_server(&name_for_block, &entry)?;
+                    let id = format!("user-{}", name_for_block);
+                    let connect = m.test_server(&id).map_err(|e| e.to_string());
+                    Ok((id, connect))
+                }
+                McpScope::Project => {
+                    let res = m.save_project_server(&root, &name_for_block, Some(&entry), true, true)?;
+                    let id = m
+                        .effective_config_for_project(&root, &name_for_block)
+                        .map(|c| c.id)
+                        .unwrap_or_else(|| name_for_block.clone());
+                    let connect = if res.consent_required {
+                        Err("the project's .mcp.json has changes not yet approved in Rustic; ask the user to approve it in Settings → MCP".to_string())
+                    } else if res.connected {
+                        m.server_tools(&id).map_err(|e| e.to_string())
+                    } else {
+                        Err(res.error.unwrap_or_else(|| "connection failed".to_string()))
+                    };
+                    Ok((id, connect))
+                }
+            }
+        },
+    )
     .await;
 
     let (id, connect) = match add_result {
@@ -559,9 +723,9 @@ async fn uninstall_extension(params: Value, context: &ToolContext) -> Result<Too
     };
     let scope_filter = str_param(&params, "scope");
 
-    if !matches!(kind.as_str(), "skill" | "workflow" | "mcp_server") {
+    if !matches!(kind.as_str(), "skill" | "workflow" | "rule" | "mcp_server") {
         return Ok(ToolOutput::text(
-            "INVALID_PARAMS: kind must be \"skill\", \"workflow\", or \"mcp_server\"",
+            "INVALID_PARAMS: kind must be \"skill\", \"workflow\", \"rule\", or \"mcp_server\"",
             true,
         ));
     }
@@ -690,6 +854,56 @@ async fn uninstall_extension(params: Value, context: &ToolContext) -> Result<Too
                 Err(e) => Ok(ToolOutput::text(format!("UNINSTALL_FAILED: {}", e), true)),
             }
         }
+        "rule" => {
+            let mut rules = crate::rules::discover_project_rules(&context.project_root);
+            rules.extend(crate::rules::discover_global_rules());
+            let matched: Vec<_> = rules
+                .into_iter()
+                .filter(|r| r.name == name)
+                .filter(|r| match scope_filter.as_deref() {
+                    Some("project") => r.scope == crate::rules::RuleScope::Project,
+                    Some("global") => r.scope == crate::rules::RuleScope::Global,
+                    _ => true,
+                })
+                .collect();
+            let Some(rule) = matched.first() else {
+                return Ok(ToolOutput::text(
+                    format!("NOT_FOUND: no rule named `{}` in the requested scope", name),
+                    true,
+                ));
+            };
+            match move_to_trash(&rule.path) {
+                Ok(dest) => {
+                    if rule.scope == crate::rules::RuleScope::Global {
+                        let _ = crate::rules::forget_rule(&name);
+                    }
+                    let scope_str = if rule.scope == crate::rules::RuleScope::Project {
+                        "project"
+                    } else {
+                        "global"
+                    };
+                    audit(&audit_entry(
+                        "uninstall",
+                        "rule",
+                        &name,
+                        scope_str,
+                        "local",
+                        None,
+                        &context.task_id,
+                        Some(format!("trashed to {}", dest.display())),
+                    ));
+                    Ok(ToolOutput::text(
+                        format!(
+                            "Removed rule `{}`. Backed up to {} — restore by moving the file back.",
+                            name,
+                            dest.display()
+                        ),
+                        false,
+                    ))
+                }
+                Err(e) => Ok(ToolOutput::text(format!("UNINSTALL_FAILED: {}", e), true)),
+            }
+        }
         _ => {
             let Some(mgr) = context.mcp_manager.as_ref() else {
                 return Ok(ToolOutput::text(
@@ -700,6 +914,48 @@ async fn uninstall_extension(params: Value, context: &ToolContext) -> Result<Too
             let mgr_clone = std::sync::Arc::clone(mgr);
             let name_c = name.clone();
             let scope_c = scope_filter.clone();
+            // project scope = disable in THIS project only (removed from its
+            // .mcp.json / .gemini / .codex, recorded in .rustic/mcp.json); the
+            // pool entry and other projects are untouched.
+            if scope_c.as_deref() == Some("project") {
+                let root = context.project_root.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    mgr_clone
+                        .lock()
+                        .unwrap()
+                        .save_project_server(&root, &name_c, None, false, false)
+                })
+                .await;
+                return Ok(match res {
+                    Ok(Ok(_)) => {
+                        audit(&audit_entry(
+                            "uninstall",
+                            "mcp_server",
+                            &name,
+                            "project",
+                            "local",
+                            None,
+                            &context.task_id,
+                            Some("disabled for this project".to_string()),
+                        ));
+                        ToolOutput::text(
+                            format!(
+                                "Disabled MCP server `{}` for this project (removed from .mcp.json, \
+                                 .gemini/settings.json and .codex/config.toml). Re-enable it in \
+                                 Settings → MCP → Configure or with add_mcp_server scope=project.",
+                                name
+                            ),
+                            false,
+                        )
+                    }
+                    Ok(Err(e)) => ToolOutput::text(format!("UNINSTALL_FAILED: {}", e), true),
+                    Err(e) => {
+                        ToolOutput::text(format!("UNINSTALL_FAILED: task panicked: {}", e), true)
+                    }
+                });
+            }
+            let mgr_clone = std::sync::Arc::clone(mgr);
+            let name_c = name.clone();
             let result =
                 tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String, String)> {
                     let mut m = mgr_clone.lock().unwrap();
@@ -767,5 +1023,93 @@ async fn uninstall_extension(params: Value, context: &ToolContext) -> Result<Too
                 )),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rule_install_tests {
+    use super::*;
+
+    const RULE: &str = "---\nname: no-emojis\ndescription: Never use emojis\n---\nDo not use emojis in code or docs.\n";
+
+    /// Fresh temp project root.
+    fn root() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("rustic-rule-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn installs_project_rule_and_refuses_duplicate_without_overwrite() {
+        let dir = root();
+        let (ctx, _rx) = ToolContext::new_test(dir.clone());
+        let out = execute(
+            "install_extension",
+            json!({"kind": "rule", "name": "no-emojis", "content": RULE}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!out.is_error, "install failed: {}", out.content);
+        let path = crate::rules::project_rules_dir(&dir).join("no-emojis.md");
+        assert!(path.is_file());
+        assert!(crate::rules::discover_project_rules(&dir)
+            .iter()
+            .any(|r| r.name == "no-emojis"));
+
+        let dup = execute(
+            "install_extension",
+            json!({"kind": "rule", "name": "no-emojis", "content": RULE}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dup.is_error && dup.content.contains("ALREADY_EXISTS"),
+            "{}",
+            dup.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rule_name_must_match_frontmatter() {
+        let dir = root();
+        let (ctx, _rx) = ToolContext::new_test(dir.clone());
+        let out = execute(
+            "install_extension",
+            json!({"kind": "rule", "name": "other-name", "content": RULE}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.is_error && out.content.contains("NAME_MISMATCH"),
+            "{}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_extensions_reports_installed_project_rule() {
+        let dir = root();
+        let (ctx, _rx) = ToolContext::new_test(dir.clone());
+        execute(
+            "install_extension",
+            json!({"kind": "rule", "name": "no-emojis", "content": RULE}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let out = execute("list_extensions", json!({}), &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).expect("valid JSON");
+        let rules = v["rules"].as_array().expect("rules array");
+        assert!(rules
+            .iter()
+            .any(|r| r["name"] == "no-emojis" && r["scope"] == "project" && r["active"] == true));
+        assert!(v["skills"].is_array() && v["workflows"].is_array());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

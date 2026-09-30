@@ -296,8 +296,10 @@ mod tests {
 
     #[test]
     fn salvages_truncated_verdict() {
-        let v = parse_verdict(r#"{"met": true, "reason": "gh issue list confirms #80–#92 are CLOSED and"#)
-            .unwrap();
+        let v = parse_verdict(
+            r#"{"met": true, "reason": "gh issue list confirms #80–#92 are CLOSED and"#,
+        )
+        .unwrap();
         assert!(v.met);
         assert!(v.reason.contains("gh issue list"));
         assert!(v.reason.contains("truncated"));

@@ -196,6 +196,7 @@ async fn call_mcp_tool(
     tool_name: &str,
     tool_input: serde_json::Value,
     mcp_tool_defs: &[ToolDef],
+    project_root: &std::path::Path,
 ) -> ToolOutput {
     if let Err(e) = validate_mcp_arguments(tool_name, &tool_input, mcp_tool_defs) {
         return ToolOutput {
@@ -206,6 +207,7 @@ async fn call_mcp_tool(
     }
     let mcp_call = Arc::clone(mcp);
     let name = tool_name.to_string();
+    let root = project_root.to_path_buf();
     let call_result = tokio::time::timeout(
         std::time::Duration::from_secs(MCP_CALL_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
@@ -213,8 +215,8 @@ async fn call_mcp_tool(
             // with only the per-client lock held.
             let client = {
                 let mut mgr = mcp_call.lock().unwrap();
-                mgr.client_providing(&name)
-                    .or_else(|| mgr.reconnect_for_tool(&name))
+                mgr.client_providing(Some(&root), &name)
+                    .or_else(|| mgr.reconnect_for_tool(Some(&root), &name))
             };
             let result = match client {
                 Some(c) => {
@@ -229,7 +231,7 @@ async fn call_mcp_tool(
                 // of reusing a desynced stream (8.1). Non-transport tool
                 // errors leave the client untouched.
                 if let Ok(mut mgr) = mcp_call.lock() {
-                    mgr.drop_client_if_broken(&name);
+                    mgr.drop_client_if_broken(Some(&root), &name);
                 }
             }
             result
@@ -244,9 +246,10 @@ async fn call_mcp_tool(
             // reply can't become the NEXT request's response.
             let mcp_drop = Arc::clone(mcp);
             let name_drop = tool_name.to_string();
+            let root_drop = project_root.to_path_buf();
             tokio::task::spawn_blocking(move || {
                 if let Ok(mut mgr) = mcp_drop.lock() {
-                    mgr.drop_client_for_tool(&name_drop);
+                    mgr.drop_client_for_tool(Some(&root_drop), &name_drop);
                 }
             });
             ToolOutput {
@@ -1475,7 +1478,7 @@ impl TaskExecutor {
                                                 // longer waits give Anthropic's server more recovery time between
                                                 // attempts — the old 0/30s/60s schedule was too tight for
                                                 // transient server-load stalls and all 4 attempts would stall.
-            const STREAM_RETRY_BACKOFFS_MS: [u64; 3] = [3_000, 60_000, 90_000];
+            const STREAM_RETRY_BACKOFFS_MS: [u64; 3] = [2_000, 8_000, 20_000];
             // 180s threshold: Anthropic's SSE stream is bursty during large
             // tool_use / thinking generations — it buffers internally and
             // flushes 200–300 chunks at a time, with 15–25s pauses between
@@ -1886,8 +1889,9 @@ impl TaskExecutor {
                             && is_image_rejection_error(&e.to_string()) =>
                     {
                         let err_str = e.to_string();
-                        let report =
-                            crate::task::repair::repair_history_for_provider_error(messages, &err_str);
+                        let report = crate::task::repair::repair_history_for_provider_error(
+                            messages, &err_str,
+                        );
                         if report.stubbed == 0 {
                             break 'attempt_loop Err(e);
                         }
@@ -2718,8 +2722,14 @@ impl TaskExecutor {
                                         attachments: Vec::new(),
                                     })
                             } else if let Some(mcp) = &context.mcp_manager {
-                                call_mcp_tool(mcp, &tool_name, tool_input, &context.mcp_tool_defs)
-                                    .await
+                                call_mcp_tool(
+                                    mcp,
+                                    &tool_name,
+                                    tool_input,
+                                    &context.mcp_tool_defs,
+                                    &context.project_root,
+                                )
+                                .await
                             } else {
                                 ToolOutput {
                                     content: format!("Unknown tool: {}", tool_name),
@@ -2799,8 +2809,14 @@ impl TaskExecutor {
                                 attachments: Vec::new(),
                             })
                     } else if let Some(mcp) = &context.mcp_manager {
-                        call_mcp_tool(mcp, tool_name, tool_input.clone(), &context.mcp_tool_defs)
-                            .await
+                        call_mcp_tool(
+                            mcp,
+                            tool_name,
+                            tool_input.clone(),
+                            &context.mcp_tool_defs,
+                            &context.project_root,
+                        )
+                        .await
                     } else {
                         ToolOutput {
                             content: format!("Unknown tool: {}", tool_name),
@@ -3413,7 +3429,12 @@ fn preferred_condense_model(context: &ToolContext) -> Option<String> {
 
 /// True when a provider error message indicates the request exceeded the
 /// model's context window — the trigger for reactive condense-and-retry.
+/// Gateway body-size rejections are excluded: condensing can't fix a proxy
+/// limit that is far below the model's context (issue #2).
 fn is_context_overflow_error(err: &str) -> bool {
+    if is_gateway_body_limit(err) {
+        return false;
+    }
     let e = err.to_lowercase();
     e.contains("prompt is too long")
         || e.contains("context_length_exceeded")
@@ -3427,6 +3448,21 @@ fn is_context_overflow_error(err: &str) -> bool {
         || e.contains("payload too large")
         || e.contains("request entity too large")
         || e.contains("length limit exceeded")
+}
+
+/// True for an HTTP 413 from a proxy / gateway body-size limit (e.g.
+/// "Failed to buffer the request body"), as opposed to a model context error.
+fn is_gateway_body_limit(err: &str) -> bool {
+    let e = err.to_lowercase();
+    if e.contains("failed to buffer the request body") {
+        return true;
+    }
+    let is_413 = e.contains("413")
+        || e.contains("payload too large")
+        || e.contains("request entity too large");
+    let mentions_tokens =
+        e.contains("token") || e.contains("context") || e.contains("prompt is too long");
+    is_413 && !mentions_tokens
 }
 
 /// Records a provider's rejection of `param` in `ov` (rename max_tokens when the error suggests `max_completion_tokens`, otherwise omit the field); returns a human-readable action, or `None` when the override was already in place.
@@ -4108,5 +4144,15 @@ mod helper_tests {
         ] {
             assert!(!is_context_overflow_error(msg), "should NOT match: {}", msg);
         }
+    }
+
+    #[test]
+    fn gateway_body_limit_is_not_context_overflow() {
+        let proxy = "OpenAI API error 413 Payload Too Large: Failed to buffer the request body: length limit exceeded";
+        assert!(super::is_gateway_body_limit(proxy));
+        assert!(!is_context_overflow_error(proxy));
+        let ctx = "API error 413: prompt is too long: 250000 tokens > 200000 maximum";
+        assert!(!super::is_gateway_body_limit(ctx));
+        assert!(is_context_overflow_error(ctx));
     }
 }

@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+pub mod project_files;
 
 use crate::provider::ToolDef;
 use anyhow::{anyhow, Result};
@@ -7,7 +8,7 @@ use client::McpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -41,6 +42,31 @@ pub struct McpServerWithStatus {
     pub status: McpConnectionStatus,
 }
 
+/// One server as seen from one project, for the per-project Configure UI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpProjectServerView {
+    /// Entry JSON the project uses (its `.mcp.json` override, else the pool entry).
+    pub entry: Value,
+    pub enabled: bool,
+    /// True when the project's `.mcp.json` has its own entry for this server.
+    pub overridden: bool,
+    pub status: McpConnectionStatus,
+}
+
+/// Outcome of saving a project's server config.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpProjectSaveResult {
+    pub enabled: bool,
+    pub connected: bool,
+    pub tool_count: usize,
+    pub error: Option<String>,
+    /// The project's `.mcp.json` has content the user hasn't approved yet, so
+    /// project overrides were not loaded.
+    pub consent_required: bool,
+}
+
 /// Tool caches older than this are re-listed on the next `connect_all` (turn
 /// start), making mid-session server tool changes visible without reconnect.
 const TOOL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -66,6 +92,10 @@ pub struct McpManager {
     /// Refuse to load project scope until the user has approved this exact byte sequence.
     /// Re-prompt on hash change so a malicious modification can't ride in on previous trust.
     project_consents: HashMap<PathBuf, String>,
+    /// Per-project disabled server names (from `<root>/.rustic/mcp.json`),
+    /// keyed by `project_key(root)`. A key being present also marks the
+    /// project as loaded, which switches tool routing to project-aware mode.
+    project_disabled: HashMap<String, BTreeSet<String>>,
 }
 
 /// Result of the consent-gated project-scope load (F-10).
@@ -101,6 +131,7 @@ impl McpManager {
             loaded_mtime: HashMap::new(),
             consent_path: None,
             project_consents: HashMap::new(),
+            project_disabled: HashMap::new(),
         }
     }
 
@@ -147,9 +178,30 @@ impl McpManager {
         Ok(())
     }
 
+    /// Snapshot of every approved (project `.mcp.json` path → content hash).
+    pub fn consents(&self) -> HashMap<PathBuf, String> {
+        self.project_consents.clone()
+    }
+
+    /// Merge approvals (e.g. carried by a sync archive, already remapped to
+    /// this machine's paths) and persist them.
+    pub fn import_consents(&mut self, entries: Vec<(PathBuf, String)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for (path, hash) in entries {
+            self.project_consents.insert(path, hash);
+        }
+        self.persist_consents()
+    }
+
     /// Like `load_scope(Project, path)` but gated on per-project consent (F-10).
     pub fn load_project_scope_gated(&mut self, path: &Path) -> Result<LoadProjectScopeResult> {
         self.project_path = Some(path.to_path_buf());
+        if let Some(root) = path.parent() {
+            self.project_disabled
+                .insert(project_key(root), project_files::read_disabled(root));
+        }
         if !path.exists() {
             self.remove_scope(McpScope::Project);
             self.loaded_mtime.insert(path.to_path_buf(), None);
@@ -162,6 +214,7 @@ impl McpManager {
         if !self.is_project_consented(path, &content_hash) {
             // Drop previously-loaded servers so a stale-trusted hash can't keep running.
             self.remove_scope(McpScope::Project);
+            self.loaded_mtime.remove(path);
             return Ok(LoadProjectScopeResult::ConsentRequired {
                 project_path: path.to_path_buf(),
                 content_hash,
@@ -175,7 +228,7 @@ impl McpManager {
                 let count = self
                     .configs
                     .iter()
-                    .filter(|c| c.scope == McpScope::Project)
+                    .filter(|c| self.in_scope(c, McpScope::Project))
                     .count();
                 return Ok(LoadProjectScopeResult::Loaded(count));
             }
@@ -185,7 +238,7 @@ impl McpManager {
         let parsed = parse_mcp_json(&text)?;
         let mut count = 0;
         for (name, transport) in parsed {
-            let id = format!("{}-{}", scope_prefix(McpScope::Project), name);
+            let id = self.scope_id(McpScope::Project, &name);
             self.configs.push(McpServerConfig {
                 id,
                 name,
@@ -201,6 +254,33 @@ impl McpManager {
 
     fn current_mtime(path: &Path) -> Option<SystemTime> {
         std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    /// Id prefix of the project whose `.mcp.json` is the current project path.
+    fn current_project_prefix(&self) -> Option<String> {
+        self.project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(project_id_prefix)
+    }
+
+    /// Whether `c` belongs to `scope`; project scope means the CURRENT project only.
+    fn in_scope(&self, c: &McpServerConfig, scope: McpScope) -> bool {
+        if c.scope != scope {
+            return false;
+        }
+        match (scope, self.current_project_prefix()) {
+            (McpScope::Project, Some(p)) => c.id.starts_with(&p),
+            _ => true,
+        }
+    }
+
+    /// Config id for `name` in `scope` (project ids carry the project prefix).
+    fn scope_id(&self, scope: McpScope, name: &str) -> String {
+        match (scope, self.current_project_prefix()) {
+            (McpScope::Project, Some(p)) => format!("{}{}", p, name),
+            _ => format!("{}-{}", scope_prefix(scope), name),
+        }
     }
 
     pub fn set_user_path(&mut self, path: PathBuf) {
@@ -243,7 +323,7 @@ impl McpManager {
         let to_remove: Vec<String> = self
             .configs
             .iter()
-            .filter(|c| c.scope == scope)
+            .filter(|c| self.in_scope(c, scope))
             .map(|c| c.id.clone())
             .collect();
         for id in &to_remove {
@@ -255,7 +335,7 @@ impl McpManager {
             self.tool_cache.remove(id);
             self.status.remove(id);
         }
-        self.configs.retain(|c| c.scope != scope);
+        self.configs.retain(|c| !to_remove.contains(&c.id));
     }
 
     /// Load `.mcp.json` content for a scope, replacing any existing entries for that scope.
@@ -269,7 +349,11 @@ impl McpManager {
         let on_disk = Self::current_mtime(path);
         if let Some(cached) = self.loaded_mtime.get(path) {
             if *cached == on_disk {
-                let count = self.configs.iter().filter(|c| c.scope == scope).count();
+                let count = self
+                    .configs
+                    .iter()
+                    .filter(|c| self.in_scope(c, scope))
+                    .count();
                 return Ok(count);
             }
         }
@@ -286,7 +370,7 @@ impl McpManager {
 
         let mut count = 0;
         for (name, transport) in parsed {
-            let id = format!("{}-{}", scope_prefix(scope), name);
+            let id = self.scope_id(scope, &name);
             self.configs.push(McpServerConfig {
                 id,
                 name,
@@ -307,7 +391,7 @@ impl McpManager {
             .to_path_buf();
 
         let mut servers = Map::new();
-        for cfg in self.configs.iter().filter(|c| c.scope == scope) {
+        for cfg in self.configs.iter().filter(|c| self.in_scope(c, scope)) {
             servers.insert(cfg.name.clone(), transport_to_json(&cfg.transport));
         }
         let root = json!({ "mcpServers": Value::Object(servers) });
@@ -349,7 +433,7 @@ impl McpManager {
         self.remove_scope(scope);
         let mut names = Vec::new();
         for (name, transport) in parsed {
-            let id = format!("{}-{}", scope_prefix(scope), name);
+            let id = self.scope_id(scope, &name);
             self.configs.push(McpServerConfig {
                 id,
                 name: name.clone(),
@@ -366,7 +450,7 @@ impl McpManager {
         let targets: Vec<McpServerConfig> = self
             .configs
             .iter()
-            .filter(|c| c.scope == scope)
+            .filter(|c| self.in_scope(c, scope))
             .cloned()
             .collect();
 
@@ -477,7 +561,7 @@ impl McpManager {
         if self
             .configs
             .iter()
-            .any(|c| c.scope == scope && c.name == name)
+            .any(|c| self.in_scope(c, scope) && c.name == name)
         {
             return Err(anyhow!(
                 "an MCP server named `{}` already exists in {:?} scope",
@@ -491,7 +575,7 @@ impl McpManager {
                 scope
             ));
         }
-        let id = format!("{}-{}", scope_prefix(scope), name);
+        let id = self.scope_id(scope, name);
         self.configs.push(McpServerConfig {
             id: id.clone(),
             name: name.to_string(),
@@ -507,6 +591,164 @@ impl McpManager {
         }
         let connect = self.test_server(&id).map_err(|e| e.to_string());
         Ok((id, connect))
+    }
+
+    /// Pool (user-scope) servers only, with status — the Settings list.
+    pub fn list_pool_servers_with_status(&self) -> Vec<McpServerWithStatus> {
+        self.list_servers_with_status()
+            .into_iter()
+            .filter(|s| s.config.scope == McpScope::User)
+            .collect()
+    }
+
+    /// Raw JSON entry for a pool server (preserves fields Rustic doesn't model).
+    pub fn pool_entry(&self, name: &str) -> Option<Value> {
+        if let Some(path) = self.user_path.as_deref() {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    if let Some(e) = v.get("mcpServers").and_then(|s| s.get(name)) {
+                        return Some(e.clone());
+                    }
+                }
+            }
+        }
+        self.configs
+            .iter()
+            .find(|c| c.scope == McpScope::User && c.name == name)
+            .map(|c| transport_to_json(&c.transport))
+    }
+
+    /// Add one server entry to the global pool file and reload the pool.
+    pub fn add_pool_server(&mut self, name: &str, entry: &Value) -> Result<()> {
+        project_files::validate_entry(name, entry)?;
+        parse_mcp_json(&json!({ "mcpServers": { name: entry } }).to_string())?;
+        let path = self
+            .user_path
+            .clone()
+            .ok_or_else(|| anyhow!("No path set for the global MCP config"))?;
+        let mut doc: Value = if path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&path)?)
+                .map_err(|e| anyhow!("Global mcp.json is not valid JSON: {}", e))?
+        } else {
+            json!({ "mcpServers": {} })
+        };
+        let servers = doc
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("Global mcp.json must be a JSON object"))?
+            .entry("mcpServers")
+            .or_insert_with(|| json!({}));
+        let servers = servers
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("\"mcpServers\" must be an object"))?;
+        if servers.contains_key(name) {
+            return Err(anyhow!("An MCP server named `{}` already exists", name));
+        }
+        servers.insert(name.to_string(), entry.clone());
+        write_json_atomic(&path, &doc)?;
+        self.loaded_mtime.remove(&path);
+        self.load_scope(McpScope::User, &path)?;
+        Ok(())
+    }
+
+    /// How server `name` looks from project `root` (entry, enabled, status).
+    pub fn project_server_view(&mut self, root: &Path, name: &str) -> Result<McpProjectServerView> {
+        let _ = self.load_project_scope_gated(&project_files::mcp_json_path(root));
+        let project_entry = project_files::read_project_entry(root, name)?;
+        let overridden = project_entry.is_some();
+        let entry = project_entry
+            .or_else(|| self.pool_entry(name))
+            .ok_or_else(|| anyhow!("MCP server not found: {}", name))?;
+        let enabled = !project_files::read_disabled(root).contains(name);
+        let status = self
+            .effective_config_for_project(root, name)
+            .and_then(|c| self.status.get(&c.id).cloned())
+            .unwrap_or(McpConnectionStatus::Unknown);
+        Ok(McpProjectServerView {
+            entry,
+            enabled,
+            overridden,
+            status,
+        })
+    }
+
+    /// Write server `name` into project `root` (or remove it when disabled),
+    /// sync `.gemini`/`.codex`, reload the project, and test the connection.
+    /// Rustic's own write is auto-approved only if the file was already
+    /// trusted (or absent), so unreviewed third-party entries stay gated.
+    pub fn save_project_server(
+        &mut self,
+        root: &Path,
+        name: &str,
+        entry: Option<&Value>,
+        enabled: bool,
+        retest: bool,
+    ) -> Result<McpProjectSaveResult> {
+        let mcp_path = project_files::mcp_json_path(root);
+        let trusted_before = match std::fs::read_to_string(&mcp_path) {
+            Ok(text) => self.is_project_consented(&mcp_path, &sha256_hex(text.as_bytes())),
+            Err(_) => true,
+        };
+
+        if enabled {
+            let entry = match entry {
+                Some(e) => e.clone(),
+                None => self
+                    .pool_entry(name)
+                    .ok_or_else(|| anyhow!("MCP server not found: {}", name))?,
+            };
+            parse_mcp_json(&json!({ "mcpServers": { name: &entry } }).to_string())?;
+            project_files::upsert_server(root, name, &entry)?;
+            project_files::set_disabled(root, name, false)?;
+        } else {
+            project_files::remove_server(root, name)?;
+            project_files::set_disabled(root, name, true)?;
+        }
+
+        if trusted_before {
+            if let Ok(text) = std::fs::read_to_string(&mcp_path) {
+                self.approve_project_consent(mcp_path.clone(), sha256_hex(text.as_bytes()))?;
+            }
+        }
+        self.loaded_mtime.remove(&mcp_path);
+        let consent_required = matches!(
+            self.load_project_scope_gated(&mcp_path)?,
+            LoadProjectScopeResult::ConsentRequired { .. }
+        );
+
+        let mut result = McpProjectSaveResult {
+            enabled,
+            connected: false,
+            tool_count: 0,
+            error: None,
+            consent_required,
+        };
+        if !enabled {
+            let override_id = format!("{}{}", project_id_prefix(root), name);
+            self.drop_client(&override_id);
+            return Ok(result);
+        }
+        match self.effective_config_for_project(root, name) {
+            Some(cfg) => {
+                if !retest {
+                    if let Some(McpConnectionStatus::Connected { tool_count }) =
+                        self.status.get(&cfg.id).cloned()
+                    {
+                        if self.clients.contains_key(&cfg.id) {
+                            result.connected = true;
+                            result.tool_count = tool_count;
+                            return Ok(result);
+                        }
+                    }
+                }
+                self.drop_client(&cfg.id);
+                let (ok, count, err) = self.connect_one(&cfg);
+                result.connected = ok;
+                result.tool_count = count;
+                result.error = err;
+            }
+            None => result.error = Some(format!("Server `{}` is not active in this project", name)),
+        }
+        Ok(result)
     }
 
     pub fn connect_all(&mut self) -> Result<()> {
@@ -627,6 +869,118 @@ impl McpManager {
         }
     }
 
+    /// Config ids a project actually uses: the global pool, overridden by the
+    /// project's `.mcp.json` entries, minus names in its disabled list. An
+    /// override identical to the pool entry reuses the pool id (one process).
+    pub fn effective_ids_for_project(&self, root: &Path) -> Vec<String> {
+        let prefix = project_id_prefix(root);
+        let empty = BTreeSet::new();
+        let disabled = self
+            .project_disabled
+            .get(&project_key(root))
+            .unwrap_or(&empty);
+        let mut by_name: std::collections::BTreeMap<&str, &McpServerConfig> = Default::default();
+        for c in self
+            .configs
+            .iter()
+            .filter(|c| c.enabled && c.scope == McpScope::User)
+        {
+            by_name.insert(c.name.as_str(), c);
+        }
+        for c in self
+            .configs
+            .iter()
+            .filter(|c| c.enabled && c.scope == McpScope::Project && c.id.starts_with(&prefix))
+        {
+            let same_as_pool = by_name.get(c.name.as_str()).is_some_and(|p| {
+                p.scope == McpScope::User
+                    && transport_to_json(&p.transport) == transport_to_json(&c.transport)
+            });
+            if !same_as_pool {
+                by_name.insert(c.name.as_str(), c);
+            }
+        }
+        let mut ids: Vec<String> = by_name
+            .into_iter()
+            .filter(|(name, _)| !disabled.contains(*name))
+            .map(|(_, c)| c.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Effective config for `name` in project `root`, if enabled there.
+    pub fn effective_config_for_project(&self, root: &Path, name: &str) -> Option<McpServerConfig> {
+        let ids = self.effective_ids_for_project(root);
+        self.configs
+            .iter()
+            .find(|c| c.name == name && ids.contains(&c.id))
+            .cloned()
+    }
+
+    /// Ids to route tool calls through: the project's effective set when that
+    /// project has been loaded, otherwise `None` (legacy global routing).
+    fn routing_ids(&self, root: Option<&Path>) -> Option<Vec<String>> {
+        let root = root?;
+        if !self.project_disabled.contains_key(&project_key(root)) {
+            return None;
+        }
+        Some(self.effective_ids_for_project(root))
+    }
+
+    /// Drop clients that flagged themselves broken so they get reconnected.
+    fn sweep_broken_clients(&mut self) {
+        let broken: Vec<String> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.try_lock().map(|g| g.is_broken()).unwrap_or(false))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in broken {
+            tracing::warn!(server = %id, "dropping broken MCP client; reconnecting");
+            self.clients.remove(&id);
+        }
+    }
+
+    /// Turn-start connect for one project: connect only its effective servers.
+    pub fn connect_project(&mut self, root: &Path) {
+        self.sweep_broken_clients();
+        let ids = self.effective_ids_for_project(root);
+        let targets: Vec<McpServerConfig> = self
+            .configs
+            .iter()
+            .filter(|c| ids.contains(&c.id) && !self.clients.contains_key(&c.id))
+            .cloned()
+            .collect();
+        for cfg in targets {
+            let _ = self.connect_one(&cfg);
+        }
+        self.refresh_stale_tools(TOOL_CACHE_TTL);
+    }
+
+    /// Tools from the project's effective, connected servers (sorted by id).
+    pub fn project_tools(&self, root: &Path) -> Vec<ToolDef> {
+        let mut tools = Vec::new();
+        for id in self.effective_ids_for_project(root) {
+            if self.clients.contains_key(&id) {
+                if let Some(t) = self.tool_cache.get(&id) {
+                    tools.extend(t.iter().cloned());
+                }
+            }
+        }
+        tools
+    }
+
+    /// Disconnect and forget a single client (e.g. before a re-test).
+    fn drop_client(&mut self, id: &str) {
+        if let Some(client) = self.clients.remove(id) {
+            if let Ok(mut c) = client.lock() {
+                c.disconnect();
+            }
+        }
+        self.tool_cache.remove(id);
+    }
+
     /// Tool definitions from all connected servers, sorted by server id for
     /// prompt-cache stability. Served from the connect-time cache — zero
     /// IPC/network cost per turn.
@@ -664,9 +1018,15 @@ impl McpManager {
 
     /// Resolve the server (config) id whose cached tool list advertises
     /// `name`. Sorted iteration keeps resolution deterministic when two
-    /// servers advertise the same tool name.
-    fn server_id_for_tool(&self, name: &str) -> Option<String> {
-        let mut ids: Vec<&String> = self.tool_cache.keys().collect();
+    /// servers advertise the same tool name. With a loaded project `root`,
+    /// only that project's effective servers are considered.
+    fn server_id_for_tool(&self, root: Option<&Path>, name: &str) -> Option<String> {
+        let allowed = self.routing_ids(root);
+        let mut ids: Vec<&String> = self
+            .tool_cache
+            .keys()
+            .filter(|id| allowed.as_ref().is_none_or(|a| a.contains(id)))
+            .collect();
         ids.sort();
         for id in ids {
             if self.tool_cache[id].iter().any(|t| t.name == name) {
@@ -682,9 +1042,10 @@ impl McpManager {
     /// what lets calls to different servers run in parallel.
     pub fn client_providing(
         &self,
+        root: Option<&Path>,
         name: &str,
     ) -> Option<std::sync::Arc<std::sync::Mutex<McpClient>>> {
-        let id = self.server_id_for_tool(name)?;
+        let id = self.server_id_for_tool(root, name)?;
         self.clients.get(&id).map(std::sync::Arc::clone)
     }
 
@@ -698,8 +1059,8 @@ impl McpManager {
     /// alive until it returns, at which point Drop disconnects it; meanwhile
     /// `connect_all` (next turn) or `reconnect_for_tool` (same turn) spawns a
     /// fresh connection.
-    pub fn drop_client_for_tool(&mut self, name: &str) {
-        let Some(id) = self.server_id_for_tool(name) else {
+    pub fn drop_client_for_tool(&mut self, root: Option<&Path>, name: &str) {
+        let Some(id) = self.server_id_for_tool(root, name) else {
             return;
         };
         if self.clients.remove(&id).is_some() {
@@ -720,8 +1081,8 @@ impl McpManager {
     /// Drop the client that provides `name` iff it reports itself broken
     /// (in-client request timeout or stream death). try_lock so this never
     /// blocks on a mutex held by a still-running call.
-    pub fn drop_client_if_broken(&mut self, name: &str) {
-        let Some(id) = self.server_id_for_tool(name) else {
+    pub fn drop_client_if_broken(&mut self, root: Option<&Path>, name: &str) {
+        let Some(id) = self.server_id_for_tool(root, name) else {
             return;
         };
         let broken = self
@@ -751,9 +1112,10 @@ impl McpManager {
     /// client is still connected.
     pub fn reconnect_for_tool(
         &mut self,
+        root: Option<&Path>,
         name: &str,
     ) -> Option<std::sync::Arc<std::sync::Mutex<McpClient>>> {
-        let id = self.server_id_for_tool(name)?;
+        let id = self.server_id_for_tool(root, name)?;
         if let Some(c) = self.clients.get(&id) {
             return Some(std::sync::Arc::clone(c));
         }
@@ -775,7 +1137,7 @@ impl McpManager {
     /// manager lock isn't held for the duration of the call.
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
         let client = self
-            .client_providing(name)
+            .client_providing(None, name)
             .ok_or_else(|| anyhow!("No MCP server provides tool: {}", name))?;
         let mut guard = client
             .lock()
@@ -798,6 +1160,26 @@ fn scope_prefix(scope: McpScope) -> &'static str {
         McpScope::User => "user",
         McpScope::Project => "project",
     }
+}
+
+/// Normalised key for a project root (no trailing separator; case-insensitive on Windows).
+pub fn project_key(root: &Path) -> String {
+    let s = root.to_string_lossy().replace('\\', "/");
+    let s = s.trim_end_matches('/');
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Config-id prefix for the project-scope servers of `root`, so two projects
+/// with a same-named server never share (or clobber) each other's entry.
+fn project_id_prefix(root: &Path) -> String {
+    format!(
+        "project-{}-",
+        &sha256_hex(project_key(root).as_bytes())[..8]
+    )
 }
 
 /// Parse `.mcp.json` content into a list of (name, transport) pairs.
@@ -909,4 +1291,99 @@ fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     }
     crate::io_util::atomic_write(path, text.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod project_scope_tests {
+    use super::*;
+
+    /// Scratch dir holding a pool file and one project root.
+    fn setup(pool: &str) -> (PathBuf, PathBuf, McpManager) {
+        let base = std::env::temp_dir().join(format!("rustic-mcp-eff-{}", uuid::Uuid::new_v4()));
+        let root = base.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let pool_path = base.join("mcp.json");
+        std::fs::write(&pool_path, pool).unwrap();
+        let mut mgr = McpManager::new();
+        mgr.load_scope(McpScope::User, &pool_path).unwrap();
+        (base, root, mgr)
+    }
+
+    /// Approve and load the project's current `.mcp.json`.
+    fn load_trusted(mgr: &mut McpManager, root: &Path) {
+        let path = project_files::mcp_json_path(root);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            mgr.approve_project_consent(path.clone(), sha256_hex(text.as_bytes()))
+                .unwrap();
+        }
+        mgr.load_project_scope_gated(&path).unwrap();
+    }
+
+    const POOL: &str = r#"{"mcpServers":{"a":{"command":"a-bin"},"b":{"command":"b-bin"}}}"#;
+
+    #[test]
+    fn identical_project_entry_reuses_pool_id_and_override_wins() {
+        let (base, root, mut mgr) = setup(POOL);
+        project_files::upsert_server(&root, "a", &json!({"command": "a-bin"})).unwrap();
+        project_files::upsert_server(&root, "b", &json!({"command": "b-bin", "env": {"K": "p"}}))
+            .unwrap();
+        load_trusted(&mut mgr, &root);
+        let ids = mgr.effective_ids_for_project(&root);
+        let prefix = project_id_prefix(&root);
+        assert_eq!(ids, vec![format!("{prefix}b"), "user-a".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn disabled_servers_are_excluded_and_other_projects_unaffected() {
+        let (base, root, mut mgr) = setup(POOL);
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        project_files::set_disabled(&root, "a", true).unwrap();
+        load_trusted(&mut mgr, &root);
+        load_trusted(&mut mgr, &other);
+        assert_eq!(
+            mgr.effective_ids_for_project(&root),
+            vec!["user-b".to_string()]
+        );
+        assert_eq!(
+            mgr.effective_ids_for_project(&other),
+            vec!["user-a".to_string(), "user-b".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn loading_one_project_keeps_another_projects_overrides() {
+        let (base, root, mut mgr) = setup(POOL);
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        project_files::upsert_server(&root, "a", &json!({"command": "a-bin", "args": ["x"]}))
+            .unwrap();
+        load_trusted(&mut mgr, &root);
+        load_trusted(&mut mgr, &other);
+        let prefix = project_id_prefix(&root);
+        assert!(mgr
+            .effective_ids_for_project(&root)
+            .contains(&format!("{prefix}a")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unapproved_project_file_does_not_load_overrides() {
+        let (base, root, mut mgr) = setup(POOL);
+        project_files::upsert_server(&root, "a", &json!({"command": "evil"})).unwrap();
+        let res = mgr
+            .load_project_scope_gated(&project_files::mcp_json_path(&root))
+            .unwrap();
+        assert!(matches!(
+            res,
+            LoadProjectScopeResult::ConsentRequired { .. }
+        ));
+        assert_eq!(
+            mgr.effective_ids_for_project(&root),
+            vec!["user-a".to_string(), "user-b".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

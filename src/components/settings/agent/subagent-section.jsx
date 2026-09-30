@@ -18,6 +18,7 @@ import {
   Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup, SelectLabel,
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { SearchableSelect } from '@/components/ui/searchable-select';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
@@ -150,31 +151,22 @@ export function SubAgentSection() {
             ))}
           </SelectContent>
         </Select>
-        <Select value={model} onValueChange={setModel} disabled={!providerKey}>
-          <SelectTrigger className="h-8 flex-1 text-xs">
-            <SelectValue placeholder={
-              !providerKey
-                ? 'Pick a provider first'
-                : modelsLoading
-                  ? 'Loading models…'
-                  : 'Pick a model…'
-            } />
-          </SelectTrigger>
-          <SelectContent>
-            {/* When the saved model isn't in the fetched list (e.g. fetch failed
-                or the id was custom), surface it as the first option so the user
-                doesn't see a blank trigger. */}
-            {model && !(providerModels || []).includes(model) && (
-              <SelectItem key={model} value={model}>{model}</SelectItem>
-            )}
-            {(providerModels || []).map((m) => (
-              <SelectItem key={m} value={m}>{m}</SelectItem>
-            ))}
-            {providerKey && !modelsLoading && (providerModels || []).length === 0 && !model && (
-              <div className="px-2 py-1.5 text-xs text-muted-foreground">No models returned.</div>
-            )}
-          </SelectContent>
-        </Select>
+        <SearchableSelect
+          value={model}
+          onValueChange={setModel}
+          disabled={!providerKey}
+          options={providerModels || []}
+          className="flex-1"
+          placeholder={
+            !providerKey
+              ? 'Pick a provider first'
+              : modelsLoading
+                ? 'Loading models…'
+                : 'Pick a model…'
+          }
+          searchPlaceholder="Search models…"
+          emptyText={modelsLoading ? 'Loading models…' : 'No models returned.'}
+        />
         {(providerKey || model) && (
           <Button size="icon-sm" variant="ghost" className="size-8 text-muted-foreground hover:text-destructive" onClick={clearChoice}>
             <Trash2 className="size-3.5" />

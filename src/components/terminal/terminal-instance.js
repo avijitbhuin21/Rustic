@@ -374,6 +374,11 @@ function createTerminalInstance(sessionId) {
             // scroll/repaint handlers stop poking a disposed addon.
             try { addon.dispose(); } catch (_) {}
             if (webgl === addon) webgl = null;
+            // Redraw with the fallback renderer so the screen isn't left blank.
+            requestAnimationFrame(() => {
+              refit();
+              try { term?.refresh(0, Math.max(0, (term?.rows || 1) - 1)); } catch (_) {}
+            });
           });
           term.loadAddon(addon);
           webgl = addon;
@@ -519,6 +524,7 @@ function createTerminalInstance(sessionId) {
         lastCols = term.cols;
         lastRows = term.rows;
         useTerminal.getState().resizeTerminal(sessionId, term.cols, term.rows);
+        scheduleRepaint();
       }
     } catch (_) {}
   };
@@ -531,6 +537,50 @@ function createTerminalInstance(sessionId) {
     try { webgl?.clearTextureAtlas?.(); } catch (_) {}
     try { term.refresh(0, Math.max(0, term.rows - 1)); } catch (_) {}
   };
+
+  // Debounced repaint for bursts (drag-resizing a panel fires many resizes).
+  let repaintTimer = null;
+  const scheduleRepaint = () => {
+    if (repaintTimer) clearTimeout(repaintTimer);
+    repaintTimer = setTimeout(() => {
+      repaintTimer = null;
+      repaint();
+    }, 100);
+  };
+
+  // A stale glyph atlas after the terminal was hidden, resized, moved to a
+  // monitor with another DPR, or the window was backgrounded is what blanks
+  // text in full-screen CLIs (issue #14). Panes that are always "active"
+  // (the side-panel CLI view) never get the tab-switch repaint, so repaint
+  // whenever the terminal actually becomes visible again.
+  let wasVisible = true;
+  const io = typeof IntersectionObserver !== 'undefined'
+    ? new IntersectionObserver((entries) => {
+        const visible = entries.some((e) => e.isIntersecting);
+        if (visible && !wasVisible) scheduleRepaint();
+        wasVisible = visible;
+      })
+    : null;
+  io?.observe(container);
+  const onVisibility = () => {
+    if (document.visibilityState === 'visible') scheduleRepaint();
+  };
+  const onFocus = () => scheduleRepaint();
+  document.addEventListener('visibilitychange', onVisibility);
+  window.addEventListener('focus', onFocus);
+  let dprQuery = null;
+  const onDprChange = () => {
+    scheduleRepaint();
+    watchDpr();
+  };
+  const watchDpr = () => {
+    try { dprQuery?.removeEventListener('change', onDprChange); } catch (_) {}
+    try {
+      dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      dprQuery.addEventListener('change', onDprChange);
+    } catch (_) { dprQuery = null; }
+  };
+  watchDpr();
 
   // ResizeObserver serves double duty: the first non-zero observation opens the
   // terminal; subsequent ones re-fit. Reparenting (mount → unmount → mount) and
@@ -549,6 +599,11 @@ function createTerminalInstance(sessionId) {
     if (disposed) return;
     disposed = true;
     try { ro.disconnect(); } catch (_) {}
+    try { io?.disconnect(); } catch (_) {}
+    if (repaintTimer) clearTimeout(repaintTimer);
+    document.removeEventListener('visibilitychange', onVisibility);
+    window.removeEventListener('focus', onFocus);
+    try { dprQuery?.removeEventListener('change', onDprChange); } catch (_) {}
     firstRenderDisposable?.dispose();
     searchResultsDisposable?.dispose();
     onDataDisposable?.dispose();

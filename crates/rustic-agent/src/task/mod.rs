@@ -386,6 +386,12 @@ pub enum TaskEvent {
         request_id: String,
         questions: serde_json::Value,
     },
+    /// A pending `ask_user` request stopped waiting without an answer (the
+    /// run was cancelled / interrupted). The UI closes that question card.
+    AskUserCancelled {
+        task_id: String,
+        request_id: String,
+    },
     /// P0.4 fix #4: the daily-cost ceiling has been hit at the top of a new
     /// turn. The task is parked on the [`CeilingBroker`]; the frontend
     /// renders a modal with "Raise ceiling to …" + "Stop task" and replies

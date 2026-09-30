@@ -34,10 +34,39 @@ async fn client_loop(mut socket: WebSocket, shared: Arc<Shared>) {
                     }
                 }
                 // A lagging subscriber dropped messages; keep going from the
-                // current position rather than tearing down the socket. The
-                // frontend resyncs via a fresh fetch on reconnect/refresh.
+                // current position rather than tearing down the socket. Dropped
+                // `rustic:fs-change` events would leave the tree / open files
+                // stale (issue #12), so tell this client to rescan every project.
                 Err(RecvError::Lagged(n)) => {
-                    tracing::warn!(skipped = n, "ws subscriber lagged; skipping ahead");
+                    tracing::warn!(skipped = n, "ws subscriber lagged; skipping ahead + requesting rescan");
+                    let roots: Vec<String> = shared
+                        .ctx
+                        .state()
+                        .workspace
+                        .lock()
+                        .map(|ws| {
+                            ws.list_projects()
+                                .into_iter()
+                                .map(|p| p.root_path.to_string_lossy().replace('\\', "/"))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for root in roots {
+                        let msg = crate::hub::EventMsg {
+                            event: "rustic:fs-change".to_string(),
+                            payload: serde_json::json!({
+                                "project_path": root,
+                                "changed_dirs": [],
+                                "changed_paths": [],
+                                "git_changed": true,
+                                "rescan": true,
+                            }),
+                        };
+                        let Ok(text) = serde_json::to_string(&msg) else { continue };
+                        if socket.send(Message::Text(text)).await.is_err() {
+                            return;
+                        }
+                    }
                     continue;
                 }
                 Err(RecvError::Closed) => break,

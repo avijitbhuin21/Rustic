@@ -6,8 +6,7 @@ pub mod openai;
 pub mod request_overrides;
 
 pub use request_overrides::{
-    apply_request_overrides, suggested_replacement_param, unsupported_param_from_error,
-    BodyDialect,
+    apply_request_overrides, suggested_replacement_param, unsupported_param_from_error, BodyDialect,
 };
 
 pub use freebuff::FreeBuffProvider;
@@ -369,10 +368,11 @@ impl SseLineBuffer {
     }
 }
 
-/// Builds the reqwest client used for provider calls: bounded TCP connect (dead hosts fail in 20s instead of the OS default ~3 min) and no overall timeout because SSE streams are long-lived.
+/// Builds the reqwest client used for provider calls: bounded TCP connect (dead hosts fail in 20s instead of the OS default ~3 min), no overall timeout because SSE streams are long-lived, and a per-read idle timeout so a silently stalled stream errors (and retries) instead of hanging.
 pub fn provider_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(300))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

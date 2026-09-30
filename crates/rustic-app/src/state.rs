@@ -130,7 +130,35 @@ pub struct AppState {
     /// runtime instead of a per-turn `Runtime::new()` so tasks spawned during a
     /// turn (sub-agents, event forwarders) survive the end of the turn that
     /// spawned them — required for the host-level sub-agent park/auto-resume.
-    pub agent_runtime: Arc<tokio::runtime::Runtime>,
+    pub agent_runtime: Arc<AgentRuntime>,
+}
+
+/// The shared agent runtime. Dropping a plain `Runtime` panics inside async
+/// code, and the last `AppState` reference can be released there (request
+/// handlers, `#[tokio::test]`) — so shut down without blocking instead.
+pub struct AgentRuntime(Option<tokio::runtime::Runtime>);
+
+impl AgentRuntime {
+    /// Wrap a built runtime.
+    pub fn new(rt: tokio::runtime::Runtime) -> Self {
+        Self(Some(rt))
+    }
+}
+
+impl std::ops::Deref for AgentRuntime {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("agent runtime used after shutdown")
+    }
+}
+
+impl Drop for AgentRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
+    }
 }
 
 /// Per-project pair: the synchronous tracker API + its background sweep worker.
@@ -168,13 +196,13 @@ impl AppState {
             file_history_registry: Arc::new(Mutex::new(HashMap::new())),
             active_search_id: Arc::new(AtomicU64::new(0)),
             workspace_services: Arc::new(WorkspaceRegistry::new()),
-            agent_runtime: Arc::new(
+            agent_runtime: Arc::new(AgentRuntime::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .thread_name("agent-runtime")
                     .build()
                     .expect("failed to build shared agent runtime"),
-            ),
+            )),
         }
     }
 }

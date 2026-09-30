@@ -8,25 +8,37 @@ const CHANGED_PATHS_CAP = 512;
 
 const norm = (p) => (p ?? '').replace(/\\/g, '/');
 
+// Windows paths are case-insensitive: the watcher and a tab opened from agent
+// output / search can disagree on drive-letter or folder casing (issue #12).
+const key = (p) => {
+  const n = norm(p).replace(/\/+$/, '');
+  return /^[a-zA-Z]:\//.test(n) ? n.toLowerCase() : n;
+};
+
 const parentDir = (p) => {
-  const n = norm(p);
+  const n = key(p);
   const i = n.lastIndexOf('/');
   return i < 0 ? n : n.slice(0, i);
 };
 
 /// Returns true when a `rustic:fs-change` payload indicates `path` changed on disk.
 export function fsChangeTouchesPath(payload, path) {
-  const target = norm(path);
+  const target = key(path);
   if (!target) return false;
+  // A rescan means events were lost: every file in that project may have changed.
+  if (payload?.rescan) {
+    const root = key(payload?.project_path);
+    return !root || target === root || target.startsWith(`${root}/`);
+  }
   const changedPaths = Array.isArray(payload?.changed_paths) ? payload.changed_paths : [];
   for (const p of changedPaths) {
-    if (norm(p) === target) return true;
+    if (key(p) === target) return true;
   }
   if (changedPaths.length >= CHANGED_PATHS_CAP) {
     const dir = parentDir(target);
     const changedDirs = Array.isArray(payload?.changed_dirs) ? payload.changed_dirs : [];
     for (const d of changedDirs) {
-      if (norm(d) === dir) return true;
+      if (key(d) === dir) return true;
     }
   }
   return false;

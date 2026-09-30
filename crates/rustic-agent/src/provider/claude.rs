@@ -400,7 +400,8 @@ async fn parse_sse_stream(
                 let chunks = chunk_count.load(Ordering::Relaxed);
                 let bytes = byte_count.load(Ordering::Relaxed);
                 let events = event_count.load(Ordering::Relaxed);
-                let stalled = since_last_ms >= STALL_WARN_MS || (chunks == 0 && elapsed_ms >= STALL_WARN_MS);
+                let stalled =
+                    since_last_ms >= STALL_WARN_MS || (chunks == 0 && elapsed_ms >= STALL_WARN_MS);
                 if stalled {
                     if !stall_reported {
                         stall_reported = true;

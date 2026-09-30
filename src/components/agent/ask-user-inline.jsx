@@ -26,7 +26,7 @@ const slideVariants = {
   exit: (dir) => ({ opacity: 0, x: dir * -28 }),
 };
 
-export function AskUserInline({ requestId, questions, answered, answers, cancelled }) {
+export function AskUserInline({ requestId, questions, answered, answers, cancelled, interrupted }) {
   const respond = useAgent((s) => s.respondQuestion);
 
   const safeQuestions = Array.isArray(questions) ? questions : [];
@@ -144,7 +144,9 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
           <XCircle className="size-3 text-muted-foreground" />
         </span>
         <div className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-          Question dismissed.
+          {interrupted
+            ? 'Question interrupted — the agent was redirected before you answered.'
+            : 'Question dismissed.'}
         </div>
       </div>
     );

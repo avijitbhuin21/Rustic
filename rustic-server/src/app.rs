@@ -90,6 +90,18 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         )
         .route("/api/sync/state", get(sync_state_handler))
         .route("/api/sync/pull", post(sync_pull_handler))
+        // Metadata-only sync (issue #15): export / merge-import the bundle.
+        .route(
+            "/api/sync/meta",
+            get(sync_meta_export_handler).post(sync_meta_import_handler),
+        )
+        // Chunked, parallel, resumable sync (streamed pack ‖ send ‖ extract).
+        .merge(rustic_app::transfer::routes::router::<
+            crate::sync_transfer::ServerTransferHost,
+            Arc<Shared>,
+        >(crate::sync_transfer::ServerTransferHost::new(
+            shared.clone(),
+        )))
         .route("/api/download", get(download_handler))
         .route("/api/asset", get(asset_handler))
         .route("/ws", get(ws::ws_handler))
@@ -663,77 +675,22 @@ async fn sync_push_handler(State(shared): State<Arc<Shared>>, body: Body) -> Res
         }
     }
 
-    let ctx = shared.ctx.clone();
+    let shared_apply = shared.clone();
     let tmp_apply = tmp.clone();
     let result = tokio::task::spawn_blocking(move || {
-        use rustic_app::cloud_sync::{
-            apply_project_archive, apply_sync_archive, safe_dir_name, SyncProjectEntry,
-        };
-
-        let emitter: Arc<dyn rustic_app::EventEmitter> = Arc::new(ctx.clone());
-        let projects_root = ctx.data_dir.join("projects");
-        // Imported projects keep their existing server location when this
-        // server already knows the project id; new ones land under
-        // <data_dir>/projects/<name> (deduped against this import batch).
-        let used: std::sync::Mutex<std::collections::HashSet<String>> = Default::default();
-        let resolve = |entry: &SyncProjectEntry, old: Option<&str>| -> std::path::PathBuf {
-            if let Some(old) = old {
-                let p = std::path::PathBuf::from(old);
-                if p.is_dir() {
-                    return p;
-                }
-            }
-            let base = safe_dir_name(&entry.name);
-            let mut used = ctx_lock(&used);
-            let mut candidate = base.clone();
-            let mut n = 1;
-            while !used.insert(candidate.clone()) {
-                n += 1;
-                candidate = format!("{base}-{n}");
-            }
-            projects_root.join(candidate)
-        };
         // A single-project archive replaces just that project's tree; a full
         // archive replaces the whole environment.
         let scoped = rustic_app::cloud_sync::read_archive_manifest(&tmp_apply)
             .map(|m| m.project_scoped)
             .unwrap_or(false);
-        if scoped {
-            apply_project_archive(
-                &ctx.state,
-                &ctx.data_dir,
-                &tmp_apply,
-                emitter.clone(),
-                &resolve,
-                &rustic_app::cloud_sync::SyncReporter::new("push", emitter),
-            )
-        } else {
-            apply_sync_archive(
-                &ctx.state,
-                &ctx.data_dir,
-                &*ctx.secrets,
-                &tmp_apply,
-                emitter.clone(),
-                &resolve,
-                &rustic_app::cloud_sync::SyncReporter::new("push", emitter),
-            )
-        }
+        let file = std::fs::File::open(&tmp_apply).map_err(|e| e.to_string())?;
+        crate::sync_transfer::apply_incoming(&shared_apply, Box::new(file), scoped)
     })
     .await;
     let _ = tokio::fs::remove_file(&tmp).await;
 
     match result {
         Ok(Ok(manifest)) => {
-            // The imported environment may carry a different git token — refresh
-            // the terminal-git credential helper with it.
-            let token = shared
-                .ctx
-                .state
-                .git_token
-                .lock()
-                .ok()
-                .and_then(|g| (*g).clone());
-            crate::git_credentials::apply(&shared.config.data_dir, token.as_deref());
             Json(json!({ "ok": true, "projects": manifest.projects.len() })).into_response()
         }
         Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
@@ -745,9 +702,57 @@ async fn sync_push_handler(State(shared): State<Arc<Shared>>, body: Body) -> Res
     }
 }
 
-/// Poison-tolerant lock helper for the resolver's dedup set.
-fn ctx_lock<'a, T>(m: &'a std::sync::Mutex<T>) -> std::sync::MutexGuard<'a, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+/// `GET /api/sync/meta` — this server's metadata bundle (providers + keys,
+/// model overrides, global rules/skills/workflows, MCP pool).
+async fn sync_meta_export_handler(State(shared): State<Arc<Shared>>) -> Response {
+    let ctx = shared.ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        rustic_app::meta_sync::export_bundle(&ctx.state, &ctx.data_dir, &*ctx.secrets)
+    })
+    .await;
+    match result {
+        Ok(bundle) => Json(bundle).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SyncMetaImportBody {
+    bundle: rustic_app::meta_sync::MetaBundle,
+    #[serde(default)]
+    overwrite: Vec<String>,
+}
+
+/// `POST /api/sync/meta` — merge an incoming bundle: add new items, replace
+/// only the conflicting items listed in `overwrite`, keep the rest.
+async fn sync_meta_import_handler(
+    State(shared): State<Arc<Shared>>,
+    Json(body): Json<SyncMetaImportBody>,
+) -> Response {
+    let ctx = shared.ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let overwrite: std::collections::HashSet<String> = body.overwrite.into_iter().collect();
+        rustic_app::meta_sync::apply_bundle(
+            &ctx.state,
+            &ctx.data_dir,
+            &*ctx.secrets,
+            &body.bundle,
+            &overwrite,
+        )
+    })
+    .await;
+    match result {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /api/sync/state` — report this server's per-project sync fingerprints
@@ -769,56 +774,24 @@ async fn sync_state_handler(State(shared): State<Arc<Shared>>) -> Response {
     }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct SyncPullBody {
-    /// The client's per-project sync state; projects both sides hold
-    /// unchanged since a shared sync generation travel manifest-only.
-    #[serde(default)]
-    projects: Vec<rustic_app::cloud_sync::PeerProjectState>,
-    /// When set, build a single-project archive (files only) instead of a
-    /// full-environment one — the explorer's "pull this project".
-    #[serde(default)]
-    project_id: Option<String>,
-}
-
 /// `POST /api/sync/pull` — build a full-environment sync archive of this
 /// server and stream it back. The request body carries the client's sync
 /// state so unchanged project trees are skipped. The temp file is deleted
 /// when the response stream drops.
 async fn sync_pull_handler(
     State(shared): State<Arc<Shared>>,
-    body: Option<Json<SyncPullBody>>,
+    body: Option<Json<crate::sync_transfer::PullRequest>>,
 ) -> Response {
-    let (client_state, project_id) = body
-        .map(|Json(b)| (b.projects, b.project_id))
-        .unwrap_or_default();
-    let ctx = shared.ctx.clone();
+    let req = body.map(|Json(b)| b).unwrap_or_default();
     let tmp = shared
         .config
         .data_dir
         .join(format!("sync-pull-{}.tar.zst", std::process::id()));
     let tmp_build = tmp.clone();
+    let shared_build = shared.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let emitter: Arc<dyn rustic_app::EventEmitter> = Arc::new(ctx.clone());
-        let reporter = rustic_app::cloud_sync::SyncReporter::new("pull", emitter);
-        if let Some(project_id) = project_id {
-            return rustic_app::cloud_sync::build_project_archive(
-                &ctx.state,
-                &project_id,
-                &tmp_build,
-                &reporter,
-            );
-        }
-        let skips = rustic_app::cloud_sync::decide_skips(&ctx.state, &ctx.data_dir, &client_state);
-        rustic_app::cloud_sync::build_sync_archive(
-            &ctx.state,
-            &ctx.data_dir,
-            &*ctx.secrets,
-            &tmp_build,
-            &skips,
-            &reporter,
-        )
+        let file = std::fs::File::create(&tmp_build).map_err(|e| e.to_string())?;
+        crate::sync_transfer::build_outgoing(&shared_build, Box::new(file), &req)
     })
     .await;
 

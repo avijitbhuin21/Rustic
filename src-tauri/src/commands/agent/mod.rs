@@ -1427,12 +1427,13 @@ pub async fn send_message(
             // still works.
             let fh_handle_opt = if task_is_plan_mode { None } else { fh_handle_opt };
 
-            // Prepare MCP connection future
+            // Prepare MCP connection future — only this project's effective servers.
             let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
+            let mcp_project_root = PathBuf::from(&project_root);
             let mcp_fut = tokio::task::spawn_blocking(move || {
                 let mut mcp = mcp_arc_connect.lock_safe();
-                let _ = mcp.connect_all();
-                let tools = mcp.all_tools();
+                mcp.connect_project(&mcp_project_root);
+                let tools = mcp.project_tools(&mcp_project_root);
                 let section = build_mcp_system_section(&tools);
                 (tools, section)
             });
@@ -1947,6 +1948,12 @@ pub async fn send_message(
                                     "request_id": request_id,
                                     "questions": questions,
                                 }),
+                            );
+                        }
+                        TaskEvent::AskUserCancelled { task_id, request_id } => {
+                            let _ = app_events.emit(
+                                "agent-ask-user-cancelled",
+                                serde_json::json!({ "task_id": task_id, "request_id": request_id }),
                             );
                         }
                         TaskEvent::CeilingBreached { task_id, request_id, ceiling_cents, spent_cents } => {
@@ -2616,9 +2623,31 @@ pub fn list_tasks(
     state: State<'_, AppState>,
     project_id: Option<String>,
 ) -> Result<Vec<TaskInfo>, String> {
+    let pid_root: Option<String> = project_id.as_ref().and_then(|pid| {
+        state
+            .workspace
+            .lock_safe()
+            .list_projects()
+            .into_iter()
+            .find(|p| p.id.to_string() == *pid)
+            .map(|p| p.root_path.to_string_lossy().to_string())
+    });
     let db = state.db.lock_safe();
     let rows = if let Some(ref pid) = project_id {
-        db.list_tasks_for_project(pid).map_err(|e| e.to_string())?
+        let mut rows = db.list_tasks_for_project(pid).map_err(|e| e.to_string())?;
+        // First-send persistence maps the task to the DB project that owns
+        // this root path, which can have a different id than the workspace
+        // project (issue #1). Include those rows so the chat isn't orphaned.
+        if let Some(root) = pid_root {
+            if let Ok(Some(alias)) = db.get_project_by_path(&root) {
+                if alias.id != *pid {
+                    if let Ok(extra) = db.list_tasks_for_project(&alias.id) {
+                        rows.extend(extra);
+                    }
+                }
+            }
+        }
+        rows
     } else {
         // No project filter: load all in-memory tasks as fallback
         let agent = state.agent.lock_safe();

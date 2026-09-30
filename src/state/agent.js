@@ -29,6 +29,7 @@ const AGENT_EVENTS = [
   'agent-task-complete',
   'agent-permission-request',
   'agent-ask-user-request',
+  'agent-ask-user-cancelled',
   'agent-thinking-delta',
   'agent-thinking-done',
   'agent-todo-updated',
@@ -1999,6 +2000,39 @@ export const useAgent = create((set, get) => ({
   },
 
   setModels: (models) => set({ models }),
+
+  // A pending question stopped waiting (run interrupted, e.g. by a peer
+  // message). Close its card so it can't linger as a second live popup.
+  markAskUserInterrupted: (requestId) => {
+    if (!requestId) return;
+    set((s) => {
+      const nextByTask = { ...s.messagesByTask };
+      let changed = false;
+      for (const [tid, list] of Object.entries(s.messagesByTask)) {
+        let touched = false;
+        const nextList = list.map((m) => {
+          const blocks = m.content || [];
+          if (!blocks.some((b) => b && b.type === 'ask_user' && b.request_id === requestId && !b.answered && !b.cancelled)) {
+            return m;
+          }
+          touched = true;
+          return {
+            ...m,
+            content: blocks.map((b) =>
+              b && b.type === 'ask_user' && b.request_id === requestId
+                ? { ...b, cancelled: true, interrupted: true }
+                : b,
+            ),
+          };
+        });
+        if (touched) {
+          nextByTask[tid] = nextList;
+          changed = true;
+        }
+      }
+      return changed ? { messagesByTask: nextByTask } : s;
+    });
+  },
   setSelectedModel: (provider, modelId) => {
     persistModelPick(provider, modelId);
     set({ selectedProvider: provider, selectedModel: modelId });
@@ -2814,6 +2848,11 @@ export const useAgent = create((set, get) => ({
     } catch (e) {
       // eslint-disable-next-line no-console
       console.error('[agent.respondQuestion] respond_to_ask_user failed', { requestId, error: e });
+      if (!cancelled) {
+        const msg = typeof e === 'string' ? e : e?.message || String(e);
+        toast.error(msg || 'This question is no longer active.');
+        get().markAskUserInterrupted(requestId);
+      }
     }
   },
 
@@ -2890,8 +2929,17 @@ export const useAgent = create((set, get) => ({
     }
     try {
       const tasks = await safeInvoke('list_tasks', { projectId });
-      const list = Array.isArray(tasks) ? tasks : [];
+      const fetched = Array.isArray(tasks) ? tasks : [];
       set((s) => {
+        // Merge, don't replace: a chat created moments ago is only in memory
+        // until its first send persists it, so a refetch racing that insert
+        // must not drop it (issue #1 — "first chat vanishes"). Deleted chats
+        // are removed from the cache before any refetch, so they stay gone.
+        const fetchedIds = new Set(fetched.map((t) => t.id));
+        const localOnly = (s.tasksByProject[projectId] || []).filter(
+          (t) => t && t.id && !fetchedIds.has(t.id) && !/^(local|mock)-/.test(t.id),
+        );
+        const list = [...localOnly, ...fetched];
         const patch = {
           tasksByProject: { ...s.tasksByProject, [projectId]: list },
           tasksLoadedByProject: { ...s.tasksLoadedByProject, [projectId]: true },
@@ -2916,7 +2964,7 @@ export const useAgent = create((set, get) => ({
         if (goalsTouched) patch.goalByTask = goals;
         return patch;
       });
-      return list;
+      return get().tasksByProject[projectId] || fetched;
     } catch (e) {
       set((s) => ({
         tasksLoadedByProject: { ...s.tasksLoadedByProject, [projectId]: true },
@@ -3166,6 +3214,23 @@ export const useAgent = create((set, get) => ({
       'agent-tool-result': (p) => {
         clearRetry(p.task_id);
         get().addToolResult(p.task_id, p.tool_use_id, p.output, p.is_error);
+        // Agent changed skills / workflows / rules / MCP servers: let open
+        // Settings panels reload their lists (issue #11).
+        if (!p.is_error && typeof window !== 'undefined') {
+          const msgs = get().messagesByTask[p.task_id] || [];
+          let toolName = null;
+          for (let i = msgs.length - 1; i >= 0 && !toolName; i--) {
+            for (const b of msgs[i].content || []) {
+              if (b && b.type === 'tool_use' && b.id === p.tool_use_id) {
+                toolName = b.name;
+                break;
+              }
+            }
+          }
+          if (['install_extension', 'uninstall_extension', 'add_mcp_server'].includes(toolName)) {
+            window.dispatchEvent(new CustomEvent('rustic:extensions-changed', { detail: { tool: toolName } }));
+          }
+        }
       },
       'agent-cost-update': (p) => get().setCost(p.task_id, p.cost),
       'agent-request-usage': (p) => {
@@ -3197,6 +3262,7 @@ export const useAgent = create((set, get) => ({
       'agent-permission-request': (p) => get().openPermission(p),
       'agent-ask-user-request': (p) =>
         get().appendAskUserBlock(p?.task_id, p?.request_id, p?.questions),
+      'agent-ask-user-cancelled': (p) => get().markAskUserInterrupted(p?.request_id),
       'agent-todo-updated': (p) => get().setTodos(p.task_id, p.todos || []),
       'agent-peer-message': (p) => {
         if (!p?.task_id || !p?.text) return;

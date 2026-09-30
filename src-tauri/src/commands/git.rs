@@ -937,9 +937,16 @@ pub async fn github_poll_token(
 
 #[tauri::command]
 pub async fn github_get_user(state: State<'_, AppState>) -> Result<OAuthUserInfo, String> {
-    let token = {
-        let stored = state.git_token.lock_safe();
-        stored.clone().ok_or("Not authenticated")?
+    let stored = state.git_token.lock_safe().clone();
+    // No Rustic token: git may still authenticate through the machine's own
+    // credential helper / gh CLI — borrow that token just to read the
+    // username (issue #13). It is never stored or used for git operations.
+    let token = match stored {
+        Some(t) => t,
+        None => tokio::task::spawn_blocking(rustic_git::identity::discover_github_token)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("Not authenticated")?,
     };
 
     let client = reqwest::Client::new();

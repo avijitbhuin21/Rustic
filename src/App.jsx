@@ -45,6 +45,7 @@ import { initGitAutoRefresh } from '@/lib/git-auto-refresh';
 import { initExternalAgents } from '@/state/external-agents';
 import { useBreakpoint } from '@/lib/use-breakpoint';
 import { IS_WEB } from '@/lib/platform';
+import { LanPairPrompt } from '@/components/settings/lan-pair-prompt';
 import { MobileShell } from '@/components/shell/mobile-shell';
 import { TabletShell } from '@/components/shell/tablet-shell';
 import { FolderPickerHost } from '@/components/web/folder-picker-host';
@@ -318,6 +319,7 @@ export default function App() {
       {!IS_WEB && <WindowControls />}
       {IS_WEB && <FolderPickerHost />}
       {IS_WEB && <BrowserWindow />}
+      {!IS_WEB && <LanPairPrompt />}
       <Toaster />
       <ConfirmDialogHost />
       <SaveConflictDialogHost />

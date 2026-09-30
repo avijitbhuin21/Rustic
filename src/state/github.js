@@ -37,15 +37,24 @@ export const useGithubAuth = create((set, get) => ({
     set({ initialized: true });
     try {
       const has = await invoke('git_get_token');
-      if (!has) {
-        set({ hasToken: false, user: null });
-        return;
-      }
-      set({ hasToken: true });
+      set({ hasToken: !!has });
+      // Even without a Rustic token the backend can read the username through
+      // the machine's own git credential helper / gh CLI (issue #13).
       const user = await invoke('github_get_user').catch(() => null);
       set({ user });
     } catch {
       set({ hasToken: false, user: null });
+    }
+    // Retry when the window regains focus while the name is still missing
+    // (offline at launch, credential helper not ready yet, ...).
+    if (typeof window !== 'undefined' && !get()._focusRetry) {
+      const onFocus = async () => {
+        if (get().user || get().loading) return;
+        const user = await invoke('github_get_user').catch(() => null);
+        if (user) set({ user });
+      };
+      window.addEventListener('focus', onFocus);
+      set({ _focusRetry: true });
     }
   },
 

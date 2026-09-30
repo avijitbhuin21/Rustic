@@ -30,10 +30,12 @@ flate2 = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
 uuid = { workspace = true }
-zstd = { workspace = true }
+zstd = { workspace = true, features = ["zstdmt"] }
 notify = { workspace = true, features = ["macos_fsevent"] }
 reqwest = { workspace = true }
 ignore = { workspace = true }
+# Shared `/api/sync/v2/*` chunked-transfer routes (rustic-server + LAN listener).
+axum = "0.7"
 
 # Read-only access to the SQLite conversation stores the Antigravity CLI keeps
 # outside Rustic; `bundled` matches rustic-db so both link one libsqlite3.
@@ -41,3 +43,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "time"] }

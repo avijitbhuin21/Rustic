@@ -885,6 +885,7 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                       answered={!!block.answered}
                       answers={block.answers}
                       cancelled={!!block.cancelled}
+                      interrupted={!!block.interrupted}
                     />
                   );
                 }

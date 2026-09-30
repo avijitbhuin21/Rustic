@@ -325,6 +325,8 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
     if (!rootPath) return;
     let unlisten = null;
     const norm = (p) => (p ?? '').replace(/\\/g, '/');
+    // Windows paths are case-insensitive; compare drive-letter paths lowercased.
+    const winKey = (p) => (/^[a-zA-Z]:\//.test(p) ? p.replace(/\/+$/, '').toLowerCase() : p.replace(/\/+$/, ''));
     const rootNorm = norm(rootPath);
     listen('rustic:fs-change', (e) => {
       // While an inline rename is in progress, refreshing would replace `data`
@@ -337,8 +339,16 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
       if (treeRef.current?.editingId != null) return;
       const payload = e.payload ?? {};
       const projectPath = norm(payload.project_path);
-      if (projectPath !== rootNorm) return;
+      if (winKey(projectPath) !== winKey(rootNorm)) return;
       const changed = Array.isArray(payload.changed_dirs) ? payload.changed_dirs : [];
+
+      // Events were lost (watcher error / OS buffer overflow): re-read the
+      // root and every directory the tree has loaded (issue #12).
+      if (payload.rescan) {
+        refreshDir(rootPath);
+        for (const key of childrenCache.current.keys()) refreshDir(key);
+        return;
+      }
 
       // Build a normalised→original lookup off the cache. The watcher
       // emits `changed_dirs` with forward slashes (it does the conversion
@@ -352,13 +362,13 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
       const cache = childrenCache.current;
       const loadedNormToOrig = new Map();
       for (const key of cache.keys()) {
-        loadedNormToOrig.set(norm(key), key);
+        loadedNormToOrig.set(winKey(norm(key)), key);
       }
 
       const toRefresh = new Set();
       for (const dir of changed) {
-        const d = norm(dir);
-        if (d === rootNorm) {
+        const d = winKey(norm(dir));
+        if (d === winKey(rootNorm)) {
           toRefresh.add(rootPath);
           continue;
         }

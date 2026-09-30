@@ -26,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 import { Section, slugify, useAiConfig } from './shared';
+import { SearchableSelect } from '@/components/ui/searchable-select';
 
 // ─── GitHub auto issue resolve (web/server build only) ──────────────────────
 
@@ -225,7 +226,8 @@ export function GithubAutoResolveSection() {
 
               <div className="flex items-center gap-2">
                 <span className="text-[12px] text-muted-foreground w-28 shrink-0">Issue-task model</span>
-                <Select
+                <SearchableSelect
+                  className="h-7 flex-1"
                   value={
                     projCfg.providerType && projCfg.model
                       ? `${projCfg.providerType}::${projCfg.model}`
@@ -243,49 +245,23 @@ export function GithubAutoResolveSection() {
                       });
                     }
                   }}
-                >
-                  <SelectTrigger className="h-7 flex-1 text-xs">
-                    <SelectValue placeholder="Project default" />
-                  </SelectTrigger>
-                  <SelectContent className="max-h-72">
-                    <SelectItem value="__default__" className="text-xs">Project default</SelectItem>
-                    {/* Keep a previously-saved model selectable even when the
-                        provider's live list no longer (or doesn't yet) contain it. */}
-                    {projCfg.providerType && projCfg.model &&
-                      !(liveByKey[projCfg.providerType] || []).some(
-                        (m) => (m.id || m.model_id) === projCfg.model,
-                      ) && (
-                      <SelectItem
-                        value={`${projCfg.providerType}::${projCfg.model}`}
-                        className="text-xs font-mono"
-                      >
-                        {projCfg.model} (saved)
-                      </SelectItem>
-                    )}
-                    {providers.map((p) => {
-                      const models = liveByKey[p.key] || [];
-                      if (models.length === 0) return null;
-                      return (
-                        <SelectGroup key={p.key}>
-                          <SelectLabel className="text-[11px] text-muted-foreground">{p.label}</SelectLabel>
-                          {models.map((m) => {
-                            const id = m.id || m.model_id;
-                            if (!id) return null;
-                            return (
-                              <SelectItem
-                                key={`${p.key}::${id}`}
-                                value={`${p.key}::${id}`}
-                                className="text-xs font-mono"
-                              >
-                                {id}
-                              </SelectItem>
-                            );
-                          })}
-                        </SelectGroup>
-                      );
-                    })}
-                  </SelectContent>
-                </Select>
+                  placeholder="Project default"
+                  searchPlaceholder="Search models…"
+                  groups={[
+                    { label: null, options: [{ value: '__default__', label: 'Project default' }] },
+                    // A previously-saved model stays selectable (SearchableSelect
+                    // surfaces an unknown value) even when the live list lacks it.
+                    ...providers
+                      .map((p) => ({
+                        label: p.label,
+                        options: (liveByKey[p.key] || [])
+                          .map((m) => m.id || m.model_id)
+                          .filter(Boolean)
+                          .map((id) => ({ value: `${p.key}::${id}`, label: id })),
+                      }))
+                      .filter((g) => g.options.length > 0),
+                  ]}
+                />
               </div>
 
               <div className="flex justify-end">

@@ -1,5 +1,164 @@
- Okay, so whenever we start a chat, sometimes for the first chat it just vanishes.
+# Rustic issue checklist
 
- Sagnik shared some feedback, we need to work on that.
+Logs for Sagnik's feedback: issues/rustic.log.2026-09-16, -18, -19, -20
 
- D:\Programming\Projects\Personal\Rustic\issues\pasted-image.png  -- when a peer agent asks a clarifying question i get two similer ask user popup.
+## Bugs
+
+- [x] 1. First chat disappears from the sidebar after switching away
+  - FIXED: loadTasksForProject now merges unsaved local chats instead of replacing the list (src/state/agent.js); list_tasks (desktop + server) also returns tasks saved under the DB project that owns the same root path.
+  - Chat stays usable while open; after switching to another chat it is gone from the list, even after 10-15 min of chatting.
+  - Cause: first-send expands the project -> loadTasksForProject fetches from DB before the task row is inserted (src-tauri/src/commands/agent/mod.rs:698) and REPLACES the local list (src/state/agent.js:2896, 2899). tasksLoadedByProject then blocks any refetch.
+  - Possible second cause: ensure_project maps to an older project id by root_path (crates/rustic-db/src/project_repo.rs:70-74), so the task is saved under an id the sidebar never queries. Check: does the chat come back after a restart?
+
+- [x] 2. Long server waiting time (Opus 5)
+  - FIXED: retry backoff now 2s/8s/20s; provider client has a 300s per-read idle timeout; proxy 413 body-limit errors no longer trigger the condense-and-retry loop (surfaced immediately). Still check the proxy's ~30s cut and 413 limit on frostbyte.surobahare.com.
+  - Retry backoff 3s / 60s / 90s (crates/rustic-agent/src/task/executor.rs:1478); stall watchdog 180s (:1490); no read/idle timeout (crates/rustic-agent/src/provider/mod.rs:372-378).
+  - 413 "Payload Too Large" from the proxy at ~35k chars triggers a useless condense-and-retry loop.
+
+- [x] 3. Truncated response / decoding failure (Opus 5)
+  - FIXED: a stream that ends with neither [DONE] nor finish_reason is now a retryable error, not EndTurn (openai.rs; tests stream_cut_tests).
+  - Opus 5 goes through the OpenAI-compatible proxy (openai.rs, not claude.rs); the proxy cuts streams at ~30s.
+  - Stream end without [DONE]/finish_reason is treated as success (crates/rustic-agent/src/provider/openai.rs:350-358, 656).
+
+- [x] 4. Edits break mid-way
+  - FIXED: cut streams are retried instead of dropping the edit; the EOF parse message no longer wrongly blames payload size.
+  - Same cut stream: partial tool args become __parse_error and the call is dropped (openai.rs:621-633).
+  - Error text wrongly blames payload size (openai.rs:131-139), so the model re-sends and gets cut again.
+
+- [x] 5. Retry option missing
+  - FIXED: cut streams now go through the transient-error path, which emits StreamRetry (retry banner).
+  - Cut streams return Ok, so no StreamRetry event is emitted; 4xx (incl. 413) also skips the banner (executor.rs:1917-1928).
+
+- [x] 6. Duplicate ask_user popup when a peer agent messages
+  - FIXED: broker drop-guard removes the stale request and emits AskUserCancelled -> card shows "interrupted"; answering a dead question returns an error + toast instead of being silently lost (desktop + server).
+  - Peer message cancels the run while ask_user is pending; broker entry is never cleaned up (crates/rustic-agent/src/task/ask_user_broker.rs:68-75), card is never finalized, and the new turn asks again.
+  - The answer to the first popup is silently dropped (ask_user_broker.rs:87).
+
+## MCP servers (feature work) — implemented, needs a manual UI test in the desktop app
+
+- [x] 7. Fix the broken "Edit mcp.json" dialog layout (content overflows the dialog).
+  - Cause: shared Textarea uses field-sizing-content, so long lines widened the dialog grid.
+- [x] 8. Split the two header buttons:
+  - "Edit JSON" edits the full global pool (all servers, all projects).
+  - "+" adds a single new server to the global pool, with a project checklist.
+- [x] 9. Per-project MCP configuration
+  - "Configure" action next to delete on each server row.
+  - For each project open in Rustic: override the server config (API keys, env, etc.).
+  - Enable/disable the server per project.
+  - On save, test the connection with that project's config and show the result.
+  - Agent tasks use the project's effective config at runtime.
+  - Files per project: .mcp.json (Claude Code), .gemini/settings.json, .codex/config.toml, .rustic/mcp.json (disabled list); all added to .gitignore.
+
+## UI: dropdowns
+
+- [x] 10. Every long dropdown must have search + scroll and stay on screen
+  - FIXED: new src/components/ui/searchable-select.jsx used for model lists (sub-agent, audio, source control, media tools, GitHub override); SelectContent defaults to popper with a viewport-capped height; template picker popover is modal with a visible scrollbar.
+  - Goal: compact, settings-style dropdowns; search box + scrollable list everywhere; never taller than the viewport.
+  - Root cause A (lists go off-screen, no search): shared SelectContent defaults to position="item-aligned" (src/components/ui/select.jsx:57). Its max-h uses --radix-select-content-available-height, which Radix only sets in "popper" mode, so the height cap is dead and long lists spill past the screen. Plain Select has no search at all.
+  - Root cause B (template list won't scroll): "Use template (optional)" picker in the Edit model dialog is a Popover without `modal` inside a Dialog (src/components/agent/register-model-modal.jsx:512-533). The Dialog's scroll lock swallows wheel events on the portalled popover; CommandList also hides its scrollbar (no-scrollbar, src/components/ui/command.jsx:77).
+  - Offenders (provider + model selects, model lists can be 50-300+ items):
+    - Settings > Models & Budget: subagent-section.jsx:140/153/163, audio-section.jsx:126/139/145, source-control-section.jsx:112/125/131
+    - Settings > Tools & MCP: tools-section.jsx:149/162/172 (MediaToolDialog, includeAll models)
+    - Settings > GitHub: github-section.jsx:174 (project), 228/250 (model override; its max-h-72 is ignored)
+    - Edit model dialog: register-model-modal.jsx:527 (template picker), 578 (provider)
+    - Onboarding: onboarding-wizard.jsx:221 (provider)
+  - Already fine: chat model picker (prompt-box.jsx:1210), openrouter-provider-select.jsx, command palette, branch switcher, terminal project picker.
+  - Fix plan:
+    - New shared src/components/ui/searchable-select.jsx (Popover modal + Command): always-visible search, groups, visible scrollbar, list max-h = min(320px, available height), collision padding, keeps a saved value visible even if not in the fetched list.
+    - Replace all provider/model Selects listed above with it.
+    - Template picker: add `modal` to its Popover, drop no-scrollbar.
+    - Safety net: SelectContent default position="popper" + max-h-[min(320px,var(--radix-select-content-available-height))] so short Selects can never overflow either.
+
+## Agent self-extension from chat
+
+- [x] 11. Agent tools to add / remove skills, workflows, rules and MCP servers when the user asks
+  - DONE: install_extension / uninstall_extension support kind "rule" (project or global, `activate` for global rules); `overwrite=true` edits a skill/workflow/rule in place; add_mcp_server user scope = global pool, project scope = per-project files (.mcp.json/.gemini/.codex + gitignore); uninstall mcp_server with scope=project disables it for that project only.
+  - DONE: new read-only `list_extensions` tool (skills, workflows, rules with scope + activation, MCP pool + servers active in this project); Settings and chat-side Skills/Workflows/Rules/MCP panels refresh live after the agent changes something (`rustic:extensions-changed`).
+  - Scope: project or global for every kind. Keep the existing consent rules (global scope, URLs and MCP servers always need user approval).
+  - Already exists (crates/rustic-agent/src/tools/extension_tools.rs):
+    - install_extension: add a skill or workflow (project/global, from content or URL).
+    - uninstall_extension: remove a skill, workflow or MCP server (moved/backed up to ~/.rustic/trash/).
+    - add_mcp_server: register an MCP server (project/user scope).
+  - Missing / to do:
+    - Rules: no agent tools yet. Add add_rule / remove_rule (+ activate/deactivate a global rule for the current project). Rules live in <project>/.rustic/rules/*.md and ~/.rustic/rules/, activation in ~/.rustic/rules-state.json (crates/rustic-agent/src/rules/mod.rs).
+    - Edit in place: update an existing skill / workflow / rule (today it is uninstall + reinstall).
+    - MCP tools still use the old model: add_mcp_server's project scope only writes .mcp.json. Align with item 9: add to global pool + pick projects, write .mcp.json/.gemini/.codex + .gitignore, enable/disable per project, configure per project (entry/API keys) with a connection test; uninstall should remove from pool and/or a single project.
+    - List tool (or extend existing listings) so the agent can see what is installed per scope before changing it.
+    - Settings UI panels (skills/workflows/rules/MCP) must refresh when the agent changes something.
+
+## File changes not showing live
+
+- [x] 12. Explorer tree and open editor tabs miss file changes (agent edits, terminal, e.g. `python -m venv .venv`) — intermittent, desktop AND server
+  - FIXED: creating/removing .venv/build/etc. itself is reported; watcher errors/overflow emit `rescan: true` (tree re-reads cached dirs, open tabs re-check); case-insensitive path matching on Windows; server sends a rescan to a lagged WebSocket client; symbol-index updates now run in the flush thread instead of the notify callback (Cause C); a watcher that fails to start keeps a placeholder entry and retries in the background every 10s for ~5 min, stopping when the project is closed (Cause D).
+  - Both platforms share one watcher: crates/rustic-app/src/watcher.rs (whole project, batched `rustic:fs-change` every ~300 ms). Agent writes emit no event of their own — everything depends on this watcher.
+  - Cause A (certain for .venv): WATCHER_SKIP_DIRS (watcher.rs:13-31) includes .venv, venv, build, dist, out, tmp, target, node_modules, and the filter drops the folder ITSELF, not just its contents (watcher.rs:252). So creating .venv/build/dist never refreshes the parent -> folder never appears; open files inside them never reload.
+  - Cause B (likely the "sometimes"): watcher errors and rescan signals are ignored (`if let Ok(event) = res`, watcher.rs:203). Big bursts (venv, pip/npm install, git checkout) overflow the Windows event buffer -> whole batch lost silently, including unrelated agent edits, no rescan. The other watcher (crates/rustic-agent/src/file_history/watcher.rs) already handles overflow/rescan.
+  - Cause C: symbol-index work runs inside the notify callback while holding the lock (watcher.rs:268-276), slowing event draining and making overflow more likely.
+  - Cause D: a watcher that fails to start (watcher.rs:280-299) is never retried (e.g. after cloud-sync re-watch).
+  - Cause E (editor tabs): fsChangeTouchesPath (src/lib/use-file-change.js:18-33) compares paths exactly — drive-letter/case differences on Windows miss the reload. Tabs with unsaved edits intentionally don't reload (monaco-editor.jsx:453).
+  - Cause F (server only): hub broadcast channel of 1024 (rustic-server/src/lib.rs:180) shared with agent streaming; a lagging client skips ahead (ws.rs:39-40) and loses fs-change events, with no resync on skip/reconnect.
+  - Fix plan: report create/remove of skipped folders themselves (filter only paths inside them); on Err/rescan log it and emit a "rescan all" fs-change that refreshes cached tree dirs + open tabs; move index work out of the callback; retry failed watchers and surface errors; case-insensitive path compare on Windows; server rescan on lag/reconnect; optionally have agent file tools emit fs-change for the paths they write.
+
+## Git / GitHub
+
+- [x] 13. GitHub username not shown on some computers, although sync/pull/push work
+  - FIXED: github_get_user falls back to `gh auth token` then non-interactive `git credential fill` (crates/rustic-git/src/identity.rs, desktop + server); frontend always tries and retries on window focus.
+  - Cause: the name comes only from GitHub /user using Rustic's OWN stored token (src/state/github.js:39-46 -> github_get_user, src-tauri/src/commands/git.rs:939-962, rustic-server/src/commands/git.rs:912-938). Push/pull without that token fall back to the system git credential helper (crates/rustic-git/src/remote.rs:37-59), e.g. Git Credential Manager / SSH / gh — so git works but no username.
+  - Also: keychain load failure is ignored (src-tauri/src/lib.rs:202-204); /user errors are swallowed (github.js:45) and shown as a bare "GitHub"; init() runs once with no retry (github.js:36-37), so an offline start leaves it empty all session; web server stores the token per server data dir.
+  - Fix plan: backend `github_identity` fallback chain — Rustic token -> `gh auth token` -> non-interactive `git credential fill` (GIT_TERMINAL_PROMPT=0, GCM_INTERACTIVE=never) -> /user; last resort remote-URL user / `git config user.name` (name only). Log keychain failures, show an error state instead of "GitHub", retry on focus/online.
+
+## Terminal
+
+- [x] 14. Side-panel terminal text vanishes with Antigravity / Claude Code / Codex (comes back on scroll)
+  - FIXED: terminal repaints (clear glyph atlas + refresh) when it becomes visible again (IntersectionObserver), after real resizes, on window focus / tab visibility / DPR change, and after WebGL context loss (terminal-instance.js). Needs confirmation on an affected machine.
+  - Screenshot: .rustic/uploaded/pasted-image-2.png — text replaced by blank/solid blocks.
+  - Cause: xterm WebGL renderer (@xterm/addon-webgl, src/components/terminal/terminal-instance.js:169-175, 366-398) draws from a stale glyph atlas after the panel is hidden/resized/GPU cache drop. The repaint() helper (clear atlas + full refresh, terminal-instance.js:529-533) only runs when a pane's `active` flips (terminal-pane.jsx:204-220) or when scrolling into history (terminal-instance.js:480-495). The side panel mounts the pane with `active` hard-coded true (src/components/agent/cli-chat-view.jsx:131), so it never repaints after being hidden/shown. Resize (refit) never repaints; no visibilitychange/focus/DPR handling; onContextLoss disposes WebGL without refreshing (terminal-instance.js:370-377).
+  - Why scroll fixes it: scrolling triggers the atlas clear/refresh, or (alternate screen) makes the TUI redraw everything.
+  - Fix plan: pass a real visibility signal (or IntersectionObserver) to TerminalPane in cli-chat-view; repaint after real size changes (debounced); repaint on visibilitychange / window focus / DPR change; on context loss refresh + refit (optionally re-create WebGL).
+  - Quick confirm on an affected machine: localStorage['rustic.terminal.renderer']='dom' — if text stops vanishing, it's the WebGL atlas.
+
+## Cloud & sync (feature work)
+
+- [x] 15. New "Cloud" section under Settings > Workspace (replaces "Remote Backend" + "Cloud Sync")
+  - DONE: Settings > Workspace > Cloud (src/components/settings/cloud-settings.jsx; old remote-backend-settings.jsx removed): remote backend enable toggle + URL/password/test/open; Sync with transport toggle; Push/Pull with a project picker (per-project via cloud_sync_push_project / cloud_sync_pull_project) or "Everything" (old full sync).
+  - DONE: "Everything" sync now also carries metadata — global rules, skills, workflows, rules-state (per-project activation remapped to the receiving machine's roots) and the MCP server pool (cloud_sync.rs `meta/` entries; older archives/receivers unaffected).
+  - DONE: Pull can bring projects that exist only on the other side (listed in the picker, folder picker per project).
+  - DONE: MCP approvals travel with synced projects (mcp_consent.json entries remapped to the receiving machine's paths), so pulled projects don't re-prompt.
+  - DONE: "Metadata only" sync (providers + keys, model settings, global rules/skills/workflows, MCP servers): merge — new items added, items only on the receiving side kept, same-name items listed for per-item Overwrite/Keep review (rustic-app meta_sync.rs; server GET/POST /api/sync/meta).
+  - DONE: Local-network sync (src-tauri/src/lan/): opt-in "Allow local-network sync"; mDNS discovery; Accept/Decline pairing with a matching 6-digit code on both screens; TLS pinned to each device's self-signed certificate; per-device tokens; same Selected projects / Metadata only / Everything push+pull as the remote backend; incoming-sync notices.
+  - Known limits: custom model templates live in browser localStorage, so they are not part of metadata sync; LAN sync is desktop-only (IPv4); paired-device tokens are stored in <app data>/lan/peers.json.
+  - Today: both live in src/components/settings/remote-backend-settings.jsx (sections at :162 and :234), mounted from general-settings.jsx:146 (desktop only). Sync engine: crates/rustic-app/src/cloud_sync.rs — ONE archive of the whole environment (SQLite snapshot, file history, secrets, every non-archived project), destructive replace both ways, no project selection. Only build/dependency dirs are skipped (SYNC_EXCLUDED_DIRS, cloud_sync.rs:105-120); .env files already travel.
+  - Remove: the "Remote Backend" and "Cloud Sync" blocks from General settings (including the current "Push to cloud" / "Pull from cloud" buttons).
+  - Cloud > Remote backend
+    - Enable toggle -> server URL + password fields -> "Test connection" (same thin-client mode as today).
+  - Cloud > Sync — transport toggle: Remote backend | Local network
+    - Remote backend: checks the remote backend is connected; if not, prompt to set it up above.
+    - Local network (NEW): discover other running Rustic instances on the same Wi-Fi/LAN and sync directly between machines, no internet needed.
+    - Actions for both transports: Pull (other side -> this machine) and Push (this machine -> other side, same semantics as today's push).
+    - Project picker: on Push/Pull, ask which projects to include (checkbox list) instead of always syncing everything.
+    - Carry project-local secrets: include .env / .env.* and other git-ignored config (e.g. .mcp.json, .gemini/, .codex/, .rustic/) so a project is fully usable on the other machine.
+    - Metadata sync (NEW option, next to project sync, works on both transports): sync the global Rustic setup without any project files.
+      - Providers + API keys + custom models/templates. Today only travel inside the all-or-nothing full archive (DB snapshot + secrets export, crates/rustic-app/src/cloud_sync.rs:392-412).
+      - Global rules: ~/.rustic/rules/*.md + ~/.rustic/rules-state.json (per-project activation — remap project paths on the receiving machine).
+      - Global skills and workflows: skills::global_skills_dir(), workflows::global_workflows_dir() (~/.rustic/...).
+      - MCP pool: <app_data>/mcp.json + mcp_consent.json (approvals are keyed by project path/hash — remap or re-prompt).
+      - Not synced today at all: rules, skills, workflows, MCP pool (cloud_sync.rs never touches them).
+      - Let the user pick categories (checkboxes: Providers & keys, Models, Rules, Skills, Workflows, MCP servers) for Push/Pull.
+      - Decide merge vs replace per category: replace is simplest; merge-by-name (keep local-only items, overwrite same-name items) is friendlier for rules/skills/MCP.
+      - Same security bar as project sync: API keys travel, so encrypted + paired channel only.
+  - Local-network design notes / decisions needed:
+    - Discovery: mDNS/DNS-SD (e.g. `_rustic._tcp`) or UDP broadcast; show device name, OS user, Rustic version.
+    - Pairing + auth: never accept unknown peers silently — pairing code or password shown on the receiving machine; remember paired devices.
+    - Encryption: .env files, API keys and secrets travel, so the LAN channel must be encrypted (TLS with pinned per-device cert, or Noise), not plain HTTP.
+    - Windows firewall prompt on first listen; allow disabling discovery (listening off by default?).
+    - Per-project semantics: what else goes with a project — its chat history/tasks, file history, per-project settings — vs. global state (providers, API keys, global skills/rules/MCP pool). Today's archive is all-or-nothing.
+    - Conflicts: pull replaces the selected projects locally (destructive, as today) — show a confirmation listing what will be overwritten; project root paths get rewritten for the receiving machine (existing logic).
+    - Progress: reuse rustic:sync-progress reporting; large repos should stream rather than build one archive in memory.
+    - Web build (IS_WEB): decide whether the Cloud section is hidden (as Remote Backend is today) or partially available.
+
+- [x] 16. Faster cloud / LAN sync transfers
+  - [x] Streaming: pack while sending, extract while receiving (growing file + contiguous-prefix assembler)
+  - [x] Multi-threaded zstd on all cores
+  - [x] Parallel 8 MB chunks (4 streams remote, 2 LAN) over `/api/sync/v2/*`
+  - [x] Resumable: per-chunk SHA-256, retry with backoff, receiver reports held chunks; sessions kept 60 min
+  - [x] Falls back to the old single-stream sync when the other side is older

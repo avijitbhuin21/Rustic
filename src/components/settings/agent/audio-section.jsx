@@ -26,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 import { Section, isTauri, slugify, useAiConfig } from './shared';
+import { SearchableSelect } from '@/components/ui/searchable-select';
 
 // ─── Audio Input ───────────────────────────────────────────────────────────────
 
@@ -136,24 +137,16 @@ export function AudioInputSection() {
             ))}
           </SelectContent>
         </Select>
-        <Select value={model} onValueChange={setModel} disabled={!providerKey}>
-          <SelectTrigger className="h-8 flex-1 text-xs">
-            <SelectValue placeholder={
-              !providerKey ? 'Pick a provider first' : modelsLoading ? 'Loading models…' : 'Pick a model…'
-            } />
-          </SelectTrigger>
-          <SelectContent>
-            {model && !(providerModels || []).includes(model) && (
-              <SelectItem key={model} value={model}>{model}</SelectItem>
-            )}
-            {(providerModels || []).map((m) => (
-              <SelectItem key={m} value={m}>{m}</SelectItem>
-            ))}
-            {providerKey && !modelsLoading && (providerModels || []).length === 0 && !model && (
-              <div className="px-2 py-1.5 text-xs text-muted-foreground">No models returned.</div>
-            )}
-          </SelectContent>
-        </Select>
+        <SearchableSelect
+          value={model}
+          onValueChange={setModel}
+          disabled={!providerKey}
+          options={providerModels || []}
+          className="flex-1"
+          placeholder={!providerKey ? 'Pick a provider first' : modelsLoading ? 'Loading models…' : 'Pick a model…'}
+          searchPlaceholder="Search models…"
+          emptyText={modelsLoading ? 'Loading models…' : 'No models returned.'}
+        />
         {(providerKey || model) && (
           <Button size="icon-sm" variant="ghost" className="size-8 text-muted-foreground hover:text-destructive" onClick={clearChoice}>
             <Trash2 className="size-3.5" />

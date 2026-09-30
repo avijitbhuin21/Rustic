@@ -509,7 +509,9 @@ export function RegisterModelModal({
           {!isOpenRouter && (
             <div className="flex flex-col gap-1.5">
               <Label className="text-xs">Use template (optional)</Label>
-              <Popover open={templateOpen} onOpenChange={setTemplateOpen}>
+              {/* `modal`: inside the Edit model Dialog the dialog's scroll lock
+                  swallows wheel events on a non-modal popover (issue #10). */}
+              <Popover open={templateOpen} onOpenChange={setTemplateOpen} modal>
                 <PopoverTrigger asChild>
                   <Button
                     variant="outline"
@@ -526,11 +528,12 @@ export function RegisterModelModal({
                 </PopoverTrigger>
                 <PopoverContent
                   align="start"
-                  className="w-[var(--radix-popover-trigger-width)] p-0"
+                  collisionPadding={8}
+                  className="w-[var(--radix-popover-trigger-width)] gap-0 p-0"
                 >
                   <Command>
                     <CommandInput placeholder="Search models…" />
-                    <CommandList>
+                    <CommandList className="max-h-[min(320px,calc(var(--radix-popover-content-available-height)-3rem))] overscroll-contain [scrollbar-width:thin] [&::-webkit-scrollbar]:block">
                       <CommandEmpty>
                         {orLoading ? 'Loading catalogue…' : 'No models found.'}
                       </CommandEmpty>

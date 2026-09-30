@@ -8,6 +8,7 @@ pub mod file_history;
 pub mod file_tree;
 pub mod formatters;
 pub mod git;
+pub mod lan_sync;
 pub mod notebook_kernel;
 pub mod preview;
 pub mod rules;

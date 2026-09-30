@@ -599,6 +599,7 @@ impl BuiltinTools {
                 | "install_extension"
                 | "add_mcp_server"
                 | "uninstall_extension"
+                | "list_extensions"
                 | "todo_write"
                 | "spawn_subagent"
                 | "list_subagents"
@@ -636,6 +637,7 @@ impl BuiltinTools {
                 | "grep_search"
                 | "glob"
                 | "read_skill"
+                | "list_extensions"
                 | "search_history"
                 | "read_history"
                 | "list_subagents"
@@ -711,7 +713,7 @@ impl ToolExecutor for BuiltinTools {
             "grep_search" | "glob" => search::execute(name, tool_use_id, params, context).await,
             "read_skill" => skill_tools::execute(name, params, context).await,
             "read_workflow" => workflow_tools::execute(name, params, context).await,
-            "install_extension" | "add_mcp_server" | "uninstall_extension" => {
+            "install_extension" | "add_mcp_server" | "uninstall_extension" | "list_extensions" => {
                 extension_tools::execute(name, params, context).await
             }
             "todo_write" => todo_tools::execute(name, params, context).await,

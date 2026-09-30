@@ -270,7 +270,7 @@ pub fn respond_to_ask_user(
     images: Option<Vec<super::ImageAttachment>>,
 ) -> Result<(), String> {
     let agent = state.agent.lock().map_err(|e| e.to_string())?;
-    agent.ask_user_broker.respond(
+    let delivered = agent.ask_user_broker.respond(
         &request_id,
         rustic_agent::task::ask_user_broker::AskUserResponse {
             answers,
@@ -278,8 +278,15 @@ pub fn respond_to_ask_user(
             images: decode_ask_user_images(images),
         },
     );
+    if !delivered {
+        return Err(ASK_USER_STALE_MSG.to_string());
+    }
     Ok(())
 }
+
+/// Error shown when an answer arrives for a question that is no longer waiting.
+pub const ASK_USER_STALE_MSG: &str =
+    "This question is no longer active (the run was interrupted). Answer the newest question instead.";
 
 /// Resolve a parked ceiling-breach. `action`: "raise" (persists new ceiling) or "stop".
 #[tauri::command]

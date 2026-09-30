@@ -1,6 +1,7 @@
 pub mod conflict;
 pub mod diff;
 pub mod git_cli;
+pub mod identity;
 pub mod io_util;
 pub mod log;
 pub mod remote;

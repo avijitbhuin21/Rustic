@@ -23,9 +23,8 @@ pub mod workspace;
 
 pub use config::{
     AiConfig, AudioInputConfig, MaxTokensKey, ModelCapabilities, ParamOverride, ProviderEntry,
-    ProviderType, RequestParamOverrides,
-    SourceControlConfig, SubagentConfig, ToolConfig, WebFetchConfig, WebSearchBackend,
-    WebSearchConfig,
+    ProviderType, RequestParamOverrides, SourceControlConfig, SubagentConfig, ToolConfig,
+    WebFetchConfig, WebSearchBackend, WebSearchConfig,
 };
 pub use file_history::{
     BaselineGate, BaselineState, CaptureOutcome, ChangeCallback, DirtyPathAccumulator, DirtySet,
@@ -35,8 +34,9 @@ pub use file_history::{
 pub use file_tree::{generate_file_tree, generate_file_tree_with_limits, tool_mutates_file_tree};
 pub use index::{IndexStatus, SymbolEntry, SymbolIndex, SymbolKind};
 pub use mcp::{
-    sha256_hex as mcp_sha256_hex, LoadProjectScopeResult, McpConnectResult, McpConnectionStatus,
-    McpManager, McpScope, McpServerWithStatus, McpTransport, ServerConfig,
+    project_key as mcp_project_key, sha256_hex as mcp_sha256_hex, LoadProjectScopeResult,
+    McpConnectResult, McpConnectionStatus, McpManager, McpProjectSaveResult, McpProjectServerView,
+    McpScope, McpServerWithStatus, McpTransport, ServerConfig,
 };
 pub use provider::{
     AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,

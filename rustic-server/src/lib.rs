@@ -15,6 +15,7 @@ pub mod github;
 pub mod hub;
 pub mod port_monitor;
 pub mod proxy;
+pub mod sync_transfer;
 pub mod ws;
 
 use std::net::SocketAddr;

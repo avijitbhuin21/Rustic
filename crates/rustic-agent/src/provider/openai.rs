@@ -127,18 +127,25 @@ impl OpenAiProvider {
     }
 }
 
-/// Builds the `__parse_error` text for malformed tool arguments, calling out mid-JSON truncation (EOF) with concrete split-the-payload guidance.
+/// Error text for a stream that ended before `[DONE]` / `finish_reason`.
+pub(crate) const STREAM_CUT_ERROR: &str =
+    "Provider stream ended unexpectedly: the connection closed before the response finished";
+
+/// Builds the `__parse_error` text for malformed tool arguments, calling out mid-JSON truncation (EOF).
 pub(crate) fn tool_args_parse_error_message(e: &serde_json::Error, raw_len: usize) -> String {
     if e.is_eof() {
         format!(
-            "Tool arguments were TRUNCATED mid-JSON after {} characters ({}). The single call was too large \
-             for the provider's output limit and was dropped. Do NOT resend the same payload: split the work \
-             into several smaller calls (e.g. create_file with the first part, then edit_file with \
-             old_string=\"\" to append the next parts), each well under a few thousand characters.",
+            "Tool arguments were cut off mid-JSON after {} characters ({}), so the call was NOT executed. \
+             This happens when the response hits the output-token limit. Retry the call; if its payload is \
+             very large, split it (e.g. create_file with the first part, then edit_file with old_string=\"\" \
+             to append the rest).",
             raw_len, e
         )
     } else {
-        format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e)
+        format!(
+            "Failed to parse tool arguments: {}. Please retry with valid JSON.",
+            e
+        )
     }
 }
 
@@ -304,7 +311,21 @@ pub(crate) async fn parse_completions_sse_stream(
     stream_cb: Option<StreamCallback>,
     cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<AiResponse> {
-    let mut byte_stream = resp.bytes_stream();
+    parse_completions_byte_stream(resp.bytes_stream(), stream_cb, cancel_token).await
+}
+
+/// Parse a Chat Completions SSE body from any byte-chunk stream (testable core).
+async fn parse_completions_byte_stream<S, B, E>(
+    byte_stream: S,
+    stream_cb: Option<StreamCallback>,
+    cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<AiResponse>
+where
+    S: futures::Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: Into<anyhow::Error>,
+{
+    let mut byte_stream = Box::pin(byte_stream);
     let mut sse = super::SseLineBuffer::new();
     let mut eof_flushed = false;
     let mut dropped_lines: u32 = 0;
@@ -326,6 +347,10 @@ pub(crate) async fn parse_completions_sse_stream(
     let mut tool_starts_emitted: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     let mut finish_reason: Option<String> = None;
+    // A clean stream ends with `[DONE]` and/or a `finish_reason`. Neither
+    // means the connection was cut (proxies closing at a fixed timeout) and
+    // the response is incomplete — surfaced as a retryable error below.
+    let mut saw_done = false;
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
     let mut cache_read_tokens: u32 = 0;
@@ -345,7 +370,7 @@ pub(crate) async fn parse_completions_sse_stream(
                         return Err(anyhow::anyhow!("Task cancelled"));
                     }
                 }
-                sse.push(&chunk?)
+                sse.push(chunk.map_err(Into::into)?.as_ref())
             }
             None => {
                 if eof_flushed {
@@ -368,6 +393,7 @@ pub(crate) async fn parse_completions_sse_stream(
 
                     let data = &line["data: ".len()..];
                     if data == "[DONE]" {
+                        saw_done = true;
                         break 'outer;
                     }
 
@@ -589,6 +615,15 @@ pub(crate) async fn parse_completions_sse_stream(
 
     // Build content blocks. Thinking goes first so the order matches the
     // Claude / Responses-API paths (thinking → text → tool_use); downstream
+    if !saw_done && finish_reason.is_none() {
+        return Err(anyhow::anyhow!(
+            "{} ({} text chars, {} tool call(s) received before the cut)",
+            STREAM_CUT_ERROR,
+            full_text.len(),
+            tool_calls.len()
+        ));
+    }
+
     // renderers stop scanning once they hit a Text block, which would hide a
     // trailing Thinking block on resume from history.
     let mut content = Vec::new();
@@ -1747,5 +1782,56 @@ mod sse_snapshot_tests {
         }"#;
         let resp: ResponsesApiResponse = serde_json::from_str(json).expect("ResponsesApi parses");
         assert_eq!(resp.output[0].summary.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod stream_cut_tests {
+    use super::*;
+
+    /// Run the completions parser over in-memory SSE chunks.
+    async fn parse(chunks: &[&str]) -> Result<AiResponse> {
+        let items: Vec<std::result::Result<Vec<u8>, std::io::Error>> =
+            chunks.iter().map(|c| Ok(c.as_bytes().to_vec())).collect();
+        parse_completions_byte_stream(futures::stream::iter(items), None, None).await
+    }
+
+    const TEXT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+
+    #[tokio::test]
+    async fn clean_stream_with_done_succeeds() {
+        let r = parse(&[
+            TEXT,
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await
+        .expect("clean stream parses");
+        assert!(matches!(r.stop_reason, StopReason::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn stream_cut_mid_tool_call_is_an_error_not_end_turn() {
+        let tool = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"create_file\",\"arguments\":\"{\\\"path\\\": \\\"research.md\\\"\"}}]}}]}\n\n";
+        let err = parse(&[TEXT, tool])
+            .await
+            .expect_err("cut stream must error");
+        let msg = err.to_string();
+        assert!(msg.contains(STREAM_CUT_ERROR), "unexpected message: {msg}");
+        assert!(
+            !crate::provider::is_provider_client_error(&err),
+            "must be retryable, not a 4xx"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_reason_without_done_is_accepted() {
+        let r = parse(&[
+            TEXT,
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ])
+        .await
+        .expect("finish_reason alone marks a complete stream");
+        assert!(matches!(r.stop_reason, StopReason::EndTurn));
     }
 }

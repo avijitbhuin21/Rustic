@@ -123,7 +123,11 @@ pub fn normalize_for_providers(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> 
     }
     let mut img = image::load_from_memory(bytes).ok()?;
     if oversized {
-        img = img.resize(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE, image::imageops::FilterType::Triangle);
+        img = img.resize(
+            MAX_IMAGE_SIDE,
+            MAX_IMAGE_SIDE,
+            image::imageops::FilterType::Triangle,
+        );
     }
     let encode = |img: &image::DynamicImage, fmt: image::ImageFormat| -> Option<Vec<u8>> {
         let mut out = std::io::Cursor::new(Vec::new());
@@ -163,7 +167,9 @@ pub fn normalize_for_providers(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> 
 /// in-memory history or `content_json`; `hydrate_messages` refills it for each
 /// provider request. Images beyond provider limits are downscaled first.
 pub fn image_block(media_type: String, b64: &str) -> ContentBlock {
-    let decoded = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).ok();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .ok();
     let (media_type, bytes, b64_owned): (String, Option<Vec<u8>>, Option<String>) = match decoded {
         Some(raw) => match normalize_for_providers(&raw) {
             Some((shrunk, mt)) => {

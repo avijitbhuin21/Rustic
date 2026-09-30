@@ -49,6 +49,12 @@ export function WorkflowsPanel() {
     load();
   }, [load]);
 
+  // Reload when the agent installs / removes something from chat (issue #11).
+  useEffect(() => {
+    window.addEventListener('rustic:extensions-changed', load);
+    return () => window.removeEventListener('rustic:extensions-changed', load);
+  }, [load]);
+
   const select = async (name) => {
     setActiveName(name);
     setOriginalName(name);

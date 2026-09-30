@@ -4,7 +4,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { invoke } from '@tauri-apps/api/core';
 import {
   ChevronRight, ChevronDown, Plus, Eye, EyeOff, Pencil, Trash2, Info, RefreshCw,
-  ClipboardEdit, X, Check, FileText, Copy, List, Loader2,
+  ClipboardEdit, X, Check, FileText, Copy, List, Loader2, Settings2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -25,7 +25,8 @@ import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
-import { Section, isTauri } from './shared';
+import { Section, isTauri, useExtensionsChanged } from './shared';
+import { JsonArea, McpAddServerDialog, McpConfigureDialog, statusBadge } from './mcp-dialogs';
 
 // ─── MCP Servers ─────────────────────────────────────────────────────────────
 
@@ -64,13 +65,11 @@ export function McpJsonDialog({ open, onClose }) {
         <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
           <DialogTitle className="text-[14px]">Edit mcp.json</DialogTitle>
         </DialogHeader>
-        <div className="px-5 py-4">
-          <Textarea
-            value={json}
-            onChange={(e) => setJson(e.target.value)}
-            className="min-h-[320px] font-mono text-[11px] resize-none"
-            spellCheck={false}
-          />
+        <div className="min-w-0 px-5 py-4">
+          <JsonArea value={json} onChange={setJson} />
+          <p className="mt-2 text-[10.5px] text-muted-foreground">
+            Global pool — every server here is available to all projects. Use Configure on a server to change it per project.
+          </p>
         </div>
         <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
           <Button variant="outline" size="sm" className="text-xs" onClick={onClose}>Cancel</Button>
@@ -83,7 +82,7 @@ export function McpJsonDialog({ open, onClose }) {
   );
 }
 
-export function McpServerRow({ server, onRemove }) {
+export function McpServerRow({ server, onRemove, onConfigure }) {
   const [open, setOpen] = useState(false);
   const [tools, setTools] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -92,14 +91,7 @@ export function McpServerRow({ server, onRemove }) {
   const id = server.id || server.name;
   const st = server.status || { state: 'unknown' };
   const connected = st.state === 'connected';
-  const label =
-    connected ? `Connected · ${st.tool_count ?? 0} tool${st.tool_count === 1 ? '' : 's'}` :
-    st.state === 'failed' ? 'Failed' :
-    'Idle';
-  const tone =
-    connected ? 'border-emerald-500/40 text-emerald-500' :
-    st.state === 'failed' ? 'border-rose-500/40 text-rose-500' :
-    'border-border/60 text-muted-foreground';
+  const { label, tone } = statusBadge(st);
 
   const toggle = async () => {
     const next = !open;
@@ -132,6 +124,13 @@ export function McpServerRow({ server, onRemove }) {
         )}
         <span className="text-[12px] font-mono flex-1 truncate">{server.name || id}</span>
         <Badge variant="outline" className={cn('h-5 text-[10px]', tone)}>{label}</Badge>
+        <Button
+          size="sm" variant="ghost" className="h-7 gap-1 px-2 text-[11px] text-muted-foreground hover:text-foreground"
+          title="Configure per project"
+          onClick={(e) => { e.stopPropagation(); onConfigure(server); }}
+        >
+          <Settings2 className="size-3.5" /> Configure
+        </Button>
         <Button
           size="icon-sm" variant="ghost" className="size-7 text-muted-foreground hover:text-destructive"
           onClick={(e) => { e.stopPropagation(); onRemove(id); }}
@@ -173,10 +172,11 @@ export function McpServerRow({ server, onRemove }) {
 export function McpSection() {
   const [servers, setServers] = useState([]);
   const [jsonOpen, setJsonOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [configuring, setConfiguring] = useState(null);
 
-  // MCP servers are configured once at the user level and apply across all
-  // projects — no per-project scoping. We pass projectId: null so the backend
-  // always returns / writes the user-level server list.
+  // The Settings list shows the global pool (projectId: null → pool only).
+  // Per-project overrides are edited through each row's Configure dialog.
   const refresh = async () => {
     if (!isTauri()) return;
     try {
@@ -185,6 +185,7 @@ export function McpSection() {
     } catch { setServers([]); }
   };
   useEffect(() => { refresh(); }, []);
+  useExtensionsChanged(refresh);
 
   const remove = async (id) => {
     try { await invoke('remove_mcp_server', { id }); refresh(); }
@@ -197,10 +198,18 @@ export function McpSection() {
       badge="Global"
       actions={
         <>
-          <Button size="sm" variant="outline" className="h-7 text-xs gap-1.5" onClick={() => setJsonOpen(true)}>
+          <Button
+            size="sm" variant="outline" className="h-7 text-xs gap-1.5"
+            title="Edit the global pool of MCP servers"
+            onClick={() => setJsonOpen(true)}
+          >
             <ClipboardEdit className="size-3" /> Edit JSON
           </Button>
-          <Button size="icon-sm" variant="ghost" className="size-7" onClick={() => setJsonOpen(true)}>
+          <Button
+            size="icon-sm" variant="ghost" className="size-7"
+            title="Add an MCP server"
+            onClick={() => setAddOpen(true)}
+          >
             <Plus className="size-3.5" />
           </Button>
         </>
@@ -209,16 +218,22 @@ export function McpSection() {
       {servers.length === 0 ? (
         <div className="text-[12px] text-muted-foreground">
           No MCP servers configured.<br />
-          Click "Edit JSON" to add one. Standard <code className="text-[11px]">.mcp.json</code> format.
+          Click + to add one, or "Edit JSON" to paste a standard <code className="text-[11px]">.mcp.json</code>.
         </div>
       ) : (
         <ul className="space-y-1.5">
           {servers.map((s) => (
-            <McpServerRow key={s.id || s.name} server={s} onRemove={remove} />
+            <McpServerRow key={s.id || s.name} server={s} onRemove={remove} onConfigure={setConfiguring} />
           ))}
         </ul>
       )}
       <McpJsonDialog open={jsonOpen} onClose={() => { setJsonOpen(false); refresh(); }} />
+      <McpAddServerDialog open={addOpen} onClose={() => { setAddOpen(false); refresh(); }} />
+      <McpConfigureDialog
+        server={configuring}
+        open={!!configuring}
+        onClose={() => { setConfiguring(null); refresh(); }}
+      />
     </Section>
   );
 }

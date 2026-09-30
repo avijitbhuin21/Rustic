@@ -1,6 +1,7 @@
 mod app_icon;
 mod app_paths;
 mod commands;
+mod lan;
 mod logging;
 mod path_scope;
 mod secrets;
@@ -204,6 +205,8 @@ pub fn run() {
             }
 
             app.manage(app_state);
+            app.manage(lan::LanState::default());
+            commands::lan_sync::restore_on_startup(app.handle());
             tracing::info!(target: "rustic::timing", elapsed_ms = t_keys.elapsed().as_millis() as u64, "startup: ai_config restore + keychain hydration");
 
             if let Ok(home) = app.path().home_dir() {
@@ -427,6 +430,9 @@ pub fn run() {
             commands::agent::read_mcp_json,
             commands::agent::save_mcp_json,
             commands::agent::remove_mcp_server,
+            commands::agent::add_mcp_pool_server,
+            commands::agent::get_mcp_server_projects,
+            commands::agent::save_mcp_project_server,
             commands::agent::list_mcp_servers,
             commands::agent::list_mcp_server_tools,
             commands::agent::test_mcp_server,
@@ -451,6 +457,21 @@ pub fn run() {
             commands::cloud_sync::cloud_sync_pull,
             commands::cloud_sync::cloud_sync_push_project,
             commands::cloud_sync::cloud_sync_pull_project,
+            commands::cloud_sync::cloud_list_remote_projects,
+            commands::cloud_sync::cloud_meta_preview,
+            commands::cloud_sync::cloud_meta_apply,
+            commands::lan_sync::lan_status,
+            commands::lan_sync::lan_set_enabled,
+            commands::lan_sync::lan_devices,
+            commands::lan_sync::lan_pair_code,
+            commands::lan_sync::lan_pair,
+            commands::lan_sync::lan_respond_pair,
+            commands::lan_sync::lan_forget,
+            commands::lan_sync::lan_push,
+            commands::lan_sync::lan_pull,
+            commands::lan_sync::lan_list_projects,
+            commands::lan_sync::lan_meta_preview,
+            commands::lan_sync::lan_meta_apply,
             commands::cloud_sync::cloud_sync_remember,
             commands::cloud_sync::cloud_sync_has_credentials,
             commands::agent::set_task_plan_mode,

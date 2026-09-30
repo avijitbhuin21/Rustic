@@ -9,7 +9,6 @@ import { useEditor } from '@/state/editor';
 import { SettingsSection, SettingRow } from './setting-row';
 import { TunnelSettings } from './tunnel-settings';
 import { PowerSettings } from './power-settings';
-import { RemoteBackendSettings } from './remote-backend-settings';
 import { IS_WEB } from '@/lib/platform';
 
 export function GeneralSettings() {
@@ -143,7 +142,6 @@ export function GeneralSettings() {
         </SettingRow>
       </SettingsSection>
 
-      {!IS_WEB && <RemoteBackendSettings />}
       {IS_WEB && <PowerSettings />}
       {IS_WEB && <TunnelSettings />}
 

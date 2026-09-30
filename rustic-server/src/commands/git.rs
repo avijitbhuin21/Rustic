@@ -910,9 +910,15 @@ async fn github_poll_token(ctx: &ServerContext, args: &Value) -> Result<Value, A
 }
 
 async fn github_get_user(ctx: &ServerContext) -> Result<Value, ApiError> {
-    let token = {
-        let stored = ctx.state().git_token.lock_safe();
-        stored.clone().ok_or("Not authenticated")?
+    let stored = ctx.state().git_token.lock_safe().clone();
+    // See desktop github_get_user: borrow the machine's git credential /
+    // gh token only to read the username (issue #13).
+    let token = match stored {
+        Some(t) => t,
+        None => tokio::task::spawn_blocking(rustic_git::identity::discover_github_token)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("Not authenticated")?,
     };
 
     let client = reqwest::Client::new();

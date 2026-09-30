@@ -140,7 +140,9 @@ pub fn extract_text(pdf_path: &Path) -> Result<String, PdfExtractError> {
 
     match status.code() {
         Some(0) => std::fs::read_to_string(&out_path).map_err(|e| {
-            PdfExtractError::WorkerCrashed(format!("worker reported success but output unreadable: {e}"))
+            PdfExtractError::WorkerCrashed(format!(
+                "worker reported success but output unreadable: {e}"
+            ))
         }),
         Some(EXIT_PARSE_FAILED) => Err(PdfExtractError::Parse(if detail.is_empty() {
             "unsupported or corrupt PDF structure".to_string()

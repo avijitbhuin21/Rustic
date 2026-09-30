@@ -1048,10 +1048,11 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             let fh_handle_opt = if task_is_plan_mode { None } else { fh_handle_opt };
 
             let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
+            let mcp_project_root = PathBuf::from(&project_root);
             let mcp_fut = tokio::task::spawn_blocking(move || {
                 let mut mcp = mcp_arc_connect.lock_safe();
-                let _ = mcp.connect_all();
-                let tools = mcp.all_tools();
+                mcp.connect_project(&mcp_project_root);
+                let tools = mcp.project_tools(&mcp_project_root);
                 let section = build_mcp_system_section(&tools);
                 (tools, section)
             });
@@ -1428,6 +1429,12 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                                 "task_id": task_id,
                                 "request_id": request_id,
                                 "questions": questions,
+                            }));
+                        }
+                        TaskEvent::AskUserCancelled { task_id, request_id } => {
+                            ctx_events.emit("agent-ask-user-cancelled", serde_json::json!({
+                                "task_id": task_id,
+                                "request_id": request_id,
                             }));
                         }
                         TaskEvent::CeilingBreached { task_id, request_id, ceiling_cents, spent_cents } => {
@@ -2598,9 +2605,30 @@ struct ListTasksArg {
 fn list_tasks(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ListTasksArg = crate::api::parse(args)?;
     let state = ctx.state();
+    let pid_root: Option<String> = a.project_id.as_ref().and_then(|pid| {
+        state
+            .workspace
+            .lock_safe()
+            .list_projects()
+            .into_iter()
+            .find(|p| p.id.to_string() == *pid)
+            .map(|p| p.root_path.to_string_lossy().to_string())
+    });
     let db = state.db.lock_safe();
     let rows = if let Some(ref pid) = a.project_id {
-        db.list_tasks_for_project(pid).map_err(|e| e.to_string())?
+        let mut rows = db.list_tasks_for_project(pid).map_err(|e| e.to_string())?;
+        // See desktop list_tasks: include rows persisted under the DB project
+        // that owns this root path when its id differs (issue #1).
+        if let Some(root) = pid_root {
+            if let Ok(Some(alias)) = db.get_project_by_path(&root) {
+                if alias.id != *pid {
+                    if let Ok(extra) = db.list_tasks_for_project(&alias.id) {
+                        rows.extend(extra);
+                    }
+                }
+            }
+        }
+        rows
     } else {
         let agent = state.agent.lock_safe();
         return ok(agent
@@ -3508,7 +3536,7 @@ fn respond_to_ask_user(ctx: &ServerContext, args: &Value) -> Result<Value, ApiEr
             .collect()
     };
     let agent = ctx.state().agent.lock().map_err(|e| e.to_string())?;
-    agent.ask_user_broker.respond(
+    let delivered = agent.ask_user_broker.respond(
         &a.request_id,
         rustic_agent::task::ask_user_broker::AskUserResponse {
             answers: a.answers,
@@ -3516,6 +3544,11 @@ fn respond_to_ask_user(ctx: &ServerContext, args: &Value) -> Result<Value, ApiEr
             images,
         },
     );
+    if !delivered {
+        return Err(ApiError::bad(
+            "This question is no longer active (the run was interrupted). Answer the newest question instead.",
+        ));
+    }
     ok(serde_json::json!(null))
 }
 

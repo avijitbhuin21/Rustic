@@ -465,6 +465,28 @@ pub fn build_sync_archive(
     skip_files: &std::collections::HashSet<String>,
     reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
+    let file = std::fs::File::create(out_path)
+        .map_err(|e| format!("create {} failed: {e}", out_path.display()))?;
+    build_sync_archive_into(
+        state,
+        data_dir,
+        secrets,
+        Box::new(file),
+        skip_files,
+        reporter,
+    )
+}
+
+/// Like [`build_sync_archive`] but streams the archive into `sink` — e.g. a
+/// growing file that a parallel uploader reads while it is still being written.
+pub fn build_sync_archive_into(
+    state: &AppState,
+    data_dir: &Path,
+    secrets: &dyn SecretStore,
+    sink: Box<dyn Write + Send>,
+    skip_files: &std::collections::HashSet<String>,
+    reporter: &SyncReporter,
+) -> Result<SyncManifest, String> {
     ensure_no_running_tasks(state)?;
 
     reporter.stage("preparing", "database snapshot", 0, 0);
@@ -506,12 +528,10 @@ pub fn build_sync_archive(
 
     // 2. Stream everything into the tar.zst.
     let result = (|| -> Result<(), String> {
-        let file = std::fs::File::create(out_path)
-            .map_err(|e| format!("create {} failed: {e}", out_path.display()))?;
+        let file = sink;
         // Level 3: near-gzip-fast compression with a clearly better ratio, so
         // the CPU keeps ahead of the network while uploads shrink.
-        let enc = zstd::stream::write::Encoder::new(file, 3)
-            .map_err(|e| format!("zstd init failed: {e}"))?;
+        let enc = zstd_encoder(file)?;
         let mut tar = tar::Builder::new(enc);
         tar.mode(tar::HeaderMode::Deterministic);
 
@@ -544,6 +564,42 @@ pub fn build_sync_archive(
             tar.append_dir("data/media", &media_dir)
                 .map_err(|e| e.to_string())?;
             append_dir_filtered(&mut tar, &media_dir, "data/media", &|_| {})?;
+        }
+
+        // Metadata sync (issue #15): global rules / skills / workflows, rule
+        // activation state and the MCP server pool travel with a full sync.
+        // Absent on older archives; older receivers just ignore `meta/`.
+        reporter.stage("archiving", "rules, skills, workflows, MCP servers", 0, 0);
+        for (dir, name) in [
+            (rustic_agent::rules::global_rules_dir(), "meta/rules"),
+            (rustic_agent::skills::global_skills_dir(), "meta/skills"),
+            (
+                rustic_agent::workflows::global_workflows_dir(),
+                "meta/workflows",
+            ),
+        ] {
+            if let Some(dir) = dir.filter(|d| d.is_dir()) {
+                tar.append_dir(name, &dir).map_err(|e| e.to_string())?;
+                append_dir_filtered(&mut tar, &dir, name, &|_| {})?;
+            }
+        }
+        if let Some(p) = rustic_agent::rules::rules_state_path().filter(|p| p.is_file()) {
+            tar.append_path_with_name(&p, "meta/rules-state.json")
+                .map_err(|e| format!("tar rules state: {e}"))?;
+        }
+        let mcp_pool = data_dir.join("mcp.json");
+        if mcp_pool.is_file() {
+            tar.append_path_with_name(&mcp_pool, "meta/mcp.json")
+                .map_err(|e| format!("tar mcp pool: {e}"))?;
+        }
+        let roots: Vec<String> = projects.iter().map(|p| p.root_path.clone()).collect();
+        let consents = export_project_consents(state, &roots);
+        if !consents.is_empty() {
+            append_bytes(
+                &mut tar,
+                "meta/mcp_consent.json",
+                &serde_json::to_vec_pretty(&consents).map_err(|e| e.to_string())?,
+            )?;
         }
 
         let total = manifest
@@ -602,6 +658,18 @@ pub fn build_project_archive(
     out_path: &Path,
     reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
+    let file = std::fs::File::create(out_path)
+        .map_err(|e| format!("create {} failed: {e}", out_path.display()))?;
+    build_project_archive_into(state, project_id, Box::new(file), reporter)
+}
+
+/// Like [`build_project_archive`] but streams the archive into `sink`.
+pub fn build_project_archive_into(
+    state: &AppState,
+    project_id: &str,
+    sink: Box<dyn Write + Send>,
+    reporter: &SyncReporter,
+) -> Result<SyncManifest, String> {
     ensure_no_running_tasks(state)?;
     reporter.stage("preparing", "reading project", 0, 1);
 
@@ -632,10 +700,7 @@ pub fn build_project_archive(
     };
     let entry = &manifest.projects[0];
 
-    let file = std::fs::File::create(out_path)
-        .map_err(|e| format!("create {} failed: {e}", out_path.display()))?;
-    let enc =
-        zstd::stream::write::Encoder::new(file, 3).map_err(|e| format!("zstd init failed: {e}"))?;
+    let enc = zstd_encoder(sink)?;
     let mut tar = tar::Builder::new(enc);
     tar.mode(tar::HeaderMode::Deterministic);
     append_bytes(
@@ -651,6 +716,15 @@ pub fn build_project_archive(
         reporter.tick("archiving", &format!("{} — {}", project.name, name), 0, 1);
     };
     append_dir_filtered(&mut tar, &root, &entry.dir, &on_file)?;
+
+    let consents = export_project_consents(state, std::slice::from_ref(&project.root_path));
+    if !consents.is_empty() {
+        append_bytes(
+            &mut tar,
+            "meta/mcp_consent.json",
+            &serde_json::to_vec_pretty(&consents).map_err(|e| e.to_string())?,
+        )?;
+    }
 
     reporter.stage("compressing", "finishing archive", 1, 1);
     let enc = tar.into_inner().map_err(|e| e.to_string())?;
@@ -692,26 +766,54 @@ fn append_bytes<W: Write>(
         .map_err(|e| format!("tar {name}: {e}"))
 }
 
+/// zstd level-3 encoder using every CPU core, so packing keeps ahead of the
+/// network on large syncs. Level 3 keeps the ratio close to the old single-
+/// threaded output.
+fn zstd_encoder<W: Write>(w: W) -> Result<zstd::stream::write::Encoder<'static, W>, String> {
+    let mut enc =
+        zstd::stream::write::Encoder::new(w, 3).map_err(|e| format!("zstd init failed: {e}"))?;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
+    if threads > 1 {
+        if let Err(e) = enc.multithread(threads) {
+            tracing::debug!("zstd multithreading unavailable, using one thread: {e}");
+        }
+    }
+    Ok(enc)
+}
+
+/// Wrap a raw archive byte stream in the right decompressor, sniffing the
+/// magic bytes: zstd (current format) or gzip (archives built before the
+/// zstd switch). Works on streams that are still being written.
+pub fn decode_archive_stream(raw: Box<dyn Read + Send>) -> Result<Box<dyn Read + Send>, String> {
+    use std::io::BufRead;
+    let mut buf = std::io::BufReader::with_capacity(256 * 1024, raw);
+    let magic: Vec<u8> = buf
+        .fill_buf()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .take(4)
+        .copied()
+        .collect();
+    if magic.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        Ok(Box::new(
+            zstd::stream::read::Decoder::with_buffer(buf).map_err(|e| format!("zstd open: {e}"))?,
+        ))
+    } else if magic.starts_with(&[0x1F, 0x8B]) {
+        Ok(Box::new(flate2::read::GzDecoder::new(buf)))
+    } else {
+        Err("not a sync archive (unrecognized compression format)".into())
+    }
+}
+
 /// Open a sync archive for reading, sniffing the compression from its magic
 /// bytes: zstd (current format) or gzip (accepted for compatibility with
 /// archives built before the zstd switch).
 fn open_archive_reader(path: &Path) -> Result<Box<dyn Read>, String> {
-    let mut magic = [0u8; 4];
-    {
-        let mut f = std::fs::File::open(path)
-            .map_err(|e| format!("open archive {}: {e}", path.display()))?;
-        let _ = f.read(&mut magic).map_err(|e| e.to_string())?;
-    }
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    if magic == [0x28, 0xB5, 0x2F, 0xFD] {
-        Ok(Box::new(
-            zstd::stream::read::Decoder::new(file).map_err(|e| format!("zstd open: {e}"))?,
-        ))
-    } else if magic[0] == 0x1F && magic[1] == 0x8B {
-        Ok(Box::new(flate2::read::GzDecoder::new(file)))
-    } else {
-        Err("not a sync archive (unrecognized compression format)".into())
-    }
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("open archive {}: {e}", path.display()))?;
+    Ok(decode_archive_stream(Box::new(file))?)
 }
 
 /// Clear a read-only attribute (git object/pack files on Windows) then delete.
@@ -835,6 +937,129 @@ fn mirror_dir(src: &Path, dst: &Path, on_file: &dyn Fn(&str)) -> Result<(), Stri
     Ok(())
 }
 
+/// Normalised string form of a project's `.mcp.json` path for key matching.
+fn mcp_json_key(root: &str) -> String {
+    format!(
+        "{}/.mcp.json",
+        root.replace('\\', "/").trim_end_matches('/')
+    )
+}
+
+/// MCP consent entries for the given project roots, keyed by normalised path
+/// string, so approvals travel with the projects in a sync archive.
+fn export_project_consents(state: &AppState, roots: &[String]) -> HashMap<String, String> {
+    let wanted: std::collections::HashSet<String> = roots.iter().map(|r| mcp_json_key(r)).collect();
+    let mgr = std::sync::Arc::clone(&state.agent.lock_safe().mcp_manager);
+    let consents = mgr.lock_safe().consents();
+    consents
+        .into_iter()
+        .filter_map(|(p, h)| {
+            let k = p.to_string_lossy().replace('\\', "/");
+            wanted.contains(&k).then_some((k, h))
+        })
+        .collect()
+}
+
+/// Import `meta/mcp_consent.json` from a staged archive, remapping each
+/// project's `.mcp.json` path from the sender's root to this machine's, so
+/// pulled projects don't re-prompt for MCP approval (issue #15).
+fn import_synced_consents(
+    state: &AppState,
+    staging: &Path,
+    targets: &[(SyncProjectEntry, PathBuf)],
+) {
+    let Ok(text) = std::fs::read_to_string(staging.join("meta").join("mcp_consent.json")) else {
+        return;
+    };
+    let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&text) else {
+        return;
+    };
+    let entries = remap_consents(&map, targets);
+    let mgr = std::sync::Arc::clone(&state.agent.lock_safe().mcp_manager);
+    let res = mgr.lock_safe().import_consents(entries);
+    if let Err(e) = res {
+        tracing::warn!("sync: MCP consent import failed: {e}");
+    }
+}
+
+/// Map sender-side `.mcp.json` consent keys onto this machine's project roots.
+fn remap_consents(
+    map: &HashMap<String, String>,
+    targets: &[(SyncProjectEntry, PathBuf)],
+) -> Vec<(PathBuf, String)> {
+    targets
+        .iter()
+        .filter_map(|(e, t)| {
+            map.get(&mcp_json_key(&e.origin_root_path))
+                .map(|h| (t.join(".mcp.json"), h.clone()))
+        })
+        .collect()
+}
+
+/// Install the `meta/` payload of a full sync archive: global rules, skills,
+/// workflows, rule activation state (project keys remapped from the sender's
+/// roots to this machine's) and the MCP server pool. Best-effort per item.
+fn apply_synced_metadata(staging: &Path, data_dir: &Path, targets: &[(SyncProjectEntry, PathBuf)]) {
+    let meta = staging.join("meta");
+    if !meta.is_dir() {
+        return;
+    }
+    for (dir, name) in [
+        (rustic_agent::rules::global_rules_dir(), "rules"),
+        (rustic_agent::skills::global_skills_dir(), "skills"),
+        (rustic_agent::workflows::global_workflows_dir(), "workflows"),
+    ] {
+        let staged = meta.join(name);
+        if let (Some(dst), true) = (dir, staged.is_dir()) {
+            if let Err(e) = mirror_dir(&staged, &dst, &|_| {}) {
+                tracing::warn!(item = name, "sync: metadata install failed: {e}");
+            }
+        }
+    }
+    let staged_state = meta.join("rules-state.json");
+    if let (Some(dst), true) = (
+        rustic_agent::rules::rules_state_path(),
+        staged_state.is_file(),
+    ) {
+        if let Ok(text) = std::fs::read_to_string(&staged_state) {
+            let remapped = remap_rules_state(&text, targets);
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = rustic_agent::io_util::atomic_write(&dst, remapped.as_bytes()) {
+                tracing::warn!("sync: rules state install failed: {e}");
+            }
+        }
+    }
+    let staged_mcp = meta.join("mcp.json");
+    if staged_mcp.is_file() {
+        if let Err(e) = std::fs::copy(&staged_mcp, data_dir.join("mcp.json")) {
+            tracing::warn!("sync: MCP pool install failed: {e}");
+        }
+    }
+}
+
+/// Rewrite `active_project` keys in rules-state JSON from each project's
+/// origin root to its root on this machine. Unknown keys are kept as-is.
+fn remap_rules_state(text: &str, targets: &[(SyncProjectEntry, PathBuf)]) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return text.to_string();
+    };
+    let norm = |p: &str| p.replace('\\', "/");
+    if let Some(map) = v.get_mut("active_project").and_then(|m| m.as_object_mut()) {
+        let old = std::mem::take(map);
+        for (key, val) in old {
+            let new_key = targets
+                .iter()
+                .find(|(e, _)| norm(&e.origin_root_path) == norm(&key))
+                .map(|(_, t)| norm(&t.to_string_lossy()))
+                .unwrap_or(key);
+            map.insert(new_key, val);
+        }
+    }
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| text.to_string())
+}
+
 /// Apply a sync archive to this environment. Destructive: the local DB,
 /// file-history store, secrets, and every manifest project's files are
 /// replaced. Returns the applied manifest.
@@ -847,6 +1072,30 @@ pub fn apply_sync_archive(
     resolve_root: ProjectRootResolver<'_>,
     reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("open archive {}: {e}", archive_path.display()))?;
+    apply_sync_archive_from(
+        state,
+        data_dir,
+        secrets,
+        Box::new(file),
+        emitter,
+        resolve_root,
+        reporter,
+    )
+}
+
+/// Like [`apply_sync_archive`] but reads the (compressed) archive from
+/// `source` — e.g. chunks still arriving, so extraction overlaps the download.
+pub fn apply_sync_archive_from(
+    state: &AppState,
+    data_dir: &Path,
+    secrets: &dyn SecretStore,
+    source: Box<dyn Read + Send>,
+    emitter: Arc<dyn EventEmitter>,
+    resolve_root: ProjectRootResolver<'_>,
+    reporter: &SyncReporter,
+) -> Result<SyncManifest, String> {
     ensure_no_running_tasks(state)?;
 
     // 1. Extract to a staging dir under the data dir (same volume → cheap renames).
@@ -855,7 +1104,7 @@ pub fn apply_sync_archive(
     force_remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
     {
-        let reader = open_archive_reader(archive_path)?;
+        let reader = decode_archive_stream(source)?;
         let mut archive = tar::Archive::new(reader);
         archive
             .unpack(&staging)
@@ -1026,6 +1275,18 @@ pub fn apply_sync_archive(
     }
     bootstrap::hydrate_config_and_secrets(state, secrets);
 
+    // 7b. Metadata (issue #15): replace global rules / skills / workflows,
+    //     the MCP pool, and rule activation (remapped to this machine's
+    //     project roots). Skipped when the archive predates metadata sync.
+    reporter.stage(
+        "finalizing",
+        "rules, skills, workflows, MCP servers",
+        total,
+        total,
+    );
+    apply_synced_metadata(&staging, data_dir, &targets);
+    import_synced_consents(state, &staging, &targets);
+
     // 8. Reload projects into the workspace + restart watchers.
     bootstrap::restore_projects(state, emitter.clone());
 
@@ -1058,6 +1319,27 @@ pub fn apply_project_archive(
     resolve_root: ProjectRootResolver<'_>,
     reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("open archive {}: {e}", archive_path.display()))?;
+    apply_project_archive_from(
+        state,
+        data_dir,
+        Box::new(file),
+        emitter,
+        resolve_root,
+        reporter,
+    )
+}
+
+/// Like [`apply_project_archive`] but reads the archive from `source`.
+pub fn apply_project_archive_from(
+    state: &AppState,
+    data_dir: &Path,
+    source: Box<dyn Read + Send>,
+    emitter: Arc<dyn EventEmitter>,
+    resolve_root: ProjectRootResolver<'_>,
+    reporter: &SyncReporter,
+) -> Result<SyncManifest, String> {
     ensure_no_running_tasks(state)?;
 
     reporter.stage("extracting", "unpacking archive", 0, 1);
@@ -1065,7 +1347,7 @@ pub fn apply_project_archive(
     force_remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
     {
-        let reader = open_archive_reader(archive_path)?;
+        let reader = decode_archive_stream(source)?;
         let mut archive = tar::Archive::new(reader);
         archive
             .unpack(&staging)
@@ -1146,6 +1428,7 @@ pub fn apply_project_archive(
 
         // Re-register in the workspace (a project new to this side wasn't
         // there) and restart its watcher on the resolved root.
+        import_synced_consents(state, &staging, &[(entry.clone(), target.clone())]);
         bootstrap::restore_projects(state, emitter.clone());
 
         reporter.stage("done", "sync complete", 1, 1);
@@ -1297,5 +1580,63 @@ mod tests {
 
         assert!(open_archive_reader(&out.join("manifest.json")).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod metadata_sync_tests {
+    use super::*;
+
+    #[test]
+    fn rules_state_project_keys_follow_project_to_new_root() {
+        let targets = vec![(
+            SyncProjectEntry {
+                id: "p1".into(),
+                name: "App".into(),
+                dir: "projects/p1".into(),
+                origin_root_path: "C:\\Users\\a\\app".into(),
+                files_skipped: false,
+            },
+            PathBuf::from("/home/b/app"),
+        )];
+        let text =
+            r#"{"active_global":["g"],"active_project":{"C:/Users/a/app":["r1"],"/other":["r2"]}}"#;
+        let out: serde_json::Value =
+            serde_json::from_str(&remap_rules_state(text, &targets)).unwrap();
+        assert_eq!(out["active_project"]["/home/b/app"][0], "r1");
+        assert_eq!(
+            out["active_project"]["/other"][0], "r2",
+            "unknown roots are kept"
+        );
+        assert!(out["active_project"].get("C:/Users/a/app").is_none());
+        assert_eq!(out["active_global"][0], "g");
+    }
+
+    #[test]
+    fn mcp_consents_follow_project_to_new_root() {
+        let targets = vec![(
+            SyncProjectEntry {
+                id: "p1".into(),
+                name: "App".into(),
+                dir: "projects/p1".into(),
+                origin_root_path: "C:\\Users\\a\\app\\".into(),
+                files_skipped: false,
+            },
+            PathBuf::from("/home/b/app"),
+        )];
+        let mut map = HashMap::new();
+        map.insert("C:/Users/a/app/.mcp.json".to_string(), "hash1".to_string());
+        map.insert(
+            "C:/Users/a/other/.mcp.json".to_string(),
+            "hash2".to_string(),
+        );
+        let out = remap_consents(&map, &targets);
+        assert_eq!(
+            out,
+            vec![(
+                PathBuf::from("/home/b/app").join(".mcp.json"),
+                "hash1".to_string()
+            )]
+        );
     }
 }
