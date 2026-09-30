@@ -228,8 +228,8 @@ code { font-family: var(--mono); font-size: 0.88em; }
 
 .lede { max-width: 58ch; margin: 36px 0 0; font-size: clamp(1.05rem, 1.5vw, 1.3rem); color: var(--fg-2); line-height: 1.55; }
 .swap { display: inline-block; position: relative; color: var(--fg); font-weight: 560; overflow: hidden; vertical-align: bottom; padding: 0 0.1em; }
-.swap .w { display: inline-block; }
-.swap .w.out { animation: swap-out 0.45s var(--ease-in-out) forwards; }
+.swap .w { display: inline-block; white-space: nowrap; }
+.swap .w.out { position: absolute; left: 0.1em; top: 0; animation: swap-out 0.45s var(--ease-in-out) forwards; }
 .swap .w.in { animation: swap-in 0.6s var(--ease-out) forwards; }
 @keyframes swap-out { to { transform: translateY(-110%); opacity: 0; } }
 @keyframes swap-in { from { transform: translateY(110%); opacity: 0; } to { transform: none; opacity: 1; } }
