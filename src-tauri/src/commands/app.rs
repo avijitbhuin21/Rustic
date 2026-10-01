@@ -2,7 +2,26 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 /// Window label for the thin-client window that hosts a remote rustic-server.
+/// Legacy single-window label, still matched by close/is_open without a URL.
 const REMOTE_WINDOW_LABEL: &str = "remote-backend";
+
+/// Window label for one backend: `remote-backend-<hash>`, so several backends
+/// can be open side by side (labels allow only `[a-zA-Z0-9-/:_]`).
+fn remote_window_label(base: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(base.as_bytes());
+    let hex: String = h.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{REMOTE_WINDOW_LABEL}-{hex}")
+}
+
+/// Trimmed, validated `http(s)://` base URL.
+fn remote_base(url: &str) -> Result<String, String> {
+    let base = url.trim().trim_end_matches('/').to_string();
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err("URL must start with http:// or https://".into());
+    }
+    Ok(base)
+}
 
 /// Return the absolute path to the rotating-log directory, so the frontend
 /// can offer "Reveal logs folder" or, with explicit user consent, attach the
@@ -151,51 +170,91 @@ pub fn confirm_quit(app: AppHandle) {
 /// Kept in a SEPARATE window from the local app so closing it is the exit
 /// path — the previous behaviour navigated the main window away, leaving no
 /// way back without restarting Rustic.
+///
+/// Must stay `async`: building a webview window inside a synchronous command
+/// deadlocks on Windows (the command holds the main thread the new window
+/// needs), which froze the app on "Connect".
 #[tauri::command]
-pub fn remote_backend_open(app: AppHandle, url: String) -> Result<(), String> {
-    let base = url.trim().trim_end_matches('/').to_string();
-    if !base.starts_with("http://") && !base.starts_with("https://") {
-        return Err("URL must start with http:// or https://".into());
-    }
+pub async fn remote_backend_open(
+    app: AppHandle,
+    url: String,
+    name: Option<String>,
+) -> Result<(), String> {
+    let base = remote_base(&url)?;
     let parsed: tauri::Url = base.parse().map_err(|_| format!("Invalid URL: {base}"))?;
+    let label = remote_window_label(&base);
 
-    if let Some(existing) = app.get_webview_window(REMOTE_WINDOW_LABEL) {
-        let _ = existing.navigate(parsed);
+    if let Some(existing) = app.get_webview_window(&label) {
         let _ = existing.unminimize();
         let _ = existing.set_focus();
         return Ok(());
     }
 
-    tauri::WebviewWindowBuilder::new(
-        &app,
-        REMOTE_WINDOW_LABEL,
-        tauri::WebviewUrl::External(parsed),
-    )
-    .title(format!("Rustic — Remote ({base})"))
-    .inner_size(1440.0, 900.0)
-    .decorations(true)
-    .resizable(true)
-    .build()
-    .map_err(|e| format!("Could not open the remote window: {e}"))?;
+    let title = match name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => format!("Rustic — {n} ({base})"),
+        None => format!("Rustic — Remote ({base})"),
+    };
+    super::remote_dnd::register_window(&label, &base);
+    let nav_app = app.clone();
+    let nav_label = label.clone();
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(parsed))
+        .title(title)
+        .inner_size(1440.0, 900.0)
+        .decorations(true)
+        .resizable(true)
+        // Let the web UI's HTML5 drop handlers receive OS files (upload into
+        // the folder under the cursor) instead of Tauri's native handler.
+        .disable_drag_drop_handler()
+        .initialization_script(super::remote_dnd::INIT_SCRIPT)
+        .on_navigation(move |url| super::remote_dnd::handle_navigation(&nav_app, &nav_label, url))
+        .build()
+        .map_err(|e| format!("Could not open the remote window: {e}"))?;
     Ok(())
 }
 
-/// Close the remote-backend window if it is open. Returns whether one existed.
-#[tauri::command]
-pub fn remote_backend_close(app: AppHandle) -> Result<bool, String> {
-    match app.get_webview_window(REMOTE_WINDOW_LABEL) {
-        Some(w) => {
-            w.close().map_err(|e| e.to_string())?;
-            Ok(true)
-        }
-        None => Ok(false),
+/// Labels of open remote windows — for `url`, or all of them when `None`.
+fn remote_labels(app: &AppHandle, url: Option<&str>) -> Result<Vec<String>, String> {
+    match url.filter(|u| !u.trim().is_empty()) {
+        Some(u) => Ok(vec![remote_window_label(&remote_base(u)?)]),
+        None => Ok(app
+            .webview_windows()
+            .into_keys()
+            .filter(|l| l.starts_with(REMOTE_WINDOW_LABEL))
+            .collect()),
     }
 }
 
-/// Is the remote-backend window currently open?
+/// Close the remote-backend window for `url` (or every remote window when
+/// omitted). Returns whether one existed.
 #[tauri::command]
-pub fn remote_backend_is_open(app: AppHandle) -> bool {
-    app.get_webview_window(REMOTE_WINDOW_LABEL).is_some()
+pub fn remote_backend_close(app: AppHandle, url: Option<String>) -> Result<bool, String> {
+    let mut closed = false;
+    for label in remote_labels(&app, url.as_deref())? {
+        if let Some(w) = app.get_webview_window(&label) {
+            w.close().map_err(|e| e.to_string())?;
+            closed = true;
+        }
+    }
+    Ok(closed)
+}
+
+/// Is the remote-backend window for `url` (or any, when omitted) open?
+#[tauri::command]
+pub fn remote_backend_is_open(app: AppHandle, url: Option<String>) -> bool {
+    remote_labels(&app, url.as_deref())
+        .map(|ls| ls.iter().any(|l| app.get_webview_window(l).is_some()))
+        .unwrap_or(false)
+}
+
+/// URLs of every remote-backend window currently open.
+#[tauri::command]
+pub fn remote_backend_open_urls(app: AppHandle) -> Vec<String> {
+    app.webview_windows()
+        .into_iter()
+        .filter(|(l, _)| l.starts_with(REMOTE_WINDOW_LABEL))
+        .filter_map(|(_, w)| w.url().ok())
+        .map(|u| u.origin().ascii_serialization())
+        .collect()
 }
 
 /// Validate a remote rustic-server deployment: POST /login with the password

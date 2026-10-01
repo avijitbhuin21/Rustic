@@ -93,6 +93,9 @@ pub struct ServerContext {
     pub session_gen: Arc<AtomicU64>,
     /// Wakes the GitHub auto-issue worker when the webhook enqueues an event.
     pub github_notify: Arc<tokio::sync::Notify>,
+    /// Peer sync state (pairing, approvals, tickets) — shared with the desktop
+    /// implementation in `rustic_app::peer`.
+    pub lan: rustic_app::peer::LanState,
 }
 
 impl EventEmitter for ServerContext {

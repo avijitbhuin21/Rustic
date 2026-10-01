@@ -5,6 +5,8 @@ import {
   Brain,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Copy,
   HelpCircle,
   Image as ImageIcon,
@@ -235,7 +237,18 @@ function ThinkingRow({ text, done, durationSecs, block }) {
 // chrome (bg/padding/ring/size limits) so the image takes the whole viewport.
 // Radix handles overlay-click and Escape natively — no custom dismiss wiring
 // needed beyond the explicit close button.
-function ImageLightbox({ open, onOpenChange, src, alt }) {
+function ImageLightbox({ open, onOpenChange, src, alt, onPrev, onNext, position }) {
+  useEffect(() => {
+    if (!open || (!onPrev && !onNext)) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'ArrowLeft' && onPrev) { e.preventDefault(); onPrev(); }
+      else if (e.key === 'ArrowRight' && onNext) { e.preventDefault(); onNext(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onPrev, onNext]);
+
+  const navBtn = 'fixed top-1/2 z-[60] flex size-11 -translate-y-1/2 items-center justify-center rounded-full bg-background/70 text-foreground shadow-md backdrop-blur hover:bg-background disabled:pointer-events-none disabled:opacity-30';
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -247,13 +260,42 @@ function ImageLightbox({ open, onOpenChange, src, alt }) {
           className="flex h-screen w-screen cursor-zoom-out items-center justify-center p-6"
           onClick={() => onOpenChange(false)}
         >
-          <img
-            src={src}
-            alt={alt || 'attachment'}
-            onClick={(e) => e.stopPropagation()}
-            className="max-h-[92vh] max-w-[92vw] cursor-default rounded-md object-contain shadow-2xl"
-          />
+          {src ? (
+            <img
+              src={src}
+              alt={alt || 'attachment'}
+              onClick={(e) => e.stopPropagation()}
+              className="max-h-[92vh] max-w-[92vw] cursor-default rounded-md object-contain shadow-2xl"
+            />
+          ) : (
+            <Loader2 className="size-8 animate-spin text-muted-foreground" />
+          )}
         </div>
+        {position && position.total > 1 && (
+          <>
+            <button
+              type="button"
+              onClick={onPrev}
+              disabled={!onPrev}
+              aria-label="Previous image"
+              className={cn(navBtn, 'left-4')}
+            >
+              <ChevronLeft className="size-6" />
+            </button>
+            <button
+              type="button"
+              onClick={onNext}
+              disabled={!onNext}
+              aria-label="Next image"
+              className={cn(navBtn, 'right-4')}
+            >
+              <ChevronRight className="size-6" />
+            </button>
+            <div className="fixed bottom-4 left-1/2 z-[60] -translate-x-1/2 rounded-full bg-background/70 px-3 py-1 text-[12px] tabular-nums text-foreground shadow-md backdrop-blur">
+              {position.index + 1} / {position.total}
+            </div>
+          </>
+        )}
         <button
           type="button"
           onClick={() => onOpenChange(false)}
@@ -264,6 +306,79 @@ function ImageLightbox({ open, onOpenChange, src, alt }) {
         </button>
       </DialogContent>
     </Dialog>
+  );
+}
+
+// Every image in a transcript, in chat order, so the lightbox can step across
+// turns. Built from row data rather than the DOM because the transcript is
+// virtualized — off-screen turns aren't mounted. Items are matched by object
+// identity (the attachment / block object), which both the list and the
+// rendered thumbnails derive from the same turn data.
+const ChatImagesContext = React.createContext(null);
+
+/** Collect user attachments and assistant image blocks from transcript rows, in order. */
+function collectChatImages(rows) {
+  const out = [];
+  for (const row of rows || []) {
+    const turn = row?.turn;
+    if (!turn) continue;
+    for (const att of turn.user?.attachments || []) {
+      if (att && (att.url || att.src || att.deferred)) out.push({ ref: att, att, alt: att.name });
+    }
+    for (const entry of turn.blocks || []) {
+      const block = entry?.block;
+      if (block?.type !== 'image') continue;
+      const url = block.source?.url || block.url;
+      if (url) out.push({ ref: block, att: { url }, alt: undefined });
+    }
+  }
+  return out;
+}
+
+/** Provide a shared, navigable image viewer for every image in the given transcript rows. */
+export function ChatImageGalleryProvider({ rows, children }) {
+  const items = useMemo(() => collectChatImages(rows), [rows]);
+  const [current, setCurrent] = useState(null);
+  const [srcs, setSrcs] = useState(() => new Map());
+  const remember = (ref, url) => setSrcs((m) => (m.get(ref) === url ? m : new Map(m).set(ref, url)));
+  const index = current ? items.findIndex((it) => it.ref === current) : -1;
+  const item = index >= 0 ? items[index] : null;
+  const src = item ? (item.att.url || item.att.src || srcs.get(item.ref) || null) : null;
+
+  useEffect(() => {
+    if (!item || src || !item.att.deferred) return undefined;
+    let cancelled = false;
+    const a = item.att;
+    fetchImageDataUrl(a.taskId, a.sortOrder, a.blockIndex, a.mediaType).then((url) => {
+      if (!cancelled && url) remember(item.ref, url);
+    });
+    return () => { cancelled = true; };
+  }, [item, src]);
+
+  const ctx = useMemo(() => ({
+    has: (ref) => items.some((it) => it.ref === ref),
+    open: (ref, knownSrc) => {
+      if (knownSrc) remember(ref, knownSrc);
+      setCurrent(ref);
+    },
+  }), [items]);
+
+  const onPrev = index > 0 ? () => setCurrent(items[index - 1].ref) : undefined;
+  const onNext = index >= 0 && index < items.length - 1 ? () => setCurrent(items[index + 1].ref) : undefined;
+
+  return (
+    <ChatImagesContext.Provider value={ctx}>
+      {children}
+      <ImageLightbox
+        open={!!item}
+        onOpenChange={(v) => { if (!v) setCurrent(null); }}
+        src={src}
+        alt={item?.alt}
+        onPrev={onPrev}
+        onNext={onNext}
+        position={item ? { index, total: items.length } : null}
+      />
+    </ChatImagesContext.Provider>
   );
 }
 
@@ -322,10 +437,16 @@ function useDeferredImageSrc(att) {
 function SentAttachmentChip({ attachment, src: srcProp, name }) {
   const [open, setOpen] = useState(false);
   const [dims, setDims] = useState(null);
+  const gallery = React.useContext(ChatImagesContext);
   const att = attachment || (srcProp ? { url: srcProp } : null);
   const { src, holderRef } = useDeferredImageSrc(att);
   const label = name || attachment?.name;
   if (!src && !att?.deferred) return null;
+  const inGallery = !!(gallery && attachment && gallery.has(attachment));
+  const openViewer = () => {
+    if (inGallery) gallery.open(attachment, src);
+    else if (src) setOpen(true);
+  };
   return (
     <>
       <div
@@ -335,7 +456,7 @@ function SentAttachmentChip({ attachment, src: srcProp, name }) {
       >
         <button
           type="button"
-          onClick={() => src && setOpen(true)}
+          onClick={openViewer}
           aria-label={`Open ${label || 'attachment'} full size`}
           className="flex cursor-zoom-in items-center gap-1.5 px-1 py-1 pr-2 text-left hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
         >
@@ -366,22 +487,27 @@ function SentAttachmentChip({ attachment, src: srcProp, name }) {
           )}
         </button>
       </div>
-      <ImageLightbox open={open} onOpenChange={setOpen} src={src} alt={label} />
+      {!inGallery && <ImageLightbox open={open} onOpenChange={setOpen} src={src} alt={label} />}
     </>
   );
 }
 
-function ImageAttachment({ src: srcProp, alt, attachment }) {
+function ImageAttachment({ src: srcProp, alt, attachment, galleryRef }) {
   const [open, setOpen] = useState(false);
+  const gallery = React.useContext(ChatImagesContext);
   const att = attachment || (srcProp ? { url: srcProp } : null);
   const { src, holderRef } = useDeferredImageSrc(att);
   if (!src && !att?.deferred) return null;
+  const inGallery = !!(gallery && galleryRef && gallery.has(galleryRef));
   return (
     <>
       <button
         ref={holderRef}
         type="button"
-        onClick={() => src && setOpen(true)}
+        onClick={() => {
+          if (inGallery) gallery.open(galleryRef, src);
+          else if (src) setOpen(true);
+        }}
         aria-label={`Open ${alt || 'attachment'} full size`}
         className="my-1 block cursor-zoom-in overflow-hidden rounded-md border border-border bg-background transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
       >
@@ -397,7 +523,7 @@ function ImageAttachment({ src: srcProp, alt, attachment }) {
           </span>
         )}
       </button>
-      <ImageLightbox open={open} onOpenChange={setOpen} src={src} alt={alt} />
+      {!inGallery && <ImageLightbox open={open} onOpenChange={setOpen} src={src} alt={alt} />}
     </>
   );
 }
@@ -872,6 +998,7 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                     <div key={`${messageId}-${idx}`} className="pl-7">
                       <ImageAttachment
                         src={block.source?.url || block.url}
+                        galleryRef={block}
                       />
                     </div>
                   );

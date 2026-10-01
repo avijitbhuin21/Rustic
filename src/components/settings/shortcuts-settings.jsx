@@ -15,6 +15,7 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { useSettings } from '@/state/settings';
+import { GROUP_BOX, GROUP_TITLE } from './setting-row';
 import {
   COMMANDS,
   displayKey,
@@ -245,7 +246,7 @@ export function ShortcutsSettings() {
       </div>
 
       {/* Column header */}
-      <div className="flex items-center justify-between border-b border-border/60 px-3 pb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+      <div className={`flex items-center justify-between px-4 pb-2 ${GROUP_TITLE}`}>
         <span>Command</span>
         <span>Shortcut</span>
       </div>
@@ -253,11 +254,11 @@ export function ShortcutsSettings() {
       {/* List */}
       <ScrollArea className="min-h-0 flex-1 -mr-2 pr-2">
         {[...grouped.entries()].map(([group, items]) => (
-          <section key={group} className="mb-2">
-            <div className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+          <section key={group} className="mb-5">
+            <h3 className={`mb-2 px-1 ${GROUP_TITLE}`}>
               {group}
-            </div>
-            <ul className="divide-y divide-border/40">
+            </h3>
+            <ul className={`${GROUP_BOX} divide-y divide-border/40`}>
               {items.map((c) => {
                 const k = effective.get(c.id);
                 const isOverridden = userBindings.some((b) => b.command === c.id);
@@ -265,7 +266,7 @@ export function ShortcutsSettings() {
                 return (
                   <li
                     key={c.id}
-                    className="flex items-center justify-between gap-3 px-3 py-2 hover:bg-accent/30"
+                    className="flex items-center justify-between gap-3 px-3 py-2.5 hover:bg-muted/40"
                   >
                     <div className="flex min-w-0 flex-col">
                       <span className="text-[13px] leading-tight text-foreground">{c.label}</span>

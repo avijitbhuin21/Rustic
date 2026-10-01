@@ -125,6 +125,7 @@ pub async fn dispatch(ctx: &ServerContext, command: &str, args: Value) -> Result
 
     try_modules!(
         commands::meta::dispatch,
+        commands::peer_sync::dispatch,
         commands::workspace::dispatch,
         commands::file_tree::dispatch,
         commands::editor::dispatch,

@@ -5709,7 +5709,7 @@ dependencies = [
 
 [[package]]
 name = "rustic"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5807,8 +5807,12 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "flate2",
+ "futures-util",
+ "hyper-util",
  "ignore",
+ "mdns-sd",
  "notify",
+ "rcgen",
  "reqwest 0.12.28",
  "rusqlite",
  "rustic-agent",
@@ -5816,11 +5820,14 @@ dependencies = [
  "rustic-db",
  "rustic-git",
  "rustic-terminal",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tar",
  "tokio",
+ "tokio-rustls",
+ "tokio-util",
  "tracing",
  "uuid",
  "zstd",

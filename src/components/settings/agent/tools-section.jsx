@@ -26,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 import { Section, isTauri, slugify, useAiConfig } from './shared';
+import { RowGroup } from '../setting-row';
 import { SearchableSelect } from '@/components/ui/searchable-select';
 import { SubAgentSection } from './subagent-section';
 
@@ -304,7 +305,7 @@ export function ToolsSection() {
   return (
     <div ref={wrapperRef}>
     <Section title="Tools" defaultOpen={defaultOpen}>
-      <div className="rounded-lg border border-border/40 bg-muted/10 divide-y divide-border/40">
+      <RowGroup inset>
         <ToolRow
           name="Web Search"
           enabled={ws.enabled}
@@ -361,9 +362,9 @@ export function ToolsSection() {
             )}
           </div>
         </div>
-      </div>
+      </RowGroup>
 
-      <p className="mt-2 px-1 text-[11px] text-muted-foreground/80">
+      <p className="mt-2.5 text-[11px] text-muted-foreground/80">
         Media outputs save under <code className="text-[11px]">.rustic/generated/</code>.
       </p>
 

@@ -42,7 +42,7 @@ import { useAgent } from '@/state/agent';
 import { useExternalAgents, selectActiveCliSession } from '@/state/external-agents';
 import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
-import { ChatTurn } from './chat-turn';
+import { ChatTurn, ChatImageGalleryProvider } from './chat-turn';
 import { CostIndicator } from './cost-indicator';
 import { AgentToolsSheet } from './agent-tools-sheet';
 import { PromptBox } from './prompt-box';
@@ -319,6 +319,7 @@ function VirtualTurnList({ rows, toolResults, taskId, projectRoot, scrollRef, st
   }, [totalSize, rows.length, scrollRef, stickRef]);
 
   return (
+    <ChatImageGalleryProvider rows={rows}>
     <motion.div
       initial={{ opacity: 0 }}
       animate={{ opacity: 1, transition: { duration: 0.2, delay: 0.05 } }}
@@ -349,6 +350,7 @@ function VirtualTurnList({ rows, toolResults, taskId, projectRoot, scrollRef, st
         );
       })}
     </motion.div>
+    </ChatImageGalleryProvider>
   );
 }
 

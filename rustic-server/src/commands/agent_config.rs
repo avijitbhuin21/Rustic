@@ -87,6 +87,7 @@ pub async fn dispatch(
         "save_mcp_project_server" => save_mcp_project_server(ctx, args).await,
         "list_mcp_server_tools" => list_mcp_server_tools(ctx, args).await,
         "test_mcp_server" => test_mcp_server(ctx, args).await,
+        "test_mcp_entry" => test_mcp_entry(args).await,
         "get_pending_mcp_consent" => get_pending_mcp_consent(ctx, args).await,
         "approve_mcp_project_consent" => approve_mcp_project_consent(ctx, args).await,
         "revoke_mcp_project_consent" => revoke_mcp_project_consent(ctx, args).await,
@@ -1634,6 +1635,37 @@ async fn test_mcp_server(ctx: &ServerContext, args: &Value) -> Result<Value, Api
     })
     .await
     .map_err(|e| format!("test_mcp_server task panicked: {}", e))??;
+    ok(res)
+}
+
+#[derive(serde::Deserialize)]
+struct TestEntryArgs {
+    name: String,
+    entry: Value,
+}
+
+/// Connect to a not-yet-saved server entry (standard MCP JSON), list its
+/// tools, then disconnect — the Add MCP server dialog's Test button.
+async fn test_mcp_entry(args: &Value) -> Result<Value, ApiError> {
+    let a: TestEntryArgs = parse(args)?;
+    let res = tokio::task::spawn_blocking(move || -> Result<Vec<ToolDef>, String> {
+        let transport =
+            rustic_agent::mcp::entry_transport(&a.name, &a.entry).map_err(|e| e.to_string())?;
+        let config = rustic_agent::mcp::ServerConfig {
+            id: format!("test-{}", a.name),
+            name: a.name.clone(),
+            transport,
+            enabled: true,
+            scope: rustic_agent::mcp::McpScope::User,
+        };
+        let mut client =
+            rustic_agent::mcp::client::McpClient::connect(config).map_err(|e| e.to_string())?;
+        let tools = client.list_tools().map_err(|e| e.to_string());
+        client.disconnect();
+        tools
+    })
+    .await
+    .map_err(|e| format!("test_mcp_entry task panicked: {}", e))??;
     ok(res)
 }
 

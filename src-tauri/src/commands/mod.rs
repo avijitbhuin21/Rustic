@@ -2,6 +2,7 @@ pub mod agent;
 pub mod agent_terminals;
 pub mod app;
 pub mod cloud_sync;
+pub mod remote_dnd;
 pub mod editor;
 pub mod external_agents;
 pub mod file_history;

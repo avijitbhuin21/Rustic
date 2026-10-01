@@ -1247,6 +1247,82 @@ fn parse_mcp_json(text: &str) -> Result<Vec<(String, McpTransport)>> {
     Ok(out)
 }
 
+fn is_server_entry(v: &Value) -> bool {
+    v.get("command").and_then(|c| c.as_str()).is_some()
+        || v.get("url").and_then(|u| u.as_str()).is_some()
+}
+
+/// Normalize MCP config input into validated `(name, entry)` pairs.
+///
+/// Accepts the standard `{"mcpServers": {...}}` document, a bare
+/// `{"<name>": {...}}` map, or a single entry (`command`/`url`) paired with
+/// `name`. A JSON string holding any of these is decoded first, since tool
+/// calls often deliver nested objects string-encoded.
+pub fn normalize_server_input(input: &Value, name: Option<&str>) -> Result<Vec<(String, Value)>> {
+    let decoded;
+    let input = match input {
+        Value::String(s) => {
+            decoded = serde_json::from_str::<Value>(s.trim())
+                .map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            &decoded
+        }
+        v => v,
+    };
+    let obj = input
+        .as_object()
+        .ok_or_else(|| anyhow!("MCP config must be a JSON object"))?;
+
+    let mut pairs: Vec<(String, Value)> = if let Some(servers) = obj.get("mcpServers") {
+        servers
+            .as_object()
+            .ok_or_else(|| anyhow!("\"mcpServers\" must be an object"))?
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    } else if is_server_entry(input) {
+        let n = name
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| anyhow!("A server name is required for a single entry"))?;
+        vec![(n.to_string(), input.clone())]
+    } else if !obj.is_empty() && obj.values().all(is_server_entry) {
+        obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    } else {
+        return Err(anyhow!(
+            "Expected {{\"mcpServers\": {{\"<name>\": {{\"command\": ..., \"args\": [...]}}}}}} \
+             or an entry with \"command\" (stdio) or \"url\" (http)"
+        ));
+    };
+
+    if pairs.is_empty() {
+        return Err(anyhow!("\"mcpServers\" has no servers"));
+    }
+    if let Some(n) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        if pairs.len() > 1 {
+            pairs.retain(|(k, _)| k == n);
+            if pairs.is_empty() {
+                return Err(anyhow!("No server named \"{}\" in \"mcpServers\"", n));
+            }
+        }
+    }
+    for (n, entry) in &pairs {
+        if !entry.is_object() {
+            return Err(anyhow!("Server \"{}\" must be a JSON object", n));
+        }
+        parse_mcp_json(&json!({ "mcpServers": { n.as_str(): entry } }).to_string())?;
+    }
+    Ok(pairs)
+}
+
+/// Parse a single validated server entry into its transport.
+pub fn entry_transport(name: &str, entry: &Value) -> Result<McpTransport> {
+    parse_mcp_json(&json!({ "mcpServers": { name: entry } }).to_string())?
+        .into_iter()
+        .next()
+        .map(|(_, t)| t)
+        .ok_or_else(|| anyhow!("Server \"{}\" could not be parsed", name))
+}
+
 fn transport_to_json(transport: &McpTransport) -> Value {
     match transport {
         McpTransport::Stdio { command, args, env } => {
@@ -1291,6 +1367,70 @@ fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     }
     crate::io_util::atomic_write(path, text.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod normalize_input_tests {
+    use super::*;
+
+    #[test]
+    fn standard_document_without_type_or_name() {
+        let v = json!({ "mcpServers": { "whatsapp": {
+            "command": "C:\\uv.exe",
+            "args": ["--directory", "D:\\srv", "run", "main.py"]
+        }}});
+        let pairs = normalize_server_input(&v, None).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "whatsapp");
+        match entry_transport(&pairs[0].0, &pairs[0].1).unwrap() {
+            McpTransport::Stdio { command, args, .. } => {
+                assert_eq!(command, "C:\\uv.exe");
+                assert_eq!(args.len(), 4);
+            }
+            _ => panic!("expected stdio"),
+        }
+    }
+
+    #[test]
+    fn string_encoded_document_is_decoded() {
+        let s = Value::String(r#"{"mcpServers":{"a":{"command":"a-bin"}}}"#.into());
+        let pairs = normalize_server_input(&s, None).unwrap();
+        assert_eq!(pairs[0].0, "a");
+    }
+
+    #[test]
+    fn bare_entry_needs_name() {
+        let v = json!({ "command": "npx" });
+        assert!(normalize_server_input(&v, None).is_err());
+        let pairs = normalize_server_input(&v, Some("x")).unwrap();
+        assert_eq!(pairs[0].0, "x");
+    }
+
+    #[test]
+    fn bare_name_map_and_url_entry() {
+        let v = json!({ "remote": { "url": "https://x/mcp" } });
+        let pairs = normalize_server_input(&v, None).unwrap();
+        assert!(matches!(
+            entry_transport(&pairs[0].0, &pairs[0].1).unwrap(),
+            McpTransport::Sse { .. }
+        ));
+    }
+
+    #[test]
+    fn name_picks_one_of_many() {
+        let v = json!({ "mcpServers": { "a": { "command": "a" }, "b": { "command": "b" } } });
+        assert_eq!(normalize_server_input(&v, None).unwrap().len(), 2);
+        let pairs = normalize_server_input(&v, Some("b")).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "b");
+        assert!(normalize_server_input(&v, Some("zz")).is_err());
+    }
+
+    #[test]
+    fn entry_missing_command_and_url_fails() {
+        let v = json!({ "mcpServers": { "a": { "args": [] } } });
+        assert!(normalize_server_input(&v, None).is_err());
+    }
 }
 
 #[cfg(test)]

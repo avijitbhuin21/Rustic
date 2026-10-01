@@ -275,6 +275,7 @@ export function ProjectSection({ project, onOpenFile }) {
             onDrop={onRootDrop}
             {...headerLongPress}
             data-explorer-node="folder"
+            data-explorer-dir={project.root_path}
             className={cn(
               'group/project sticky top-0 z-10 flex h-7 cursor-pointer items-center gap-1 border-b border-border/60 bg-muted/60 px-2 text-[11px] font-semibold uppercase tracking-wide text-foreground/90 backdrop-blur hover:bg-muted/80',
               coarse && 'touch-longpress h-9',
@@ -383,6 +384,7 @@ export function ProjectSection({ project, onOpenFile }) {
                     onDragLeave={onRootDragLeave}
                     onDrop={onRootDrop}
                     {...emptyZoneLongPress}
+                    data-explorer-dir={project.root_path}
                     title={rootDragOver ? 'Drop to move to project root' : undefined}
                     onClick={() => {
                       useExplorer.getState().setLastSelectedNode({

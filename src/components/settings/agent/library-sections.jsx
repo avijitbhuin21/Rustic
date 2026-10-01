@@ -26,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 import { Section, isTauri, useExtensionsChanged } from './shared';
+import { RowGroup } from '../setting-row';
 
 // ─── Skills ──────────────────────────────────────────────────────────────────
 
@@ -188,7 +189,7 @@ export function SkillsSection() {
       {items.length === 0 ? (
         <div className="text-[12px] text-muted-foreground">No skills installed.</div>
       ) : (
-        <div className="divide-y divide-border/40 rounded-md border border-border/40 bg-muted/10">
+        <RowGroup inset>
           {items.map((s) => (
             <MarkdownEntryRow
               key={s.name}
@@ -199,7 +200,7 @@ export function SkillsSection() {
               onDelete={() => remove(s.name)}
             />
           ))}
-        </div>
+        </RowGroup>
       )}
       <MarkdownEditDialog
         open={!!edit}
@@ -277,7 +278,7 @@ export function WorkflowsSection() {
       {items.length === 0 ? (
         <div className="text-[12px] text-muted-foreground">No workflows installed.</div>
       ) : (
-        <div className="divide-y divide-border/40 rounded-md border border-border/40 bg-muted/10">
+        <RowGroup inset>
           {items.map((w) => (
             <MarkdownEntryRow
               key={w.name}
@@ -288,7 +289,7 @@ export function WorkflowsSection() {
               onDelete={() => remove(w.name)}
             />
           ))}
-        </div>
+        </RowGroup>
       )}
       <MarkdownEditDialog
         open={!!edit}
@@ -545,7 +546,7 @@ export function RulesSection() {
       {items.length === 0 ? (
         <div className="text-[12px] text-muted-foreground">No rules.</div>
       ) : (
-        <div className="divide-y divide-border/40 rounded-md border border-border/40 bg-muted/10">
+        <RowGroup inset>
           {items.map((r) => (
             <div key={r.name} className="px-3 py-2.5 hover:bg-muted/30 group">
               <div className="flex items-start gap-2">
@@ -578,7 +579,7 @@ export function RulesSection() {
               </div>
             </div>
           ))}
-        </div>
+        </RowGroup>
       )}
       <MarkdownEditDialog
         open={!!edit}

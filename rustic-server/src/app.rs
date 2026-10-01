@@ -117,6 +117,14 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .layer(from_fn_with_state(shared.clone(), auth_middleware));
 
+    // Peer sync (/lan/*): paired desktops and servers authenticate with their
+    // pairing token inside the handlers, so these sit outside the password
+    // gate. Built from the shared rustic_app::peer router the desktop uses.
+    let peer_routes = crate::peer::router(&shared.ctx).unwrap_or_else(|e| {
+        tracing::error!("peer sync routes unavailable: {e}");
+        Router::new()
+    });
+
     Router::new()
         .route("/healthz", get(health))
         .route("/login", post(login))
@@ -136,6 +144,7 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         // (same-origin GETs, curl, webhooks) pass through untouched.
         .layer(from_fn(cors_middleware))
         .with_state(shared)
+        .merge(peer_routes)
 }
 
 /// Extra allowed origins from `RUSTIC_ALLOWED_ORIGINS` (comma-separated full

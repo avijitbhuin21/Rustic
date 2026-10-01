@@ -130,11 +130,11 @@ pub fn definitions() -> Vec<ToolDef> {
                 .to_string(),
             parameters: json!({
                 "type": "object",
-                "required": ["name", "transport"],
+                "required": ["transport"],
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Kebab-case server name, unique within the scope."
+                        "description": "Server name, unique within the scope. Optional when transport is a {\"mcpServers\":{...}} document with one server (the key is used); picks one server when it lists several."
                     },
                     "scope": {
                         "type": "string",
@@ -143,7 +143,7 @@ pub fn definitions() -> Vec<ToolDef> {
                     },
                     "transport": {
                         "type": "object",
-                        "description": "Connection config. stdio: {\"type\":\"stdio\",\"command\":\"npx\",\"args\":[...],\"env\":{...}}. Remote: {\"type\":\"http\",\"url\":\"https://...\",\"headers\":{...}} (\"sse\" is accepted as an alias of \"http\")."
+                        "description": "Standard MCP JSON, exactly as users paste it for Claude Code / Cursor: either the full document {\"mcpServers\":{\"<name>\":{\"command\":\"uv\",\"args\":[...],\"env\":{...}}}} or a single entry. stdio entry: {\"command\":...,\"args\":[...],\"env\":{...}}; remote entry: {\"url\":\"https://...\",\"headers\":{...}}. \"type\" is optional (inferred from command/url)."
                     }
                 }
             }),
@@ -552,9 +552,31 @@ async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolO
 }
 
 async fn add_mcp_server(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    let Some(name) = str_param(&params, "name") else {
-        return Ok(ToolOutput::text("INVALID_PARAMS: name is required", true));
+    let name_param = str_param(&params, "name");
+    let Some(raw_transport) = params.get("transport") else {
+        return Ok(ToolOutput::text(
+            "INVALID_PARAMS: transport is required",
+            true,
+        ));
     };
+    let pairs = match crate::mcp::normalize_server_input(raw_transport, name_param.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(ToolOutput::text(format!("INVALID_TRANSPORT: {}", e), true));
+        }
+    };
+    if pairs.len() > 1 {
+        let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
+        return Ok(ToolOutput::text(
+            format!(
+                "INVALID_PARAMS: the config lists {} servers ({}); call add_mcp_server once per server, passing `name` to pick one.",
+                names.len(),
+                names.join(", ")
+            ),
+            true,
+        ));
+    }
+    let (name, transport_val) = pairs.into_iter().next().expect("non-empty pairs");
     if let Err(e) = validate_name(&name) {
         return Ok(ToolOutput::text(format!("INVALID_PARAMS: {}", e), true));
     }
@@ -569,23 +591,10 @@ async fn add_mcp_server(params: Value, context: &ToolContext) -> Result<ToolOutp
             ));
         }
     };
-    let Some(transport_val) = params.get("transport").cloned() else {
-        return Ok(ToolOutput::text(
-            "INVALID_PARAMS: transport is required",
-            true,
-        ));
-    };
-    let transport: McpTransport = match serde_json::from_value(transport_val.clone()) {
+    let transport: McpTransport = match crate::mcp::entry_transport(&name, &transport_val) {
         Ok(t) => t,
         Err(e) => {
-            return Ok(ToolOutput::text(
-                format!(
-                    "INVALID_TRANSPORT: {}. Expected {{\"type\":\"stdio\",\"command\":...}} \
-                     or {{\"type\":\"http\",\"url\":...}}.",
-                    e
-                ),
-                true,
-            ));
+            return Ok(ToolOutput::text(format!("INVALID_TRANSPORT: {}", e), true));
         }
     };
     let Some(mgr) = context.mcp_manager.as_ref() else {

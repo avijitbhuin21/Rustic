@@ -17,7 +17,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "process", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "process", "time", "sync", "io-util", "net", "fs", "macros"] }
 
 rustic-core = { workspace = true }
 rustic-db = { workspace = true }
@@ -36,6 +36,15 @@ reqwest = { workspace = true }
 ignore = { workspace = true }
 # Shared `/api/sync/v2/*` chunked-transfer routes (rustic-server + LAN listener).
 axum = "0.7"
+# Peer sync (`peer`): TLS listener pinned to per-device self-signed certs,
+# mDNS discovery, streamed uploads. Versions/features mirror src-tauri.
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = "0.13"
+mdns-sd = "0.13"
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Read-only access to the SQLite conversation stores the Antigravity CLI keeps
 # outside Rustic; `bundled` matches rustic-db so both link one libsqlite3.

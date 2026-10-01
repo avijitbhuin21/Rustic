@@ -380,6 +380,15 @@ export function FileNode({ node, style, dragHandle, tree }) {
     e.dataTransfer.setData('application/x-rustic-file', node.data.path);
     e.dataTransfer.setData('text/plain', node.data.path);
     e.dataTransfer.effectAllowed = 'copyMove';
+    // Web build: Chromium saves a `DownloadURL` drag dropped onto the OS file
+    // manager. /api/download is authed by the session cookie; folders zip.
+    if (IS_WEB) {
+      const fileName = (node.data.name || 'download') + (isFolder ? '.zip' : '');
+      if (!fileName.includes(':')) {
+        const url = `${window.location.origin}/api/download?${new URLSearchParams({ path: node.data.path })}`;
+        try { e.dataTransfer.setData('DownloadURL', `application/octet-stream:${fileName}:${url}`); } catch {}
+      }
+    }
   };
 
   // Folders are drop targets for move; EVERY row is a drop target for
@@ -449,6 +458,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
           onDrop={handleDrop}
           {...longPress}
           data-explorer-node={isFolder ? 'folder' : 'file'}
+          data-explorer-dir={isFolder ? node.data.path : parentDir}
           className={cn(
             'explorer-node-enter group/node flex h-6 cursor-pointer items-center gap-1 px-1 text-xs hover:bg-muted/50',
             coarse && 'touch-longpress h-8',

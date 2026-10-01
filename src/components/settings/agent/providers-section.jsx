@@ -26,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 import { Section, isTauri, prettyProviderError, slugify, useAiConfig, validateProviderKey } from './shared';
+import { RowGroup } from '../setting-row';
 
 // ─── AI Providers ─────────────────────────────────────────────────────────────
 
@@ -252,7 +253,7 @@ export function ConnectCard({ provider, configured, onSaved }) {
   if (configured) {
     return (
       <>
-        <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
+        <div className="flex items-center gap-2 px-3 py-2.5">
           <span className="size-2 rounded-sm bg-emerald-500" />
           <span className="text-[13px] font-medium flex-1">{provider.label}</span>
           <Badge variant="outline" className="h-5 text-[10px]">connected</Badge>
@@ -295,7 +296,7 @@ export function ConnectCard({ provider, configured, onSaved }) {
   }
 
   return (
-    <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-3">
+    <div className="px-3 py-3">
       <div className="mb-2 flex items-center gap-2">
         <span className="size-2 rounded-sm bg-muted-foreground/40" />
         <span className="text-[13px] font-medium flex-1">{provider.label}</span>
@@ -449,7 +450,7 @@ export function CompatibleEntryCard({ entry, onChanged }) {
   const label = `OpenAI-Compatible${entry.name ? ` — ${entry.name}` : ''}`;
   return (
     <>
-      <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
+      <div className="flex items-center gap-2 px-3 py-2.5">
         <span className="size-2 rounded-sm bg-emerald-500" />
         <span className="text-[13px] font-medium">
           OpenAI-Compatible {entry.name ? <span className="text-muted-foreground">— {entry.name}</span> : null}
@@ -579,7 +580,7 @@ export function FreeBuffCard({ configured, onSaved }) {
 
   return (
     <>
-      <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5">
+      <div className="px-3 py-2.5">
         <div className="flex items-center gap-2">
           <span className={cn('size-2 rounded-sm', isOn ? 'bg-emerald-500' : 'bg-muted-foreground/40')} />
           <span className="text-[13px] font-medium flex-1">FreeBuff</span>
@@ -765,7 +766,7 @@ export function ProvidersSection() {
         </Button>
       }
     >
-      <div className="space-y-2.5">
+      <RowGroup inset>
         {NATIVE_PROVIDERS.map((p) => (
           <ConnectCard
             key={p.type}
@@ -778,7 +779,7 @@ export function ProvidersSection() {
         {(byType.CompatibleList || []).map((entry, i) => (
           <CompatibleEntryCard key={`${entry.name}-${i}`} entry={entry} onChanged={refresh} />
         ))}
-      </div>
+      </RowGroup>
       <CompatibleAddDialog open={addOpen} onClose={() => setAddOpen(false)} onSaved={refresh} />
     </Section>
   );

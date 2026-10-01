@@ -37,6 +37,58 @@ export function SettingRow({ label, description, children, htmlFor }) {
   );
 }
 
+/** Shared look of every connected row block (SettingsSection, RowGroup, agent Section). */
+export const GROUP_BOX = 'rounded-xl border border-border/50 bg-muted/20 overflow-hidden';
+/** Small uppercase heading above a connected block. */
+export const GROUP_TITLE = 'text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/70';
+
+/**
+ * Connected block of arbitrary rows (lists of servers, tools, shortcuts…),
+ * same container + dividers as SettingsSection. Children are usually GroupRows.
+ * `inset` flushes the rows into a surrounding bordered card (e.g. an agent
+ * `Section`) instead of drawing a second box inside it.
+ */
+export function RowGroup({ title, actions, inset = false, className, children }) {
+  const rows = inset ? (
+    <div
+      className={[
+        '-mx-4 divide-y divide-border/40 border-y border-border/40',
+        'first:-mt-3 first:border-t-0 last:-mb-3 last:border-b-0',
+        className,
+      ].filter(Boolean).join(' ')}
+    >
+      {children}
+    </div>
+  ) : (
+    <div className={[GROUP_BOX, 'divide-y divide-border/40', className].filter(Boolean).join(' ')}>
+      {children}
+    </div>
+  );
+  if (!title && !actions) return rows;
+  return (
+    <div className="mb-4">
+      <div className="mb-2 flex items-center gap-2 px-1">
+        {title && <h3 className={GROUP_TITLE}>{title}</h3>}
+        {actions && <div className="ml-auto flex items-center gap-1.5">{actions}</div>}
+      </div>
+      {rows}
+    </div>
+  );
+}
+
+/** One row of a RowGroup: content left, controls right, filterable via data-setting-row. */
+export function GroupRow({ className, children, ...rest }) {
+  return (
+    <div
+      data-setting-row
+      className={['flex items-center gap-3 px-3 py-2.5', className].filter(Boolean).join(' ')}
+      {...rest}
+    >
+      {children}
+    </div>
+  );
+}
+
 // When a section's title itself matches the query, every row inside should
 // show (so searching "Cursor" reveals the whole Cursor section). We do that
 // by overriding the inner filter context to empty for matched sections. When
@@ -50,10 +102,10 @@ export function SettingsSection({ title, children }) {
 
   return (
     <section data-settings-anchor={anchor} className="mb-6 [&:not(:has([data-setting-row]))]:hidden">
-      <h3 className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+      <h3 className={`mb-2 px-1 ${GROUP_TITLE}`}>
         {title}
       </h3>
-      <div className="rounded-xl border border-border/50 bg-muted/20 divide-y divide-border/40 overflow-hidden px-3">
+      <div className={`${GROUP_BOX} divide-y divide-border/40 px-3`}>
         <SettingsFilterContext.Provider value={innerQuery}>
           {children}
         </SettingsFilterContext.Provider>

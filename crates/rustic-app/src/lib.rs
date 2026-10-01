@@ -20,6 +20,7 @@ pub mod github_download;
 pub mod meta_sync;
 pub mod notebook_kernel;
 pub mod path_scope;
+pub mod peer;
 pub mod preview_ops;
 pub mod search_ops;
 pub mod secrets;

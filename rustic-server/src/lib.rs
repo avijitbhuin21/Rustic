@@ -13,6 +13,7 @@ pub mod context;
 pub mod git_credentials;
 pub mod github;
 pub mod hub;
+pub mod peer;
 pub mod port_monitor;
 pub mod proxy;
 pub mod sync_transfer;
@@ -65,6 +66,7 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     let shared = build_shared(config.clone())?;
+    crate::peer::restore(&shared.ctx).await;
 
     // Same one-time inline-image conversion + orphan sweep + VACUUM the desktop
     // host runs, on its own connection so no request waits on it.
@@ -204,6 +206,7 @@ pub fn build_shared(config: ServerConfig) -> anyhow::Result<Arc<Shared>> {
         cloudflared: Arc::new(crate::cloudflared::CloudflaredManager::new()),
         session_gen: Arc::new(std::sync::atomic::AtomicU64::new(session_gen)),
         github_notify: Arc::new(tokio::sync::Notify::new()),
+        lan: rustic_app::peer::LanState::default(),
     };
 
     Ok(Arc::new(Shared {

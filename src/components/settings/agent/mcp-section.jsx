@@ -26,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 import { Section, isTauri, useExtensionsChanged } from './shared';
+import { RowGroup } from '../setting-row';
 import { JsonArea, McpAddServerDialog, McpConfigureDialog, statusBadge } from './mcp-dialogs';
 
 // ─── MCP Servers ─────────────────────────────────────────────────────────────
@@ -109,7 +110,7 @@ export function McpServerRow({ server, onRemove, onConfigure }) {
   };
 
   return (
-    <li className="rounded-md border border-border/50 bg-muted/30 overflow-hidden">
+    <div data-setting-row className="overflow-hidden">
       <div
         className={cn(
           'flex items-center gap-2 px-3 py-2',
@@ -165,7 +166,7 @@ export function McpServerRow({ server, onRemove, onConfigure }) {
           )}
         </div>
       )}
-    </li>
+    </div>
   );
 }
 
@@ -221,11 +222,11 @@ export function McpSection() {
           Click + to add one, or "Edit JSON" to paste a standard <code className="text-[11px]">.mcp.json</code>.
         </div>
       ) : (
-        <ul className="space-y-1.5">
+        <RowGroup inset>
           {servers.map((s) => (
             <McpServerRow key={s.id || s.name} server={s} onRemove={remove} onConfigure={setConfiguring} />
           ))}
-        </ul>
+        </RowGroup>
       )}
       <McpJsonDialog open={jsonOpen} onClose={() => { setJsonOpen(false); refresh(); }} />
       <McpAddServerDialog open={addOpen} onClose={() => { setAddOpen(false); refresh(); }} />

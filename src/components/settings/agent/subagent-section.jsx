@@ -176,7 +176,7 @@ export function SubAgentSection() {
 
       <div className="mt-5">
         <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-2">Concurrency</div>
-        <div className="rounded-lg border border-border/40 bg-muted/20 px-3 py-3">
+        <div className="-mx-4 border-y border-border/40 px-4 py-3">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0 flex-1">
               <div className="text-[13px] font-medium">Cap parallel sub-agents per task</div>

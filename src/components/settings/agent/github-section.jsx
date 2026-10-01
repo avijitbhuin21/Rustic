@@ -26,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 import { Section, slugify, useAiConfig } from './shared';
+import { RowGroup } from '../setting-row';
 import { SearchableSelect } from '@/components/ui/searchable-select';
 
 // ─── GitHub auto issue resolve (web/server build only) ──────────────────────
@@ -133,7 +134,7 @@ export function GithubAutoResolveSection() {
         </div>
       )}
 
-      <div className="rounded-lg border border-border/40 bg-muted/20 divide-y divide-border/40">
+      <RowGroup inset>
         <div className="flex items-start justify-between gap-3 px-3 py-3">
           <div className="min-w-0">
             <div className="text-[13px] font-medium">Auto issue resolve</div>
@@ -276,7 +277,7 @@ export function GithubAutoResolveSection() {
             </div>
           )}
         </div>
-      </div>
+      </RowGroup>
     </Section>
   );
 }

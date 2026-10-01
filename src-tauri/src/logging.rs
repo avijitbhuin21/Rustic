@@ -123,6 +123,29 @@ fn install_panic_hook() {
 
         let backtrace = std::backtrace::Backtrace::force_capture();
 
+        // Release builds use panic = "abort" and the tracing file writer is
+        // non-blocking, so the error! below is usually lost when the process
+        // dies. Append synchronously to crash.log so the panic survives.
+        if let Some(dir) = LOG_DIR.get() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("crash.log"))
+            {
+                let thread = std::thread::current();
+                let _ = writeln!(
+                    f,
+                    "{} thread '{}' panicked at {}: {}\n{}\n",
+                    chrono::Utc::now().to_rfc3339(),
+                    thread.name().unwrap_or("<unnamed>"),
+                    location,
+                    payload,
+                    backtrace
+                );
+            }
+        }
+
         tracing::error!(
             target: "rustic::panic",
             location = %location,

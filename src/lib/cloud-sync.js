@@ -17,7 +17,7 @@ export function cloudUrl() {
 export async function cloudSyncReady() {
   if (IS_WEB || !cloudUrl()) return false;
   try {
-    return !!(await invoke('cloud_sync_has_credentials'));
+    return !!(await invoke('cloud_sync_has_credentials', { url: cloudUrl() }));
   } catch {
     return false;
   }
@@ -26,7 +26,7 @@ export async function cloudSyncReady() {
 /// Push or pull a single project's files. Resolves to the backend's summary.
 export async function syncProject(direction, projectId) {
   const url = cloudUrl();
-  if (!url) throw new Error('No cloud server configured — add one in Settings › Remote Backend');
+  if (!url) throw new Error('No remote backend configured — add one in Settings › Cloud › Machines');
   const command = direction === 'push' ? 'cloud_sync_push_project' : 'cloud_sync_pull_project';
   return invoke(command, { url, projectId });
 }

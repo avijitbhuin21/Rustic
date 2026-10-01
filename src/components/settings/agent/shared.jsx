@@ -25,6 +25,7 @@ import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { isTauriAvailable } from '@/lib/platform';
+import { GROUP_BOX, GROUP_TITLE } from '../setting-row';
 import { ProvidersSection } from './providers-section';
 import { SubAgentSection } from './subagent-section';
 import { ToolsSection } from './tools-section';
@@ -125,7 +126,25 @@ export function anchorSlug(title) {
 export function Section({ title, defaultOpen = false, actions, badge, children }) {
   const flat = useContext(FlatSectionsContext);
   const [open, setOpen] = useState(defaultOpen);
-  const expanded = flat || open;
+  if (flat) {
+    // Same shell as SettingsSection: small heading outside, one connected box.
+    return (
+      <section data-settings-anchor={anchorSlug(title)} className="mb-6">
+        <header className="mb-2 flex min-h-7 items-center gap-2 px-1">
+          <h3 className={GROUP_TITLE}>{title}</h3>
+          {badge && (
+            <Badge variant="outline" className="h-4 px-1.5 text-[9.5px] uppercase border-border/70 text-muted-foreground">
+              {badge}
+            </Badge>
+          )}
+          <span className="flex-1" />
+          {actions && <div className="flex items-center gap-1.5">{actions}</div>}
+        </header>
+        <div className={`${GROUP_BOX} px-4 py-3`}>{children}</div>
+      </section>
+    );
+  }
+  const expanded = open;
   return (
     <section
       data-settings-anchor={anchorSlug(title)}

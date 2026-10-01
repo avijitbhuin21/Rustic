@@ -319,7 +319,7 @@ export default function App() {
       {!IS_WEB && <WindowControls />}
       {IS_WEB && <FolderPickerHost />}
       {IS_WEB && <BrowserWindow />}
-      {!IS_WEB && <LanPairPrompt />}
+      <LanPairPrompt />
       <Toaster />
       <ConfirmDialogHost />
       <SaveConflictDialogHost />

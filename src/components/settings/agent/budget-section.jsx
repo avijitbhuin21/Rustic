@@ -26,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 import { Section, isTauri } from './shared';
+import { RowGroup } from '../setting-row';
 
 // ─── Budget ──────────────────────────────────────────────────────────────────
 
@@ -80,7 +81,7 @@ export function BudgetSection() {
         Cross-task limits. Stop runaway parallelism or spend before it bites.
       </p>
 
-      <div className="rounded-lg border border-border/40 bg-muted/20 divide-y divide-border/40">
+      <RowGroup inset>
         <div className="flex items-start justify-between gap-3 px-3 py-3">
           <div className="min-w-0">
             <div className="text-[13px] font-medium">Cap concurrent provider streams</div>
@@ -139,7 +140,7 @@ export function BudgetSection() {
             <span className="text-[11px] text-muted-foreground">calls</span>
           </div>
         </div>
-      </div>
+      </RowGroup>
 
       <div className="mt-3 flex justify-end">
         <Button size="sm" className="text-xs" onClick={save}>Save budget settings</Button>

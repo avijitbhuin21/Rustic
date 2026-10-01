@@ -285,6 +285,31 @@ pub async fn test_mcp_server(
     .map_err(|e| format!("test_mcp_server task panicked: {}", e))?
 }
 
+/// Connect to a not-yet-saved server entry (standard MCP JSON), list its
+/// tools, then disconnect. Powers the Add MCP server dialog's Test button
+/// without touching any config file.
+#[tauri::command]
+pub async fn test_mcp_entry(name: String, entry: serde_json::Value) -> Result<Vec<ToolDef>, String> {
+    tokio::task::spawn_blocking(move || {
+        let transport =
+            rustic_agent::mcp::entry_transport(&name, &entry).map_err(|e| e.to_string())?;
+        let config = rustic_agent::mcp::ServerConfig {
+            id: format!("test-{}", name),
+            name: name.clone(),
+            transport,
+            enabled: true,
+            scope: McpScope::User,
+        };
+        let mut client =
+            rustic_agent::mcp::client::McpClient::connect(config).map_err(|e| e.to_string())?;
+        let tools = client.list_tools().map_err(|e| e.to_string());
+        client.disconnect();
+        tools
+    })
+    .await
+    .map_err(|e| format!("test_mcp_entry task panicked: {}", e))?
+}
+
 /// Tools advertised by a single connected MCP server. The settings UI calls
 /// this when the user expands a server row to show what the agent can call.
 /// Errors if the server isn't currently connected — the frontend should
