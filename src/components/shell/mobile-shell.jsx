@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Files, Search, GitBranch, Terminal as TerminalIcon, Code2, Bot, Globe, MoreHorizontal, Settings } from 'lucide-react';
+import { Files, Search, GitBranch, Terminal as TerminalIcon, Code2, Bot, Globe, MoreHorizontal, Settings, History } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useLayout, MOBILE_TABS } from '@/state/layout';
 import { useBrowser } from '@/state/browser';
@@ -8,10 +8,11 @@ import { Explorer } from '@/components/explorer/explorer';
 import { SearchPanel } from '@/components/search/search-panel';
 import ScmPanel from '@/components/scm/scm-panel';
 import AgentPanel from '@/components/agent/agent-panel';
+import { AgentTaskTree } from '@/components/agent/agent-task-tree';
 import { EditorAreaHost } from '@/components/shell/editor-area-host';
 import { BottomPanelHost } from '@/components/shell/bottom-panel-host';
 import { BrowserPicker } from '@/components/browser/browser-picker';
-import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -21,14 +22,17 @@ import {
 
 const PRIMARY_TABS = [
   { id: MOBILE_TABS.AGENT, label: 'Agent', icon: Bot },
+  { id: MOBILE_TABS.HISTORY, label: 'History', icon: History },
   { id: MOBILE_TABS.EXPLORER, label: 'Files', icon: Files },
   { id: MOBILE_TABS.EDITOR, label: 'Editor', icon: Code2 },
   { id: MOBILE_TABS.TERMINAL, label: 'Terminal', icon: TerminalIcon },
 ];
 
-function renderView(id, onOpenFile) {
+function renderView(id, onOpenFile, onPickChat) {
   switch (id) {
     case MOBILE_TABS.AGENT:    return <AgentPanel />;
+    // Every project's chats (pinned, running, history); picking one opens it on the Agent tab.
+    case MOBILE_TABS.HISTORY:  return <AgentTaskTree onTaskSelected={onPickChat} />;
     case MOBILE_TABS.EXPLORER: return <Explorer onOpenFile={onOpenFile} />;
     case MOBILE_TABS.EDITOR:   return <EditorAreaHost />;
     case MOBILE_TABS.TERMINAL: return <BottomPanelHost />;
@@ -84,8 +88,11 @@ export function MobileShell() {
     [setMobileTab],
   );
 
+  const pickChat = useMemo(() => () => setMobileTab(MOBILE_TABS.AGENT), [setMobileTab]);
+
   const allViews = [
     MOBILE_TABS.AGENT,
+    MOBILE_TABS.HISTORY,
     MOBILE_TABS.EXPLORER,
     MOBILE_TABS.EDITOR,
     MOBILE_TABS.TERMINAL,
@@ -93,7 +100,7 @@ export function MobileShell() {
     MOBILE_TABS.SCM,
   ];
 
-  const moreActive = mobileTab === MOBILE_TABS.SEARCH || mobileTab === MOBILE_TABS.SCM;
+  const moreActive = mobileTab === MOBILE_TABS.SEARCH || mobileTab === MOBILE_TABS.SCM || browserOpen || browserMenu;
 
   return (
     <div className="flex h-full w-full flex-col bg-background text-foreground">
@@ -101,7 +108,7 @@ export function MobileShell() {
         {allViews.map((id) =>
           mounted.has(id) ? (
             <div key={id} className={cn('absolute inset-0', mobileTab !== id && 'hidden')}>
-              {renderView(id, openFileOnEditorTab)}
+              {renderView(id, openFileOnEditorTab, pickChat)}
             </div>
           ) : null,
         )}
@@ -121,24 +128,6 @@ export function MobileShell() {
             onClick={() => setMobileTab(id)}
           />
         ))}
-        <Popover open={browserMenu} onOpenChange={setBrowserMenu}>
-          <PopoverTrigger asChild>
-            <button
-              type="button"
-              aria-label="Browser"
-              className={cn(
-                'flex flex-1 flex-col items-center justify-center gap-0.5 py-1.5 text-[10px] font-medium transition-colors',
-                browserOpen || browserMenu ? 'text-primary' : 'text-muted-foreground active:text-foreground',
-              )}
-            >
-              <Globe className="size-5" />
-              <span className="leading-none">Browser</span>
-            </button>
-          </PopoverTrigger>
-          <PopoverContent side="top" align="end" sideOffset={8} className="w-64 p-2">
-            <BrowserPicker fullscreen onClose={() => setBrowserMenu(false)} />
-          </PopoverContent>
-        </Popover>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
@@ -154,6 +143,9 @@ export function MobileShell() {
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent side="top" align="end" className="mb-1 min-w-[180px]">
+            <DropdownMenuItem onClick={() => setBrowserMenu(true)}>
+              <Globe className="size-4" /> Browser
+            </DropdownMenuItem>
             <DropdownMenuItem onClick={() => setMobileTab(MOBILE_TABS.SEARCH)}>
               <Search className="size-4" /> Search
             </DropdownMenuItem>
@@ -166,6 +158,13 @@ export function MobileShell() {
           </DropdownMenuContent>
         </DropdownMenu>
       </nav>
+
+      <Dialog open={browserMenu} onOpenChange={setBrowserMenu}>
+        <DialogContent aria-describedby={undefined} className="w-[min(22rem,92vw)] p-2">
+          <DialogTitle className="sr-only">Browser</DialogTitle>
+          <BrowserPicker fullscreen onClose={() => setBrowserMenu(false)} />
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

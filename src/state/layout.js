@@ -12,6 +12,7 @@ export const SIDEBAR_PANELS = {
 // bottom tab bar / phone shell switches between.
 export const MOBILE_TABS = {
   AGENT: 'agent',
+  HISTORY: 'history',
   EXPLORER: 'explorer',
   EDITOR: 'editor',
   TERMINAL: 'terminal',

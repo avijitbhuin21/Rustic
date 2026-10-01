@@ -531,7 +531,7 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
 
 const EMPTY_TASKS = [];
 
-export function AgentTaskTree() {
+export function AgentTaskTree({ onTaskSelected } = {}) {
   const projects = useExplorer((s) => s.projects);
   const loading = useExplorer((s) => s.loading);
   const error = useExplorer((s) => s.error);
@@ -645,6 +645,7 @@ export function AgentTaskTree() {
       setActiveProjectInExplorer(project.id);
     }
     setActiveTask(task.id);
+    onTaskSelected?.(project, task);
   };
 
   const handleCollapseAll = () => {
