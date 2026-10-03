@@ -319,6 +319,30 @@
       .catch(() => { v.parentElement.style.display = "none"; });
   }
 
+  /** Repeats the marquee items until one group spans the viewport, then clones the group so the -50% loop never shows a gap. */
+  function setupMarquee() {
+    const track = $(".marquee-track");
+    const group = track && $(".marquee-group", track);
+    if (!group) return;
+    const items = Array.from(group.children).map((n) => n.cloneNode(true));
+    const build = () => {
+      $$(".marquee-group", track).slice(1).forEach((g) => g.remove());
+      group.replaceChildren(...items.map((n) => n.cloneNode(true)));
+      let guard = 0;
+      while (group.scrollWidth < window.innerWidth * 1.1 && guard++ < 20) {
+        items.forEach((n) => group.appendChild(n.cloneNode(true)));
+      }
+      track.appendChild(group.cloneNode(true));
+      track.style.setProperty("--marquee-dur", `${Math.round(group.scrollWidth / 60)}s`);
+    };
+    build();
+    let w = window.innerWidth, t = 0;
+    window.addEventListener("resize", () => {
+      clearTimeout(t);
+      t = setTimeout(() => { if (window.innerWidth > w) build(); w = Math.max(w, window.innerWidth); }, 200);
+    });
+  }
+
   /** Smooth in-page anchor scrolling that accounts for the fixed nav. */
   function setupAnchors() {
     document.addEventListener("click", (e) => {
@@ -349,5 +373,6 @@
     setupOsDetect();
     setupFooterMeta();
     setupAnchors();
+    setupMarquee();
   });
 })();

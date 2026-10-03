@@ -36,7 +36,7 @@
     <nav class="nav-links" aria-label="Primary">
       <a href="#features" class="roll"><span data-text="Features">Features</span></a>
       <a href="#agents" class="roll"><span data-text="Agents">Agents</span></a>
-      <a href="#selfhost" class="roll"><span data-text="Self-host">Self-host</span></a>
+      <a href="#server" class="roll"><span data-text="Server">Server</span></a>
       <a href="#download" class="roll"><span data-text="Download">Download</span></a>
     </nav>
     <div class="nav-cta">
@@ -81,43 +81,76 @@
           </a>
         </div>
 
-        <!-- app mockup -->
+        <!-- app mockup: mirrors the real Rustic window (island activity bar, tabs, breadcrumb, chat dock, status bar) -->
         <div class="mock reveal" data-delay="900" data-tilt="light">
-          <div class="mock-bar">
-            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-            <span class="mock-title">rustic — ~/projects/acme-api</span>
+          <div class="mock-chrome">
+            <span class="mock-winctl" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg>
+              <svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"/></svg>
+              <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+            </span>
           </div>
           <div class="mock-body">
+            <nav class="mock-island" aria-hidden="true">
+              <span class="ib active"><svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h6"/></svg></span>
+              <span class="ib"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
+              <span class="ib"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7M18 10.5c0 4-6 3-11 5.5"/></svg></span>
+              <span class="ib"><svg viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 3v4"/><circle cx="9" cy="13" r="1.2" fill="currentColor"/><circle cx="15" cy="13" r="1.2" fill="currentColor"/></svg></span>
+              <i></i>
+              <span class="ib"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m7 10 3 2-3 2M13 15h4"/></svg></span>
+              <span class="ib"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></span>
+              <i></i>
+              <span class="ib"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg></span>
+            </nav>
             <aside class="mock-tree">
+              <div class="tree-head">EXPLORER</div>
               <div class="t dir open">acme-api</div>
               <div class="t i1 dir open">src</div>
-              <div class="t i2 file active">main.rs</div>
-              <div class="t i2 file">routes.rs</div>
-              <div class="t i2 file hl">auth.rs</div>
-              <div class="t i1 file">Cargo.toml</div>
-              <div class="t i1 file">README.md</div>
+              <div class="t i2 file rs active">main.rs</div>
+              <div class="t i2 file rs">routes.rs</div>
+              <div class="t i2 file rs dirty">auth.rs</div>
+              <div class="t i1 dir">tests</div>
+              <div class="t i1 file toml">Cargo.toml</div>
+              <div class="t i1 file md">README.md</div>
             </aside>
             <div class="mock-editor">
-              <div class="mock-tabs"><span class="active">main.rs</span><span>auth.rs</span></div>
-              <pre class="code"><code><span class="k">use</span> axum::{Router, routing::get};
-
-<span class="c">/// Boots the API and serves on $PORT.</span>
-<span class="k">#[tokio::main]</span>
-<span class="k">async fn</span> <span class="f">main</span>() {
-    <span class="k">let</span> app = Router::new()
-        .route(<span class="s">"/healthz"</span>, get(|| <span class="k">async</span> { <span class="s">"ok"</span> }))
-        .layer(<span class="f">auth::require_bearer</span>());
-    <span class="hl-line">    axum::serve(listener, app).await.unwrap();</span>
-}</code></pre>
+              <div class="mock-tabs">
+                <span class="tab active"><b class="fi rs"></b>main.rs<small>• acme-api</small><em>×</em></span>
+                <span class="tab"><b class="fi rs"></b>auth.rs<small>• acme-api</small><em class="dirty"></em></span>
+              </div>
+              <div class="mock-crumb">acme-api <i>›</i> src <i>›</i> <b>main.rs</b></div>
+              <pre class="code"><code><span class="ln">1</span><span class="k">use</span> axum::{<span class="ty">Router</span>, routing::<span class="f">get</span>};
+<span class="ln">2</span>
+<span class="ln">3</span><span class="c">/// Boots the API and serves on $PORT.</span>
+<span class="ln">4</span>#[<span class="ty">tokio</span>::<span class="f">main</span>]
+<span class="ln">5</span><span class="k">async fn</span> <span class="f">main</span>() {
+<span class="ln">6</span>    <span class="k">let</span> <span class="v">app</span> = <span class="ty">Router</span>::<span class="f">new</span>()
+<span class="ln">7</span>        .<span class="f">route</span>(<span class="s">"/healthz"</span>, <span class="f">get</span>(|| <span class="k">async</span> { <span class="s">"ok"</span> }))
+<span class="ln">8</span>        .<span class="f">layer</span>(auth::<span class="f">require_bearer</span>());
+<span class="hl-line"><span class="ln">9</span>    axum::<span class="f">serve</span>(<span class="v">listener</span>, <span class="v">app</span>).<span class="k">await</span>.<span class="f">unwrap</span>();</span><span class="ln">10</span>}</code></pre>
             </div>
             <aside class="mock-chat">
-              <div class="msg user"><span>Add rate limiting to the auth middleware and cover it with a test.</span></div>
-              <div class="msg tool"><span class="tool-name">read_file</span> src/auth.rs</div>
-              <div class="msg tool"><span class="tool-name">edit_file</span> src/auth.rs <em>+38 −4</em></div>
-              <div class="msg tool"><span class="tool-name">create_file</span> tests/rate_limit.rs</div>
-              <div class="msg tool"><span class="tool-name">run_command</span> cargo test rate_limit</div>
-              <div class="msg agent"><span class="typer" data-type="Rate limiter added (token bucket, 60 req/min per key). 3 tests passing. Checkpoint #14 saved — revert anytime."></span></div>
+              <div class="chat-scroll">
+                <div class="msg user"><span>Add rate limiting to the auth middleware and cover it with a test.</span></div>
+                <div class="msg tool"><span class="ti">✓</span><span class="tool-name">read_file</span><span class="tool-arg">src/auth.rs</span></div>
+                <div class="msg tool"><span class="ti">✓</span><span class="tool-name">edit_file</span><span class="tool-arg">src/auth.rs</span><em>+38 −4</em></div>
+                <div class="msg tool"><span class="ti">✓</span><span class="tool-name">create_file</span><span class="tool-arg">tests/rate_limit.rs</span></div>
+                <div class="msg tool"><span class="ti">✓</span><span class="tool-name">run_command</span><span class="tool-arg">cargo test rate_limit</span></div>
+                <div class="msg agent"><span class="typer" data-type="Rate limiter added (token bucket, 60 req/min per key). 3 tests passing. Checkpoint #14 saved — revert anytime."></span></div>
+              </div>
+              <div class="mock-prompt">
+                <div class="pb-text">Ask the agent…</div>
+                <div class="pb-bar">
+                  <span class="pb-pill"><span class="pb-mode"><svg viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7Z"/></svg>Auto</span><span class="pb-model">claude-opus</span></span>
+                  <span class="pb-ctx" title="context"></span>
+                  <span class="pb-send"><svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></span>
+                </div>
+              </div>
             </aside>
+          </div>
+          <div class="mock-status">
+            <span>⎇ main <i>2↑</i></span><span class="sb-hide">avijitbhuin21</span><span class="sb-dirty">✎ 1 unsaved</span>
+            <span class="sb-right">Ln 9, Col 5</span><span class="sb-hide">RUST</span><span class="sb-hide">LF</span><span>Rustic</span>
           </div>
         </div>
       </div>
@@ -126,10 +159,19 @@
     <!-- ───────────── MARQUEE ───────────── -->
     <div class="marquee" aria-hidden="true">
       <div class="marquee-track">
-        <span>Anthropic Claude</span><i>✦</i><span>OpenAI</span><i>✦</i><span>Google Gemini</span><i>✦</i><span>OpenRouter</span><i>✦</i><span>Any OpenAI-compatible endpoint</span><i>✦</i><span>MCP servers</span><i>✦</i><span>Claude Code</span><i>✦</i><span>Codex</span><i>✦</i><span>Antigravity</span><i>✦</i>
-        <span>Anthropic Claude</span><i>✦</i><span>OpenAI</span><i>✦</i><span>Google Gemini</span><i>✦</i><span>OpenRouter</span><i>✦</i><span>Any OpenAI-compatible endpoint</span><i>✦</i><span>MCP servers</span><i>✦</i><span>Claude Code</span><i>✦</i><span>Codex</span><i>✦</i><span>Antigravity</span><i>✦</i>
+        <div class="marquee-group"><span>Anthropic Claude</span><i>✦</i><span>OpenAI</span><i>✦</i><span>Google Gemini</span><i>✦</i><span>OpenRouter</span><i>✦</i><span>Any OpenAI-compatible endpoint</span><i>✦</i><span>MCP servers</span><i>✦</i><span>Claude Code</span><i>✦</i><span>Codex</span><i>✦</i><span>Antigravity</span><i>✦</i></div>
       </div>
     </div>
+
+    <!-- ───────────── STATS ───────────── -->
+    <section class="stats" aria-label="At a glance">
+      <div class="container stats-grid">
+        <div class="stat reveal"><span class="stat-n" data-count="4">0</span><span class="stat-l">provider families<br />+ any compatible endpoint</span></div>
+        <div class="stat reveal"><span class="stat-n" data-count="0">0</span><span class="stat-l">C dependencies<br />pure-Rust workspace</span></div>
+        <div class="stat reveal"><span class="stat-n" data-count="3">0</span><span class="stat-l">permission modes<br />Chat · Edit · Auto</span></div>
+        <div class="stat reveal"><span class="stat-n">∞</span><span class="stat-l">checkpoints<br />one per message</span></div>
+      </div>
+    </section>
 
     <!-- ───────────── FEATURES ───────────── -->
     <section class="section" id="features">
@@ -176,14 +218,6 @@
             <p>The same editor core as VS Code, with tree-sitter highlighting and previews for Markdown, images, PDF, docx, xlsx and notebooks.</p>
           </article>
 
-          <article class="card span-2 reveal" data-spot data-tilt>
-            <div class="card-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
-            </div>
-            <h3>A browser the agent can drive</h3>
-            <p>Embedded Chromium with DevTools access: click, type, fill forms, read the console, inspect network requests, take screenshots, run Lighthouse. It verifies its own UI work instead of guessing.</p>
-          </article>
-
           <article class="card reveal" data-spot data-tilt>
             <div class="card-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
@@ -198,6 +232,25 @@
             </div>
             <h3>Keys never touch the webview</h3>
             <p>API keys live in the OS keychain. The frontend only ever sees a sentinel; the Rust backend resolves the real secret.</p>
+          </article>
+
+          <article class="card span-2 reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+            </div>
+            <h3>A browser the agent can drive</h3>
+            <p>Embedded Chromium with DevTools access: click, type, fill forms, read the console, inspect network requests, take screenshots, run Lighthouse. It verifies its own UI work instead of guessing.</p>
+          </article>
+
+          <article class="card span-2 reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/></svg>
+            </div>
+            <h3>Long sessions that stay on track</h3>
+            <p>Pin a goal and the agent keeps working toward it. Context auto-condenses before it overflows, a live capsule shows how full the window is, and cost tracking with budget ceilings stops a runaway task before your bill does.</p>
+            <ul class="chips">
+              <li>goal</li><li>auto-condense</li><li>context meter</li><li>cost tracking</li><li>budget ceilings</li>
+            </ul>
           </article>
 
           <article class="card reveal" data-spot data-tilt>
@@ -258,46 +311,98 @@
       </div>
     </section>
 
-    <!-- ───────────── STATS ───────────── -->
-    <section class="stats" aria-label="At a glance">
-      <div class="container stats-grid">
-        <div class="stat reveal"><span class="stat-n" data-count="4">0</span><span class="stat-l">provider families<br />+ any compatible endpoint</span></div>
-        <div class="stat reveal"><span class="stat-n" data-count="0">0</span><span class="stat-l">C dependencies<br />pure-Rust workspace</span></div>
-        <div class="stat reveal"><span class="stat-n" data-count="3">0</span><span class="stat-l">permission modes<br />Chat · Edit · Auto</span></div>
-        <div class="stat reveal"><span class="stat-n">∞</span><span class="stat-l">checkpoints<br />one per message</span></div>
-      </div>
-    </section>
+    <!-- ───────────── RUSTIC SERVER ───────────── -->
+    <section class="section" id="server">
+      <div class="container">
+        <div class="section-head">
+          <p class="eyebrow reveal">03 — Rustic Server</p>
+          <h2 class="h2" data-split="words">Your whole IDE. <em class="serif">In your pocket.</em></h2>
+          <p class="sub reveal"><code>rustic-server</code> runs the exact same Rust core as the desktop app — headless, on a box you own — and serves Rustic to any browser. Start a task from your desk, check on it from the train, approve the fix from your phone.</p>
+        </div>
 
-    <!-- ───────────── SELF-HOST ───────────── -->
-    <section class="section" id="selfhost">
-      <div class="container split">
-        <div class="split-copy">
-          <p class="eyebrow reveal">03 — rustic-server</p>
-          <h2 class="h2" data-split="words">Same agent. <em class="serif">Any browser.</em></h2>
-          <p class="sub reveal">The desktop app and the headless server share one Rust core. Deploy <code>rustic-server</code> to a box you own and open Rustic from a phone, a tablet, or a locked-down work laptop.</p>
-          <ul class="ticks reveal">
-            <li>Single container: Rust binary + web frontend + node/uvx for MCP</li>
-            <li>Embedded Chromium for the agent browser</li>
-            <li>Cloudflare quick-tunnel previews for dev servers</li>
-            <li>Cloud sync: push your whole environment up, pull it down anywhere</li>
-            <li>Go, Rust, Bun and TypeScript toolchains baked in</li>
-          </ul>
-          <div class="hero-actions reveal">
-            <a class="btn btn-primary" href="https://github.com/avijitbhuin21/Rustic/blob/main/rustic-server/README.md" target="_blank" rel="noopener" data-magnetic><span>Server docs</span></a>
-            <a class="btn btn-ghost" href="https://github.com/avijitbhuin21/Rustic/blob/main/railway.json" target="_blank" rel="noopener" data-magnetic><span>Deploy on Railway</span></a>
+        <div class="server-hero">
+          <div class="phone reveal" data-tilt="light" aria-hidden="true">
+            <div class="phone-notch"></div>
+            <div class="phone-screen">
+              <div class="ph-head"><span class="ph-dot"></span>acme-api <small>· Auto</small></div>
+              <div class="ph-chat">
+                <div class="ph-msg user">The login page 500s on Safari — fix it and show me.</div>
+                <div class="ph-tool"><b>✓</b>grep_search <span>"SameSite"</span></div>
+                <div class="ph-tool"><b>✓</b>edit_file <span>src/session.rs</span><em>+6 −2</em></div>
+                <div class="ph-tool"><b>✓</b>run_command <span>cargo test</span></div>
+                <div class="ph-tool"><b>✓</b>browser_screenshot <span>/login</span></div>
+                <div class="ph-msg agent">Fixed — cookie now sets <code>SameSite=Lax</code>. Preview live at <u>acme-dev.trycloudflare.com</u></div>
+              </div>
+              <div class="ph-prompt"><span>Ask the agent…</span><i>↑</i></div>
+              <nav class="ph-tabs">
+                <span class="on"><svg viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 3v4"/></svg>Agent</span>
+                <span><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5M12 8v4l3 2"/></svg>History</span>
+                <span><svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/></svg>Files</span>
+                <span><svg viewBox="0 0 24 24"><path d="m8 6-5 6 5 6M16 6l5 6-5 6"/></svg>Editor</span>
+                <span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/></svg>Terminal</span>
+              </nav>
+            </div>
+          </div>
+
+          <div class="server-copy">
+            <h3 class="server-kicker reveal">Built for the phone, not shrunk onto it.</h3>
+            <ul class="ticks reveal">
+              <li><b>A real mobile layout.</b> Below tablet width Rustic switches to a one-view-at-a-time shell with a bottom tab bar — Agent, History, Files, Editor, Terminal — plus Search, Git and the browser under More.</li>
+              <li><b>Nothing resets when you switch.</b> Views stay mounted, so chat scroll, open editors and live terminal sessions survive every tab hop.</li>
+              <li><b>Agents keep working when you close the lid.</b> Tasks run on the server, not your laptop. Walk away, come back on any device, and the stream picks up where it is.</li>
+              <li><b>Every tab, every device, in sync.</b> One event hub fans out to all connected browsers — your desktop and phone see the same chat, live.</li>
+            </ul>
           </div>
         </div>
-        <div class="split-media reveal" data-tilt="light">
-          <div class="term">
-            <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="mock-title">docker</span></div>
-            <pre class="term-body"><code><span class="p">$</span> git clone https://github.com/avijitbhuin21/Rustic
-<span class="p">$</span> cd Rustic
-<span class="p">$</span> docker compose up -d
-<span class="d">[+] Building image rustic-server</span>
-<span class="d">[+] Running 1/1</span>
+
+        <div class="benefits">
+          <article class="benefit reveal" data-spot>
+            <svg viewBox="0 0 24 24"><path d="M12 2v6M12 16v6M2 12h6M16 12h6"/><circle cx="12" cy="12" r="3"/></svg>
+            <h4>Dev servers, auto-exposed</h4>
+            <p>Start <code>npm run dev</code> and a Cloudflare quick-tunnel opens for that port automatically — tap the link on your phone. Stop the server and the tunnel is reaped.</p>
+          </article>
+          <article class="benefit reveal" data-spot>
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+            <h4>A real browser on the VM</h4>
+            <p>Headless Chromium next to your code, so <code>localhost:3000</code> and OAuth redirects just work. Streamed to you with full DevTools — and zero processes when it's closed.</p>
+          </article>
+          <article class="benefit reveal" data-spot>
+            <svg viewBox="0 0 24 24"><path d="M9 19c-4 1.5-4-2-6-2.5M15 22v-3.5a3 3 0 0 0-.9-2.4c3-.3 6.1-1.5 6.1-6.6a5.2 5.2 0 0 0-1.4-3.6 4.8 4.8 0 0 0-.1-3.6s-1.1-.3-3.7 1.4a12.6 12.6 0 0 0-6.6 0C5.8 1.9 4.7 2.2 4.7 2.2a4.8 4.8 0 0 0-.1 3.6A5.2 5.2 0 0 0 3.2 9.4c0 5.1 3.1 6.3 6.1 6.6a3 3 0 0 0-.9 2.4V22"/></svg>
+            <h4>Issues that fix themselves</h4>
+            <p>Point a GitHub webhook at your server: new issues spawn a fixer task, comments answer its questions, and the fix lands as a local commit — never pushed without you.</p>
+          </article>
+          <article class="benefit reveal" data-spot>
+            <svg viewBox="0 0 24 24"><path d="M4 14a8 8 0 0 1 16 0"/><path d="M12 14V3"/><rect x="3" y="14" width="18" height="7" rx="2"/></svg>
+            <h4>Sync desktop ⇄ server</h4>
+            <p>Push your whole environment — projects, chats, settings — to the server and pull it back down anywhere. Chunked, parallel, resumable transfers.</p>
+          </article>
+          <article class="benefit reveal" data-spot>
+            <svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+            <h4>Locked down by default</h4>
+            <p>Password login with HMAC-signed sessions and per-IP rate limiting. Path guards block system dirs and credentials. One Power button logs every device out.</p>
+          </article>
+          <article class="benefit reveal" data-spot>
+            <svg viewBox="0 0 24 24"><path d="M21 8 12 3 3 8v8l9 5 9-5Z"/><path d="m3 8 9 5 9-5M12 13v8"/></svg>
+            <h4>One container, batteries in</h4>
+            <p>Rust binary, web UI, git, node/npx and uv/uvx for MCP, plus Go, Rust, Bun and TypeScript toolchains. Caddy handles HTTPS. Git in the terminal is pre-authed to GitHub.</p>
+          </article>
+        </div>
+
+        <div class="server-deploy">
+          <div class="term reveal" data-tilt="light">
+            <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="mock-title">deploy</span></div>
+            <pre class="term-body"><code><span class="p">$</span> git clone https://github.com/avijitbhuin21/Rustic && cd Rustic
+<span class="p">$</span> cp .env.example .env   <span class="d"># set RUSTIC_AUTH_PASSWORD + RUSTIC_DOMAIN</span>
+<span class="p">$</span> docker compose up -d --build
  <span class="ok">✔</span> Container rustic-server  <span class="ok">Started</span>
-<span class="p">$</span> curl -s localhost:8787/healthz
-<span class="ok">ok</span><span class="caret"></span></code></pre>
+ <span class="ok">✔</span> Container caddy          <span class="ok">Started</span>  <span class="d">https://rustic.example.com</span><span class="caret"></span></code></pre>
+          </div>
+          <div class="server-cta reveal">
+            <p>Deploy to any Linux VM with Docker, put it behind Tailscale, or click through on Railway. Bring your own keys — they stay on your server.</p>
+            <div class="hero-actions">
+              <a class="btn btn-primary" href="https://github.com/avijitbhuin21/Rustic/blob/main/rustic-server/README.md" target="_blank" rel="noopener" data-magnetic><span>Server docs</span></a>
+              <a class="btn btn-ghost" href="https://github.com/avijitbhuin21/Rustic/blob/main/railway.json" target="_blank" rel="noopener" data-magnetic><span>Deploy on Railway</span></a>
+            </div>
           </div>
         </div>
       </div>
@@ -356,13 +461,30 @@
   <footer class="footer">
     <div class="container footer-inner">
       <div class="footer-top">
-        <a class="brand" href="#top"><img src="/logo.png" alt="" width="28" height="28" /><span>Rustic</span></a>
-        <nav class="footer-links" aria-label="Footer">
-          <a href="https://github.com/avijitbhuin21/Rustic" target="_blank" rel="noopener" class="roll"><span data-text="GitHub">GitHub</span></a>
-          <a href="https://github.com/avijitbhuin21/Rustic/releases" target="_blank" rel="noopener" class="roll"><span data-text="Releases">Releases</span></a>
-          <a href="https://github.com/avijitbhuin21/Rustic/blob/main/HOW-TO-USE.md" target="_blank" rel="noopener" class="roll"><span data-text="How to use">How to use</span></a>
-          <a href="https://github.com/avijitbhuin21/Rustic/blob/main/rustic-server/README.md" target="_blank" rel="noopener" class="roll"><span data-text="Self-hosting">Self-hosting</span></a>
-          <a href="https://github.com/avijitbhuin21/Rustic/issues" target="_blank" rel="noopener" class="roll"><span data-text="Issues">Issues</span></a>
+        <div class="footer-brand">
+          <a class="brand" href="#top"><img src="/logo.png" alt="" width="28" height="28" /><span>Rustic</span></a>
+          <p>The editor that ships with an agent. Desktop on Windows, macOS &amp; Linux — or self-host it and code from your phone.</p>
+          <a class="btn btn-ghost btn-sm" href="https://github.com/avijitbhuin21/Rustic" target="_blank" rel="noopener" data-magnetic><span>Star on GitHub</span></a>
+        </div>
+        <nav class="footer-cols" aria-label="Footer">
+          <div>
+            <h5>Product</h5>
+            <a href="#features" class="roll"><span data-text="Features">Features</span></a>
+            <a href="#agents" class="roll"><span data-text="Agents">Agents</span></a>
+            <a href="#server" class="roll"><span data-text="Rustic Server">Rustic Server</span></a>
+            <a href="#download" class="roll"><span data-text="Download">Download</span></a>
+          </div>
+          <div>
+            <h5>Docs</h5>
+            <a href="https://github.com/avijitbhuin21/Rustic/blob/main/HOW-TO-USE.md" target="_blank" rel="noopener" class="roll"><span data-text="How to use">How to use</span></a>
+            <a href="https://github.com/avijitbhuin21/Rustic/blob/main/rustic-server/README.md" target="_blank" rel="noopener" class="roll"><span data-text="Self-hosting">Self-hosting</span></a>
+            <a href="https://github.com/avijitbhuin21/Rustic/releases" target="_blank" rel="noopener" class="roll"><span data-text="Releases">Releases</span></a>
+          </div>
+          <div>
+            <h5>Community</h5>
+            <a href="https://github.com/avijitbhuin21/Rustic" target="_blank" rel="noopener" class="roll"><span data-text="GitHub">GitHub</span></a>
+            <a href="https://github.com/avijitbhuin21/Rustic/issues" target="_blank" rel="noopener" class="roll"><span data-text="Issues">Issues</span></a>
+          </div>
         </nav>
       </div>
       <div class="footer-giant" aria-hidden="true"><span>Rustic</span></div>
