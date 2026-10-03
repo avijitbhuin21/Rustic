@@ -231,9 +231,10 @@
       el.removeChild(probe);
       return widths;
     };
-    const widths = measure();
+    let widths = measure();
     el.style.transition = "width 0.5s cubic-bezier(0.16,1,0.3,1)";
     el.style.width = `${widths[0] + 4}px`;
+    if (document.fonts) document.fonts.ready.then(() => { widths = measure(); el.style.width = `${widths[idx] + 4}px`; });
     setInterval(() => {
       idx = (idx + 1) % words.length;
       const old = $(".w", el);
@@ -336,6 +337,7 @@
       track.style.setProperty("--marquee-dur", `${Math.round(group.scrollWidth / 60)}s`);
     };
     build();
+    if (document.fonts) document.fonts.ready.then(build);
     let w = window.innerWidth, t = 0;
     window.addEventListener("resize", () => {
       clearTimeout(t);
