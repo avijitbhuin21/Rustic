@@ -129,7 +129,8 @@
 <span class="ln">8</span>        .<span class="f">layer</span>(auth::<span class="f">require_bearer</span>());
 <span class="hl-line"><span class="ln">9</span>    axum::<span class="f">serve</span>(<span class="v">listener</span>, <span class="v">app</span>).<span class="k">await</span>.<span class="f">unwrap</span>();</span><span class="ln">10</span>}</code></pre>
               <div class="mock-term" aria-hidden="true">
-                <div class="mt-tabs"><span class="on">cargo test</span><span>dev server</span><em>×</em></div>
+                <div class="mt-head"><span>Terminal</span><i>+</i><i>⤢</i><i>×</i></div>
+                <div class="mt-main">
                 <pre class="mt-body"><code><span class="mt-p">$</span> cargo test rate_limit
 <span class="mt-d">   Compiling acme-api v0.1.0 (~/projects/acme-api)</span>
 <span class="mt-d">    Finished test profile in 3.42s</span>
@@ -139,6 +140,8 @@ test rate_limit::rejects_61st_request ... <span class="mt-ok">ok</span>
 test rate_limit::refills_after_window ... <span class="mt-ok">ok</span>
 
 test result: <span class="mt-ok">ok</span>. 3 passed; 0 failed</code></pre>
+                <div class="mt-tabs"><span class="on">cargo test</span><span>dev server</span></div>
+                </div>
               </div>
             </div>
             <aside class="mock-chat">

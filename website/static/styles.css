@@ -259,11 +259,14 @@ code { font-family: var(--mono); font-size: 0.88em; }
 .dot { width: 10px; height: 10px; border-radius: 50%; }
 .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
 .mock-title { margin-left: 8px; font-family: var(--mono); font-size: 0.74rem; color: var(--fg-3); }
-.mock-body { position: relative; flex: 1; min-height: 0; display: grid; grid-template-columns: 64px 190px minmax(0, 1fr) 320px; border-top: 1px solid var(--m-line); }
+.mock-body { position: relative; flex: 1; min-height: 0; display: grid; grid-template-columns: 230px minmax(0, 1fr) 320px; border-top: 1px solid var(--m-line); }
 .mock-body::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--m-blue); opacity: 0.8; }
 .mock-island {
-  align-self: start; margin: 12px 0 0 10px; width: 44px; padding: 4px 0; display: flex; flex-direction: column; align-items: center; gap: 2px;
-  border-radius: 14px; border: 1px solid rgba(255, 255, 255, 0.09); background: rgba(23, 23, 23, 0.8); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+  position: absolute; z-index: 3; left: 12px; top: 50%; transform: translateY(-50%);
+  width: 44px; padding: 4px 0; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  border-radius: 14px; border: 1px solid rgba(255, 255, 255, 0.09); background: rgba(10, 10, 10, 0.65);
+  -webkit-backdrop-filter: blur(14px) saturate(140%); backdrop-filter: blur(14px) saturate(140%);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
 }
 .mock-island .ib { position: relative; width: 36px; height: 36px; padding: 9px; border-radius: 10px; color: var(--m-fg-3); }
 .mock-island .ib.active { color: var(--m-fg); background: rgba(255, 255, 255, 0.05); }
@@ -282,11 +285,15 @@ code { font-family: var(--mono); font-size: 0.88em; }
 .mock-editor { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .mock-editor .code { flex: 1; min-height: 0; }
 .mock-term { flex: 0 0 34%; min-height: 150px; display: flex; flex-direction: column; border-top: 1px solid var(--m-line); background: var(--m-bg); }
-.mt-tabs { display: flex; align-items: center; gap: 2px; height: 30px; padding: 0 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); font-size: 0.66rem; color: var(--m-fg-3); }
-.mt-tabs span { padding: 4px 10px; border-radius: 6px; }
+.mt-head { display: flex; align-items: center; gap: 4px; height: 28px; flex-shrink: 0; padding: 0 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.06); font-size: 0.66rem; color: var(--m-fg-2); }
+.mt-head span { margin-right: auto; }
+.mt-head i { width: 18px; text-align: center; font-style: normal; color: var(--m-fg-3); }
+.mt-main { flex: 1; min-height: 0; display: flex; }
+.mt-tabs { flex: 0 0 15%; min-width: 92px; display: flex; flex-direction: column; padding: 4px; gap: 2px; border-left: 1px solid rgba(255, 255, 255, 0.06); font-size: 0.64rem; color: var(--m-fg-3); }
+.mt-tabs span { display: flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mt-tabs span::before { content: ">_"; font-size: 0.56rem; opacity: 0.7; }
 .mt-tabs span.on { color: var(--m-fg); background: rgba(255, 255, 255, 0.06); }
-.mt-tabs em { margin-left: auto; font-style: normal; }
-.mt-body { flex: 1; margin: 0; padding: 10px 16px; overflow: hidden; font-family: "Victor Mono", var(--mono); font-size: 0.7rem; line-height: 1.65; color: #cccccc; }
+.mt-body { flex: 1; min-width: 0; margin: 0; padding: 10px 16px; overflow: hidden; font-family: "Victor Mono", var(--mono); font-size: 0.7rem; line-height: 1.65; color: #cccccc; }
 .mt-p { color: #4ec9b0; } .mt-d { color: var(--m-fg-3); } .mt-ok { color: #4ec9b0; }
 .chat-scroll { overflow: hidden; }
 .mock-tabs { display: flex; height: 32px; font-size: 0.72rem; border-bottom: 1px solid var(--m-line); background: rgba(38, 38, 38, 0.2); }
@@ -531,7 +538,7 @@ code { font-family: var(--mono); font-size: 0.88em; }
   .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .card.span-2 { grid-column: span 2; }
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .mock-body { grid-template-columns: 58px 160px minmax(0, 1fr) 270px; }
+  .mock-body { grid-template-columns: 190px minmax(0, 1fr) 270px; }
   .benefits { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .server-deploy { grid-template-columns: minmax(0, 1fr); }
   .footer-top { grid-template-columns: minmax(0, 1fr); }
