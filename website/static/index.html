@@ -3,14 +3,59 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Rustic — The code editor that ships with an agent</title>
-  <meta name="description" content="Rustic is an agentic, multi-project code editor built in Rust. A VS Code–style editor paired with a first-class AI agent that reads, edits, runs and reasons about your whole workspace — every change captured as a revertible checkpoint." />
+  <title>Rustic — Open-Source AI Code Editor Built in Rust</title>
+  <meta name="description" content="Rustic is a free, open-source AI code editor built in Rust. A VS Code–style IDE with a built-in coding agent, integrated terminals, MCP, sub-agents and per-message checkpoints — on Windows, macOS, Linux, or self-hosted in your browser." />
+  <meta name="keywords" content="Rustic, Rustic editor, Rustic IDE, Rustic code editor, AI code editor, agentic code editor, Rust code editor, open source IDE, Tauri, self-hosted IDE" />
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1" />
+  <meta name="author" content="Avijit Bhuin" />
+  <link rel="canonical" href="https://rustic.avijitbhuin.com/" />
   <meta name="theme-color" content="#0a0a0a" />
-  <meta property="og:title" content="Rustic — The code editor that ships with an agent" />
-  <meta property="og:description" content="An agentic, multi-project code editor. Rust + Tauri backend, Monaco editor, integrated terminals, sub-agents, MCP, and per-message checkpoints." />
-  <meta property="og:image" content="/logo.png" />
   <meta property="og:type" content="website" />
-  <link rel="icon" type="image/png" href="/logo.png" />
+  <meta property="og:site_name" content="Rustic" />
+  <meta property="og:url" content="https://rustic.avijitbhuin.com/" />
+  <meta property="og:title" content="Rustic — Open-Source AI Code Editor Built in Rust" />
+  <meta property="og:description" content="A VS Code–style editor with a first-class AI agent that reads, edits, runs and reasons about your whole workspace. Free and open source." />
+  <meta property="og:image" content="https://rustic.avijitbhuin.com/og-image.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="Rustic — the code editor that ships with an agent" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Rustic — Open-Source AI Code Editor Built in Rust" />
+  <meta name="twitter:description" content="A VS Code–style editor with a first-class AI agent. Free and open source." />
+  <meta name="twitter:image" content="https://rustic.avijitbhuin.com/og-image.png" />
+  <link rel="icon" type="image/png" sizes="512x512" href="/rustic-icon.png" />
+  <link rel="apple-touch-icon" href="/rustic-icon.png" />
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://rustic.avijitbhuin.com/#app",
+        "name": "Rustic",
+        "alternateName": ["Rustic Editor", "Rustic IDE", "Rustic Code Editor"],
+        "description": "Rustic is a free, open-source AI code editor built in Rust: a VS Code–style IDE with a built-in coding agent, integrated terminals, MCP support, sub-agents and per-message checkpoints.",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Windows, macOS, Linux, Web",
+        "url": "https://rustic.avijitbhuin.com/",
+        "downloadUrl": "https://github.com/avijitbhuin21/Rustic/releases/latest",
+        "image": "https://rustic.avijitbhuin.com/og-image.png",
+        "license": "https://github.com/avijitbhuin21/Rustic",
+        "isAccessibleForFree": true,
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+        "author": { "@type": "Person", "name": "Avijit Bhuin", "url": "https://avijitbhuin.com/" },
+        "sameAs": ["https://github.com/avijitbhuin21/Rustic", "https://railway.com/deploy/rustic"]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://rustic.avijitbhuin.com/#website",
+        "name": "Rustic",
+        "url": "https://rustic.avijitbhuin.com/",
+        "publisher": { "@type": "Person", "name": "Avijit Bhuin", "url": "https://avijitbhuin.com/" }
+      }
+    ]
+  }
+  </script>
   <link rel="preload" href="/VictorMono-Bold.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="preload" href="/VictorMono-Italic.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="stylesheet" href="/styles.css" />
@@ -62,6 +107,7 @@
           Open source · Pure Rust · Tauri 2 · Windows, macOS &amp; Linux
         </p>
         <h1 class="display" data-split="chars">
+          <span class="sr-only">Rustic, the open-source AI code editor: </span>
           <span class="line">The editor that</span>
           <span class="line">ships with <em class="serif">an agent.</em></span>
         </h1>
