@@ -516,9 +516,28 @@ impl RemoteTransport {
                 }))?;
                 Ok(transport)
             }
-            Ok(resp) if resp.status().is_client_error() => {
-                // 4xx on the POST probe → assume a legacy HTTP+SSE server.
+            Ok(resp)
+                if matches!(
+                    resp.status(),
+                    reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                ) =>
+            {
+                // 404/405 on the POST probe → assume a legacy HTTP+SSE server.
                 Self::connect_legacy(http, url, headers)
+            }
+            Ok(resp) if resp.status().is_client_error() => {
+                // Auth/validation failures (401/403/400…) — falling back to
+                // legacy SSE here would bury the real cause under a 405.
+                let status = resp.status();
+                let body = resp.text().unwrap_or_default();
+                let body: String = body.trim().chars().take(400).collect();
+                Err(anyhow::anyhow!(
+                    "MCP remote server '{}' rejected initialize with HTTP {}{}{}",
+                    url,
+                    status,
+                    if body.is_empty() { "" } else { ": " },
+                    body
+                ))
             }
             Ok(resp) => Err(anyhow::anyhow!(
                 "MCP remote server '{}' returned HTTP {} during initialize",

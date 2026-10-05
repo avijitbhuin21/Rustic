@@ -144,13 +144,20 @@ COPY --from=web   /app/dist /app/dist
 # GOPATH/CARGO_INSTALL_ROOT point at the /data volume so binaries installed at
 # runtime (`go install ...`, `cargo install ...`) persist across deploys. Their
 # bin dirs are prepended to PATH. The toolchains themselves stay in the image.
+# HOME and NPM_CONFIG_PREFIX also live on the volume so every user-level
+# install survives redeploys: `npm i -g` (Claude Code, Codex…), the `agy`
+# installer and pipx/uv tools (~/.local/bin), plus CLI logins and config
+# (~/.claude, ~/.codex, ~/.gemini, ~/.gitconfig). rustic-server creates these
+# dirs on boot because the volume mount hides anything the image put there.
 ENV RUSTIC_DATA_DIR=/data \
     RUSTIC_STATIC_DIR=/app/dist \
     CHROME_BIN=/usr/bin/chromium \
+    HOME=/data/home \
+    NPM_CONFIG_PREFIX=/data/npm-global \
     GOPATH=/data/go \
     CARGO_INSTALL_ROOT=/data/cargo \
     BUN_INSTALL=/data/bun \
-    PATH=/data/go/bin:/data/cargo/bin:/data/bun/bin:/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/data/npm-global/bin:/data/home/.local/bin:/data/go/bin:/data/cargo/bin:/data/bun/bin:/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 EXPOSE 8787
 
 # Healthcheck hits the unauthenticated /healthz endpoint. Honors $PORT (set by

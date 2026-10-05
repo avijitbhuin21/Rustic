@@ -96,13 +96,15 @@ fn pick_best(installs: &[Install]) -> Option<usize> {
 /// One per directory matters on Windows, where a single npm install lays down
 /// `foo`, `foo.cmd` and `foo.ps1` side by side — three files, one install.
 pub fn candidates(program: &str) -> Vec<PathBuf> {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
     let mut found: Vec<PathBuf> = Vec::new();
     let mut seen_dirs: Vec<PathBuf> = Vec::new();
 
-    for dir in std::env::split_paths(&path_var) {
+    // Known per-user install dirs come after PATH: a CLI installed while Rustic
+    // is running lands there, but this process's PATH predates the installer's
+    // profile edit, so without them it would stay "missing" until a restart.
+    let dirs = std::env::split_paths(&path_var).chain(fallback_install_dirs());
+    for dir in dirs {
         if dir.as_os_str().is_empty() || seen_dirs.contains(&dir) {
             continue;
         }
@@ -112,6 +114,30 @@ pub fn candidates(program: &str) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// Per-user directories the npm and Antigravity installers write to.
+fn fallback_install_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(prefix) = std::env::var_os("NPM_CONFIG_PREFIX").filter(|p| !p.is_empty()) {
+        let prefix = PathBuf::from(prefix);
+        dirs.push(if cfg!(windows) { prefix.clone() } else { prefix.join("bin") });
+    }
+    if cfg!(windows) {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("npm"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let base = PathBuf::from(local).join("Antigravity");
+            dirs.push(base.join("bin"));
+            dirs.push(base);
+        }
+    } else if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".npm-global").join("bin"));
+    }
+    dirs
 }
 
 #[cfg(windows)]

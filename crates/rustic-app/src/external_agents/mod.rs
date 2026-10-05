@@ -86,6 +86,41 @@ impl AgentKind {
             AgentKind::Antigravity => None,
         }
     }
+
+    /// Shell-agnostic command that installs this CLI on the host OS (npm for
+    /// the registry CLIs, Google's official installer script for `agy`).
+    pub fn install_command(self) -> String {
+        if let Some(package) = self.registry_package() {
+            return format!("npm install -g {package}");
+        }
+        if cfg!(windows) {
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://antigravity.google/cli/install.ps1 | iex\"".to_string()
+        } else {
+            "curl -fsSL https://antigravity.google/cli/install.sh | bash".to_string()
+        }
+    }
+}
+
+/// A supported CLI agent that isn't installed, with the command to install it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingAgent {
+    pub agent: String,
+    pub label: String,
+    pub install_command: String,
+}
+
+/// Every supported CLI agent not found on this machine.
+pub fn missing_agents() -> Vec<MissingAgent> {
+    AgentKind::ALL
+        .iter()
+        .filter(|kind| launcher::candidates(kind.program()).is_empty())
+        .map(|kind| MissingAgent {
+            agent: kind.as_str().to_string(),
+            label: kind.label().to_string(),
+            install_command: kind.install_command(),
+        })
+        .collect()
 }
 
 /// One installed CLI agent, as reported to the frontend.

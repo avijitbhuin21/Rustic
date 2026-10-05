@@ -333,6 +333,7 @@ pub fn run() {
             commands::terminal::read_terminal_scrollback,
             commands::terminal::detect_shells,
             commands::external_agents::detect_external_agents,
+            commands::external_agents::list_missing_external_agents,
             commands::external_agents::spawn_external_agent,
             commands::external_agents::resume_external_agent,
             commands::external_agents::list_external_agent_sessions,

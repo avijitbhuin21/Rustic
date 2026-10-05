@@ -19,9 +19,12 @@ export function agentLabel(agent) {
   return agent;
 }
 
-// Row of launch icons — one per CLI agent installed on this machine.
+// Row of launch icons — colored for each CLI agent installed on this machine,
+// greyed out (click to install) for the supported ones that aren't.
 export function ExternalAgentButtons({ project, className }) {
   const installed = useExternalAgents((s) => s.installed);
+  const missing = useExternalAgents((s) => s.missing);
+  const installing = useExternalAgents((s) => s.installing);
   const launching = useExternalAgents((s) => s.launching);
   const detect = useExternalAgents((s) => s.detect);
 
@@ -29,12 +32,28 @@ export function ExternalAgentButtons({ project, className }) {
     detect().catch(() => {});
   }, [detect]);
 
-  if (!installed.length) return null;
+  if (!installed.length && !missing.length) return null;
 
   const launch = async (e, agent) => {
     e.stopPropagation();
     try {
       await useExternalAgents.getState().spawn(agent.agent, project.id);
+    } catch (err) {
+      toast.error(String(err));
+    }
+  };
+
+  const install = async (e, agent) => {
+    e.stopPropagation();
+    if (installing) return;
+    const ok = await confirm({
+      title: `Install ${agent.label}?`,
+      description: `Rustic will run this in a new terminal:\n${agent.installCommand}`,
+      confirmLabel: 'Install',
+    });
+    if (!ok) return;
+    try {
+      await useExternalAgents.getState().install(agent, project.root_path);
     } catch (err) {
       toast.error(String(err));
     }
@@ -86,6 +105,34 @@ export function ExternalAgentButtons({ project, className }) {
                   newest.
                 </div>
               )}
+            </TooltipContent>
+          </Tooltip>
+        );
+      })}
+      {missing.map((agent) => {
+        const busy = installing === agent.agent;
+        return (
+          <Tooltip key={`missing-${agent.agent}`}>
+            <TooltipTrigger asChild>
+              <button
+                onClick={(e) => install(e, agent)}
+                disabled={!!installing}
+                className={cn(
+                  'relative flex size-5 items-center justify-center rounded opacity-40 grayscale transition-opacity hover:bg-foreground/10 hover:opacity-80 disabled:cursor-default',
+                  busy && 'opacity-80',
+                  className,
+                )}
+              >
+                {busy ? (
+                  <Loader2 className="size-3 animate-spin" />
+                ) : (
+                  <AgentLogo agent={agent.agent} className="size-3.5" />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="max-w-64 space-y-1">
+              <div>{busy ? `Installing ${agent.label}…` : `${agent.label} isn't installed — click to install`}</div>
+              <div className="font-mono text-[10px] text-muted-foreground break-all">{agent.installCommand}</div>
             </TooltipContent>
           </Tooltip>
         );

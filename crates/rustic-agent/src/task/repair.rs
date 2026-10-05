@@ -343,3 +343,143 @@ mod tests {
         ));
     }
 }
+
+/// Parses one `<parameter=…>` value, keeping numbers/bools/objects typed and
+/// everything else as a string.
+fn text_tool_param_value(raw: &str) -> serde_json::Value {
+    let v = raw.strip_prefix('\n').unwrap_or(raw);
+    let v = v.strip_suffix('\n').unwrap_or(v);
+    let t = v.trim();
+    if t.starts_with('{') || t.starts_with('[') || t == "true" || t == "false" || t == "null" {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(t) {
+            return parsed;
+        }
+    }
+    if !t.is_empty() && t.parse::<f64>().is_ok() && !t.starts_with('+') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(t) {
+            return parsed;
+        }
+    }
+    serde_json::Value::String(v.to_string())
+}
+
+/// Splits text containing Qwen/MiMo-style `<function=name><parameter=k>v</parameter></function>`
+/// calls into the leading prose and the parsed `(name, input)` calls.
+pub(crate) fn parse_text_tool_calls(text: &str) -> Option<(String, Vec<(String, serde_json::Value)>)> {
+    let first = text.find("<function=")?;
+    let mut prose = text[..first].to_string();
+    if let Some(stripped) = prose.trim_end().strip_suffix("<tool_call>") {
+        prose = stripped.to_string();
+    }
+    let mut calls = Vec::new();
+    for chunk in text[first..].split("<function=").skip(1) {
+        let chunk = chunk.split("</function>").next().unwrap_or(chunk);
+        let name_end = chunk.find('>').unwrap_or(chunk.len());
+        let name = chunk[..name_end].trim().to_string();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        {
+            continue;
+        }
+        let mut input = serde_json::Map::new();
+        let body = chunk.get(name_end + 1..).unwrap_or("");
+        for p in body.split("<parameter=").skip(1) {
+            let Some(key_end) = p.find('>') else { continue };
+            let key = p[..key_end].trim().to_string();
+            let rest = &p[key_end + 1..];
+            let mut end = rest.len();
+            for stop in ["</parameter>", "</tool_call>"] {
+                if let Some(i) = rest.find(stop) {
+                    end = end.min(i);
+                }
+            }
+            if !key.is_empty() {
+                input.insert(key, text_tool_param_value(&rest[..end]));
+            }
+        }
+        calls.push((name, serde_json::Value::Object(input)));
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    Some((prose.trim_end().to_string(), calls))
+}
+
+/// Converts tool calls a model wrote as plain text into real ToolUse blocks
+/// when the response carries no structured tool calls; returns true if any were recovered.
+pub(crate) fn recover_text_tool_calls(content: &mut Vec<ContentBlock>) -> bool {
+    if content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })) {
+        return false;
+    }
+    let mut recovered = false;
+    let mut out = Vec::with_capacity(content.len());
+    for block in content.drain(..) {
+        match block {
+            ContentBlock::Text { text } if !recovered => match parse_text_tool_calls(&text) {
+                Some((prose, calls)) => {
+                    recovered = true;
+                    if !prose.trim().is_empty() {
+                        out.push(ContentBlock::Text { text: prose });
+                    }
+                    for (name, input) in calls {
+                        out.push(ContentBlock::ToolUse {
+                            id: format!("call_txt_{}", uuid::Uuid::new_v4().simple()),
+                            name,
+                            input,
+                            thought_signature: None,
+                        });
+                    }
+                }
+                None => out.push(ContentBlock::Text { text }),
+            },
+            other => out.push(other),
+        }
+    }
+    *content = out;
+    recovered
+}
+
+#[cfg(test)]
+mod text_tool_call_tests {
+    use super::*;
+
+    #[test]
+    fn parses_mimo_style_calls_without_closing_tags() {
+        let t = "Checking what's installed now.<function=list_extensions><parameter=description>Verify installed skills";
+        let (prose, calls) = parse_text_tool_calls(t).unwrap();
+        assert_eq!(prose, "Checking what's installed now.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "list_extensions");
+        assert_eq!(calls[0].1["description"], "Verify installed skills");
+    }
+
+    #[test]
+    fn parses_multiple_closed_calls_with_typed_values() {
+        let t = "<tool_call>\n<function=install_extension>\n<parameter=url>\nhttps://x/SKILL.md\n</parameter>\n<parameter=overwrite>true</parameter>\n</function>\n</tool_call><function=read_file><parameter=path>a.rs</parameter><parameter=limit>20</parameter></function>";
+        let (prose, calls) = parse_text_tool_calls(t).unwrap();
+        assert!(prose.is_empty());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1["url"], "https://x/SKILL.md");
+        assert_eq!(calls[0].1["overwrite"], true);
+        assert_eq!(calls[1].1["limit"], 20);
+    }
+
+    #[test]
+    fn recover_skips_when_structured_calls_exist() {
+        let mut c = vec![
+            ContentBlock::Text { text: "<function=a><parameter=b>c".into() },
+            ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            },
+        ];
+        assert!(!recover_text_tool_calls(&mut c));
+        let mut c = vec![ContentBlock::Text { text: "hi <function=a><parameter=b>c".into() }];
+        assert!(recover_text_tool_calls(&mut c));
+        assert_eq!(c.len(), 2);
+    }
+}

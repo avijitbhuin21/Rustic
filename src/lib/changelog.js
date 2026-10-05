@@ -2,6 +2,47 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.7.5',
+    date: 'October 2026',
+    entries: [
+      { tag: 'fixed', text: 'Chats no longer stall when a model (e.g. Xiaomi MiMo, Qwen3-Coder) writes its tool calls as plain text — Rustic now recognises and runs them instead of silently ending the turn.' },
+      { tag: 'improved', text: 'Sync — pushing or pulling a project is only blocked by agents running in that project, not by agents working anywhere else.' },
+      { tag: 'new', text: 'CLI agents — Claude Code, Codex and Antigravity show as greyed-out icons when not installed; click one to install it in a terminal, and it lights up once ready.' },
+      { tag: 'improved', text: 'Rustic Server keeps everything you install (npm globals, CLI agents, pipx/uv tools) and their logins on the persistent volume, so they survive redeploys.' },
+      { tag: 'improved', text: 'MCP — remote servers configured with `serverUrl` / `httpUrl` (Google Stitch, Gemini CLI style) are accepted, and auth failures show the real error instead of a misleading 405.' },
+      { tag: 'improved', text: 'Desktop window can be dragged, snapped and maximised (double-click) from any empty spot in the top bar.' },
+      { tag: 'fixed', text: 'Rules editor scrolls long rules instead of pushing the Save button off-screen.' },
+      { tag: 'fixed', text: "What's New now shows the current release's notes." },
+    ],
+  },
+  {
+    version: '0.7.0',
+    date: 'October 2026',
+    entries: [
+      { tag: 'new', text: 'Cloud & Sync rework — a "My machine" view plus Sync / Backends tabs, per-machine Push, Pull and Sharing with approval prompts and share allowlists, and Cloudflare tunnel / port forwarding for reaching machines outside your network.' },
+      { tag: 'new', text: 'Rustic Server is now a full sync peer, so a cloud deployment can push and pull with your desktop like any other machine.' },
+      { tag: 'new', text: 'Multiple remote backends — each opens in its own window with its own keychain entry, and files can be dragged and dropped between backend windows.' },
+      { tag: 'improved', text: 'MCP — paste standard `mcpServers` JSON anywhere (Settings or via the agent). Add / Configure dialogs are now two-column with a Test button to check the connection before saving.' },
+      { tag: 'new', text: 'Chat image viewer — step through images in a conversation with previous / next.' },
+      { tag: 'improved', text: 'Settings lists use a cleaner connected-row layout throughout.' },
+      { tag: 'fixed', text: 'LAN sync works offline again (fixed port 47820 with peer discovery probing).' },
+      { tag: 'fixed', text: 'Opening a remote backend window no longer freezes the app on Windows.' },
+    ],
+  },
+  {
+    version: '0.6.0',
+    date: 'October 2026',
+    entries: [
+      { tag: 'new', text: 'Per-project MCP servers — enable or disable servers per project; Rustic keeps `.mcp.json`, Gemini CLI and Codex configs in sync so external agents see the same servers.' },
+      { tag: 'new', text: 'Cloud settings — remote and LAN sync between machines, with metadata (tasks, settings) merged rather than overwritten.' },
+      { tag: 'improved', text: 'Sync transfers are streamed in parallel, resumable chunks, so large projects sync faster and survive dropped connections.' },
+      { tag: 'new', text: 'Agent extension tools — the agent can list, install and uninstall skills, workflows and MCP servers itself (with your approval where needed).' },
+      { tag: 'improved', text: 'Live file refresh — files changed on disk outside Rustic update in the explorer and editor automatically.' },
+      { tag: 'fixed', text: 'Chat reliability — fixes for ask-user prompts, stream interruptions and stalled responses.' },
+      { tag: 'new', text: 'Releases now ship for Windows, macOS (Apple Silicon and Intel) and Linux.' },
+    ],
+  },
+  {
     version: '0.5.2',
     date: 'September 2026',
     entries: [

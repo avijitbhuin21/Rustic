@@ -53,6 +53,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
     std::fs::create_dir_all(&config.data_dir).ok();
+    ensure_persistent_install_dirs();
     // Image payloads live as content-addressed files beside the DB instead of
     // inline base64 in `messages.content_json`. Must be initialized before any
     // task loads or persists history.
@@ -262,6 +263,26 @@ struct HubEmitter(EventHub);
 impl rustic_app::EventEmitter for HubEmitter {
     fn emit_json(&self, event: &str, payload: serde_json::Value) {
         self.0.publish(event, payload);
+    }
+}
+
+/// Creates the install roots the image points at the data volume (HOME, the npm
+/// global prefix, GOPATH…). The volume is mounted over `/data` at runtime, so
+/// anything the image created there is hidden and must be recreated on boot.
+fn ensure_persistent_install_dirs() {
+    for var in ["HOME", "NPM_CONFIG_PREFIX", "GOPATH", "CARGO_INSTALL_ROOT", "BUN_INSTALL"] {
+        let Some(dir) = std::env::var_os(var).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let made = if var == "HOME" {
+            std::fs::create_dir_all(dir.join(".local").join("bin"))
+        } else {
+            std::fs::create_dir_all(dir.join("bin"))
+        };
+        if let Err(e) = made {
+            tracing::warn!(var, dir = %dir.display(), error = %e, "could not create persistent install dir");
+        }
     }
 }
 

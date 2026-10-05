@@ -2003,7 +2003,7 @@ impl TaskExecutor {
             };
             // Note: the original single-attempt match below is preserved so
             // user-cancel + final-error paths behave identically to before.
-            let response = match response {
+            let mut response = match response {
                 Ok(resp) => resp,
                 Err(e) if e.to_string().contains("Task cancelled") => {
                     // The user aborted mid-stream (typically via "Stop & send"
@@ -2132,6 +2132,17 @@ impl TaskExecutor {
                 }
                 Err(e) => return Err(e),
             };
+
+            // Some open models (MiMo, Qwen3-Coder via OpenRouter, …) intermittently
+            // write `<function=…><parameter=…>` calls into the text instead of
+            // structured tool_calls; without this the turn silently ends.
+            if super::repair::recover_text_tool_calls(&mut response.content) {
+                tracing::warn!(
+                    "[executor] '{}' recovered text-format tool calls from model output",
+                    task_id
+                );
+                response.stop_reason = StopReason::ToolUse;
+            }
 
             // Accumulate cost and emit update. `actual_cost_usd` (OpenRouter's
             // reported figure) is preferred over the token estimate when present.
