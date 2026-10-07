@@ -23,6 +23,7 @@ import { KeybindingBridge } from '@/components/keybinding-bridge';
 import { FontBridge } from '@/components/shell/font-bridge';
 import { WindowControls } from '@/components/shell/window-controls';
 import { ActivityBar } from '@/components/shell/activity-bar';
+import { useSyncSidebarWidth } from '@/components/sync/use-sync-sidebar-width';
 import { RightDock } from '@/components/shell/right-dock';
 import { SidebarHost } from '@/components/shell/sidebar-host';
 import { EditorAreaHost } from '@/components/shell/editor-area-host';
@@ -46,6 +47,7 @@ import { initExternalAgents } from '@/state/external-agents';
 import { useBreakpoint } from '@/lib/use-breakpoint';
 import { IS_WEB } from '@/lib/platform';
 import { LanPairPrompt } from '@/components/settings/lan-pair-prompt';
+import { ThemeAgentPrompt } from '@/components/settings/themes-section';
 import { MobileShell } from '@/components/shell/mobile-shell';
 import { TabletShell } from '@/components/shell/tablet-shell';
 import { FolderPickerHost } from '@/components/web/folder-picker-host';
@@ -188,6 +190,7 @@ function MainArea({ chatDockOpen, bottomPanelVisible, hasMiddleContent }) {
 
 export default function App() {
   const sidebarVisible = useLayout((s) => s.sidebarVisible);
+  const { panelRef: sidebarPanelRef, wide: syncSidebarWide } = useSyncSidebarWidth();
   const bottomPanelVisible = useLayout((s) => s.bottomPanelVisible);
   const chatDockOpen = useLayout((s) => s.chatDockOpen);
   const hasMiddleContent = useHasMiddleContent();
@@ -319,7 +322,8 @@ export default function App() {
       {!IS_WEB && <WindowControls />}
       {IS_WEB && <FolderPickerHost />}
       {IS_WEB && <BrowserWindow />}
-      <LanPairPrompt />
+        <LanPairPrompt />
+        <ThemeAgentPrompt />
       <Toaster />
       <ConfirmDialogHost />
       <SaveConflictDialogHost />
@@ -348,7 +352,7 @@ export default function App() {
           <ResizablePanelGroup direction="horizontal" className="flex-1">
             {sidebarVisible && (
               <>
-                <ResizablePanel id="sidebar" defaultSize="20%" minSize="12%" maxSize="40%">
+                <ResizablePanel id="sidebar" panelRef={sidebarPanelRef} defaultSize="20%" minSize="12%" maxSize={syncSidebarWide ? '88%' : '40%'}>
                   <SidebarHost />
                 </ResizablePanel>
                 <ResizableHandle />

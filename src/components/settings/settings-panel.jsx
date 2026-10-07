@@ -2,7 +2,7 @@ import React, { useMemo, useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   X, Settings2, Code2, Paintbrush, Keyboard, Sparkles, Search,
-  Wrench, Library, Gauge, ChevronRight, Cloud,
+  Wrench, Library, Gauge, ChevronRight,
 } from 'lucide-react';
 import { GithubIcon } from '@/components/github/icon';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -13,7 +13,6 @@ import { useSettings } from '@/state/settings';
 import { useLayout } from '@/state/layout';
 import { IS_WEB } from '@/lib/platform';
 import { GeneralSettings } from './general-settings';
-import { CloudSettings } from './cloud-settings';
 import { EditorSettings } from './editor-settings';
 import { AppearanceSettings } from './appearance-settings';
 import {
@@ -30,7 +29,6 @@ const NAV_GROUPS = [
       { id: 'editor',     label: 'Editor',     icon: Code2      },
       { id: 'appearance', label: 'Appearance', icon: Paintbrush },
       { id: 'shortcuts',  label: 'Shortcuts',  icon: Keyboard   },
-      { id: 'cloud', label: 'Cloud & Sync', icon: Cloud },
     ],
   },
   {
@@ -63,8 +61,6 @@ const SEARCH_INDEX = [
   { tab: 'appearance', section: 'Fonts', anchor: 'fonts', keywords: ['Font family', 'Google Fonts', 'Load font', 'Apply font'] },
   { tab: 'appearance', section: 'Color Palette', anchor: 'color-palette', keywords: ['Theme', 'Import theme', 'Dark', 'Light', 'Colors'] },
   { tab: 'shortcuts', section: 'Keyboard Shortcuts', anchor: null, keywords: ['Keybinding', 'Remap', 'Hotkey', 'Import keybindings', 'Reset keybindings'] },
-  { tab: 'cloud', section: 'My machine', anchor: 'my-machine', keywords: ['My machine', 'Machine name', 'IP address', 'Port', 'Local network sync', 'Cloudflare tunnel', 'Internet sync'] },
-  { tab: 'cloud', section: 'Machines', anchor: 'machines', keywords: ['Sync', 'Push', 'Pull', 'Metadata', 'Backends', 'Remote backend', 'Add machine', 'Sharing', 'Pair'] },
   { tab: 'agent-providers', section: 'AI Providers', anchor: 'ai-providers', keywords: ['Anthropic', 'Claude', 'OpenAI', 'Gemini', 'OpenRouter', 'FreeBuff', 'API key', 'Model', 'OpenAI-compatible', 'Base URL', 'Connect'] },
   { tab: 'agent-tools', section: 'Tools', anchor: 'tools', keywords: ['Web Search', 'Web Fetch', 'Tavily', 'Image creator', 'Video creator', 'Animator', 'Media', 'image_create', 'video_create', 'animate'] },
   { tab: 'agent-tools', section: 'MCP Servers', anchor: 'mcp-servers', keywords: ['MCP', 'Server', 'mcp.json', 'Transport'] },
@@ -149,7 +145,6 @@ function tabContent(id) {
     case 'editor':          return <EditorSettings />;
     case 'appearance':      return <AppearanceSettings />;
     case 'shortcuts':       return <ShortcutsSettings />;
-    case 'cloud':           return <CloudSettings />;
     case 'agent-providers': return <AgentProvidersTab />;
     case 'agent-tools':     return <AgentToolsTab />;
     case 'agent-library':   return <AgentLibraryTab />;

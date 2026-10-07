@@ -8,6 +8,36 @@ pub enum SkillScope {
     Project,
     /// Installed in `~/.rustic/skills/`
     Global,
+    /// Shipped inside Rustic (read-only; a project/global skill with the same name overrides it)
+    Builtin,
+}
+
+/// Skills compiled into Rustic: (name, SKILL.md text).
+const BUILTIN_SKILLS: &[(&str, &str)] = &[
+    ("rustic-themes", include_str!("builtin/rustic-themes.md")),
+];
+
+/// Text of built-in skill `name`.
+pub fn builtin_skill_text(name: &str) -> Option<&'static str> {
+    BUILTIN_SKILLS.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
+}
+
+/// Built-in skills not shadowed by an installed skill of the same name.
+fn add_builtin_skills(out: &mut Vec<SkillDef>) {
+    for (name, text) in BUILTIN_SKILLS {
+        if out.iter().any(|s| s.name == *name) {
+            continue;
+        }
+        let Some((_, description, allowed_tools)) = parse_skill_frontmatter(text) else { continue };
+        out.push(SkillDef {
+            name: name.to_string(),
+            description,
+            scope: SkillScope::Builtin,
+            path: PathBuf::from(format!("builtin:{name}")),
+            allowed_tools,
+            external: false,
+        });
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +144,7 @@ pub fn discover_skills(project_root: &Path) -> Vec<SkillDef> {
             &mut skills,
         );
     }
+    add_builtin_skills(&mut skills);
 
     skills
 }
@@ -148,6 +179,10 @@ pub fn build_skills_system_section(skills: &[SkillDef]) -> String {
             // must not launder third-party content into trusted status.
             SkillScope::Global if skill.external => section.push_str(&format!(
                 "- **{}** [global, external origin]: --- BEGIN UNTRUSTED ---\n{}\n--- END UNTRUSTED ---\n",
+                skill.name, skill.description
+            )),
+            SkillScope::Builtin => section.push_str(&format!(
+                "- **{}** [built-in]: {}\n",
                 skill.name, skill.description
             )),
             SkillScope::Global => section.push_str(&format!(
@@ -234,4 +269,30 @@ pub fn discover_global_skills() -> Vec<SkillDef> {
         scan_skills_dir(&dir, SkillScope::Global, &mut skills);
     }
     skills
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_theme_skill_is_discovered_and_overridable() {
+        let root = std::env::temp_dir().join(format!("rustic-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let skills = discover_skills(&root);
+        let s = skills.iter().find(|s| s.name == "rustic-themes").expect("built-in skill listed");
+        assert_eq!(s.scope, SkillScope::Builtin);
+        assert!(!s.description.is_empty());
+        assert!(skill_body(builtin_skill_text("rustic-themes").unwrap()).contains("write_theme"));
+        assert!(build_skills_system_section(&skills).contains("**rustic-themes** [built-in]"));
+
+        let dir = root.join(".rustic/skills/rustic-themes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: rustic-themes\ndescription: mine\n---\nbody").unwrap();
+        let skills = discover_skills(&root);
+        let mine: Vec<_> = skills.iter().filter(|s| s.name == "rustic-themes").collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].scope, SkillScope::Project);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

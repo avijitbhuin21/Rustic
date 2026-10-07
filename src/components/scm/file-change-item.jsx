@@ -5,12 +5,12 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { cn } from '@/lib/utils';
 
 const STATUS_META = {
-  M: { label: 'Modified', className: 'text-yellow-500' },
-  A: { label: 'Added', className: 'text-emerald-500' },
-  D: { label: 'Deleted', className: 'text-red-500' },
-  R: { label: 'Renamed', className: 'text-blue-500' },
-  U: { label: 'Conflict', className: 'text-orange-500' },
-  '?': { label: 'Untracked', className: 'text-emerald-400' },
+  M: { label: 'Modified', className: 'text-warning' },
+  A: { label: 'Added', className: 'text-success' },
+  D: { label: 'Deleted', className: 'text-danger' },
+  R: { label: 'Renamed', className: 'text-info' },
+  U: { label: 'Conflict', className: 'text-highlight' },
+  '?': { label: 'Untracked', className: 'text-success' },
 };
 
 function basename(path) {

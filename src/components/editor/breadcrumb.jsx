@@ -121,7 +121,7 @@ function FileSegment({ name, fullPath }) {
       className="flex min-w-0 items-center gap-1 rounded-sm px-0.5 text-[11px] text-foreground/85 transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
     >
       <span className="truncate">{name}</span>
-      {copied && <Check className="size-3 shrink-0 text-emerald-500" />}
+      {copied && <Check className="size-3 shrink-0 text-success" />}
     </button>
   );
 }

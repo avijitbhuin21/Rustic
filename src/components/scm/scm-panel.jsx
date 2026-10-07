@@ -20,6 +20,12 @@ import {
   Globe,
   Undo2,
   LogOut,
+  CloudDownload,
+  ArrowDownUp,
+  RotateCcw,
+  CirclePlus,
+  CircleMinus,
+  UserRoundCog,
 } from 'lucide-react';
 import { GithubIcon } from '@/components/github/icon';
 import { Button } from '@/components/ui/button';
@@ -28,10 +34,15 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuShortcut,
   DropdownMenuTrigger,
   DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
+import { remoteWebInfo } from '@/lib/git-remote';
+import { openExternalHref } from '@/lib/markdown-assets';
 import {
   Dialog,
   DialogContent,
@@ -99,28 +110,31 @@ function GithubHeaderButton() {
           {`Signed in as ${label}`}
         </TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" className="min-w-[180px]">
-        <DropdownMenuItem
-          onClick={() =>
-            user?.login
-              ? openUrl(`https://github.com/${user.login}`).catch(() => {})
-              : openDialog()
-          }
-          className="whitespace-nowrap"
-        >
+      <DropdownMenuContent align="end" className="min-w-[200px]">
+        <DropdownMenuLabel className="flex items-center gap-1.5 text-[11px] font-normal text-muted-foreground">
           <GithubIcon className="size-3" />
-          {label}
-          {user?.login && <ExternalLink className="ml-auto size-3 text-muted-foreground" />}
-        </DropdownMenuItem>
+          {user?.login ? <>Signed in as <span className="font-medium text-foreground">{user.login}</span></> : 'GitHub'}
+        </DropdownMenuLabel>
         <DropdownMenuSeparator />
+        {user?.login && (
+          <DropdownMenuItem
+            onClick={() => openUrl(`https://github.com/${user.login}`).catch(() => {})}
+            className="whitespace-nowrap"
+          >
+            <ExternalLink className="size-3.5" />
+            Open profile on GitHub
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem onClick={openDialog} className="whitespace-nowrap">
+          <UserRoundCog className="size-3.5" />
           Switch account…
         </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem
           onClick={signOut}
-          className="whitespace-nowrap text-destructive focus:text-destructive"
+          className="whitespace-nowrap text-destructive focus:text-destructive [&_svg]:text-destructive"
         >
-          <LogOut className="size-3" />
+          <LogOut className="size-3.5" />
           Sign out
         </DropdownMenuItem>
       </DropdownMenuContent>
@@ -317,6 +331,7 @@ function ProjectScmSection({ project }) {
   const log = gitProject?.log ?? [];
   const isGitRepo = gitProject?.isGitRepo ?? null;
   const remoteUrl = gitProject?.remoteUrl ?? null;
+  const remoteWeb = remoteUrl ? remoteWebInfo(remoteUrl, gitProject?.currentBranch ?? null) : null;
 
   const [publishDialogOpen, setPublishDialogOpen] = useState(false);
   const [syncing, setSyncing] = useState(null);
@@ -508,70 +523,101 @@ function ProjectScmSection({ project }) {
                   <MoreHorizontal />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="min-w-[170px]">
-                <DropdownMenuItem
-                  className="whitespace-nowrap"
-                  onClick={() => withToast(() => push(projectId), 'Pushed', 'Push failed')}
-                >
-                  <ArrowUp className="size-3" />
-                  Push{aheadBehind.ahead > 0 ? ` (${aheadBehind.ahead})` : ''}
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="whitespace-nowrap"
-                  onClick={() => withToast(() => pull(projectId), 'Pulled', 'Pull failed')}
-                >
-                  <ArrowDown className="size-3" />
-                  Pull{aheadBehind.behind > 0 ? ` (${aheadBehind.behind})` : ''}
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="whitespace-nowrap"
-                  onClick={() => withToast(() => fetch(projectId), 'Fetched', 'Fetch failed')}
-                >
-                  Fetch
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="whitespace-nowrap"
-                  onClick={() => withToast(() => sync(projectId), 'Synced', 'Sync failed')}
-                >
-                  Sync (Pull + Push)
-                </DropdownMenuItem>
+              <DropdownMenuContent align="end" className="min-w-[220px]">
+                <DropdownMenuLabel className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground/70">Remote</DropdownMenuLabel>
+                <DropdownMenuGroup>
+                  <DropdownMenuItem
+                    className="whitespace-nowrap"
+                    onClick={() => withToast(() => pull(projectId), 'Pulled', 'Pull failed')}
+                    disabled={!remoteUrl}
+                  >
+                    <ArrowDown className="size-3.5" />
+                    Pull
+                    {aheadBehind.behind > 0 && <DropdownMenuShortcut>{aheadBehind.behind}</DropdownMenuShortcut>}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="whitespace-nowrap"
+                    onClick={() => withToast(() => push(projectId), 'Pushed', 'Push failed')}
+                    disabled={!remoteUrl}
+                  >
+                    <ArrowUp className="size-3.5" />
+                    Push
+                    {aheadBehind.ahead > 0 && <DropdownMenuShortcut>{aheadBehind.ahead}</DropdownMenuShortcut>}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="whitespace-nowrap"
+                    onClick={() => withToast(() => sync(projectId), 'Synced', 'Sync failed')}
+                    disabled={!remoteUrl}
+                  >
+                    <ArrowDownUp className="size-3.5" />
+                    Sync
+                    <DropdownMenuShortcut>pull + push</DropdownMenuShortcut>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="whitespace-nowrap"
+                    onClick={() => withToast(() => fetch(projectId), 'Fetched', 'Fetch failed')}
+                    disabled={!remoteUrl}
+                  >
+                    <CloudDownload className="size-3.5" />
+                    Fetch
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="whitespace-nowrap"
+                    disabled={!remoteWeb}
+                    title={remoteWeb?.url || (remoteUrl ? 'This remote has no web page' : 'No remote configured')}
+                    onClick={() => remoteWeb && openExternalHref(remoteWeb.url)}
+                  >
+                    <ExternalLink className="size-3.5" />
+                    {remoteWeb ? `Open on ${remoteWeb.provider}` : 'Visit remote'}
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+
                 <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  className="whitespace-nowrap"
-                  onClick={() => withToast(() => stageAll(projectId), 'Staged all changes', 'Stage failed')}
-                  disabled={changesTotal === 0}
-                >
-                  Stage all changes
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="whitespace-nowrap"
-                  onClick={() => withToast(() => unstageAll(projectId), 'Unstaged all', 'Unstage failed')}
-                  disabled={stagedTotal === 0}
-                >
-                  Unstage all
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="whitespace-nowrap text-destructive focus:text-destructive"
-                  onClick={handleDiscardAll}
-                  disabled={changesTotal === 0}
-                >
-                  <Undo2 className="size-3" />
-                  Discard all changes
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  className="whitespace-nowrap"
-                  onClick={() =>
-                    withToast(() => undoLastCommit(projectId), 'Undid last commit', 'Undo failed')
-                  }
-                >
-                  Undo last commit
-                </DropdownMenuItem>
+                <DropdownMenuLabel className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground/70">Changes</DropdownMenuLabel>
+                <DropdownMenuGroup>
+                  <DropdownMenuItem
+                    className="whitespace-nowrap"
+                    onClick={() => withToast(() => stageAll(projectId), 'Staged all changes', 'Stage failed')}
+                    disabled={changesTotal === 0}
+                  >
+                    <CirclePlus className="size-3.5" />
+                    Stage all
+                    {changesTotal > 0 && <DropdownMenuShortcut>{changesTotal}</DropdownMenuShortcut>}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="whitespace-nowrap"
+                    onClick={() => withToast(() => unstageAll(projectId), 'Unstaged all', 'Unstage failed')}
+                    disabled={stagedTotal === 0}
+                  >
+                    <CircleMinus className="size-3.5" />
+                    Unstage all
+                    {stagedTotal > 0 && <DropdownMenuShortcut>{stagedTotal}</DropdownMenuShortcut>}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="whitespace-nowrap"
+                    onClick={() =>
+                      withToast(() => undoLastCommit(projectId), 'Undid last commit', 'Undo failed')
+                    }
+                  >
+                    <RotateCcw className="size-3.5" />
+                    Undo last commit
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="whitespace-nowrap text-destructive focus:text-destructive [&_svg]:text-destructive"
+                    onClick={handleDiscardAll}
+                    disabled={changesTotal === 0}
+                  >
+                    <Undo2 className="size-3.5" />
+                    Discard all changes…
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   className="whitespace-nowrap"
                   onClick={() => refreshAll(projectId)} disabled={loading}
                 >
+                  <RefreshCw className={`size-3.5 ${loading ? 'animate-spin' : ''}`} />
                   Refresh
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -651,7 +697,7 @@ function ProjectScmSection({ project }) {
 
               {!loading && stagedTotal === 0 && changesTotal === 0 && (
                 <div className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] text-muted-foreground">
-                  <Check className="size-3 text-emerald-500" />
+                  <Check className="size-3 text-success" />
                   No changes
                 </div>
               )}

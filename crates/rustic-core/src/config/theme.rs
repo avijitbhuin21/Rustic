@@ -179,6 +179,117 @@ impl Theme {
         }
     }
 
+    /// Build a theme from its 31 color slots in field order:
+    /// bg_hard bg bg_soft bg1 bg2 bg3 bg4 · fg fg1 fg2 fg3 fg4 · accent primary
+    /// border · red green yellow blue purple aqua orange · keyword string
+    /// comment function type variable number operator punctuation.
+    fn palette(name: &str, kind: &str, c: [&str; 31]) -> Self {
+        let s = |i: usize| c[i].to_string();
+        Self {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            bg_hard: s(0), bg: s(1), bg_soft: s(2), bg1: s(3), bg2: s(4), bg3: s(5), bg4: s(6),
+            fg: s(7), fg1: s(8), fg2: s(9), fg3: s(10), fg4: s(11),
+            accent: s(12), primary: Some(s(13)), border: s(14),
+            bright_red: s(15), bright_green: s(16), bright_yellow: s(17), bright_blue: s(18),
+            bright_purple: s(19), bright_aqua: s(20), bright_orange: s(21),
+            token_keyword: s(22), token_string: s(23), token_comment: s(24), token_function: s(25),
+            token_type: s(26), token_variable: s(27), token_number: s(28), token_operator: s(29),
+            token_punctuation: s(30),
+        }
+    }
+
+    // Palette families (light + dark), contrast-checked: text ≥ 14:1, muted
+    // text ≥ 5.5:1, button text on primary ≥ 4.5:1, status + syntax ≥ 4.5:1.
+
+    /// Graphite — cool neutral grey, cobalt accent.
+    pub fn graphite() -> Self {
+        Self::palette("Graphite", "dark", [
+            "#0b0d10", "#111317", "#15181d", "#1a1d23", "#23272e", "#2e333b", "#3b414a",
+            "#e6e8eb", "#e6e8eb", "#c9cdd3", "#959ba5", "#6c727c",
+            "#6b9bff", "#6b9bff", "#252a31",
+            "#f2777a", "#7fcf9a", "#e8c46a", "#6b9bff", "#b49cf0", "#6cc9d4", "#ee9a62",
+            "#8fb2ff", "#93d3a8", "#6f7680", "#e8c46a", "#6cc9d4", "#e6e8eb", "#ee9a62", "#a9b0ba", "#8a919b",
+        ])
+    }
+
+    /// Graphite Light — the same family on near-white.
+    pub fn graphite_light() -> Self {
+        Self::palette("Graphite Light", "light", [
+            "#e7e9ec", "#f6f7f9", "#f0f2f5", "#ffffff", "#eceef2", "#dfe2e7", "#cbd0d7",
+            "#16191d", "#16191d", "#2c3138", "#5b626c", "#8a919b",
+            "#2f5fd0", "#2f5fd0", "#dde1e6",
+            "#c4373a", "#1f7a45", "#9a6b00", "#2f5fd0", "#6b4fc4", "#0f7c86", "#b45a1c",
+            "#2f5fd0", "#1f7a45", "#6b727c", "#8a5a00", "#0f7c86", "#16191d", "#b45a1c", "#4a515b", "#5b626c",
+        ])
+    }
+
+    /// Ink — warm near-black with a brass accent (night editorial).
+    pub fn ink() -> Self {
+        Self::palette("Ink", "dark", [
+            "#0f0d0b", "#151310", "#1a1714", "#201c18", "#2a2520", "#36302a", "#463e36",
+            "#ece4d8", "#ece4d8", "#d6ccbd", "#a39886", "#786e60",
+            "#d9b26f", "#d9b26f", "#2c2721",
+            "#e07a68", "#a8c48a", "#d9b26f", "#8fb0c9", "#c1a0c8", "#8cc2b4", "#df9b62",
+            "#df9b62", "#a8c48a", "#7d7366", "#d9b26f", "#8fb0c9", "#ece4d8", "#c1a0c8", "#b8ab97", "#a39886",
+        ])
+    }
+
+    /// Paper — warm parchment with an ink-blue accent.
+    pub fn paper() -> Self {
+        Self::palette("Paper", "light", [
+            "#ebe5d9", "#f7f3ea", "#f1ecdf", "#fdfbf6", "#ece6d8", "#e0d8c6", "#cbbfa8",
+            "#221d17", "#221d17", "#3a3229", "#6b6052", "#968a79",
+            "#2d4f7c", "#2d4f7c", "#e2dacb",
+            "#b23a2c", "#4a6b2a", "#8a6510", "#2d4f7c", "#6d4a7e", "#2c6e66", "#a5521f",
+            "#a5521f", "#4a6b2a", "#7d7264", "#2d4f7c", "#2c6e66", "#221d17", "#6d4a7e", "#5a5044", "#6b6052",
+        ])
+    }
+
+    /// Fjord Night — cool slate with a glacier-teal accent.
+    pub fn fjord_night() -> Self {
+        Self::palette("Fjord Night", "dark", [
+            "#0a0f14", "#0f151c", "#131a22", "#172029", "#1f2a35", "#2a3744", "#384756",
+            "#e2e9ef", "#e2e9ef", "#c3cdd6", "#8d9aa8", "#66727f",
+            "#5cc6c1", "#5cc6c1", "#213040",
+            "#ef7d7d", "#7fd1a4", "#e6c770", "#78aee8", "#a99be8", "#5cc6c1", "#ec9f6d",
+            "#78aee8", "#7fd1a4", "#66737f", "#5cc6c1", "#e6c770", "#e2e9ef", "#ec9f6d", "#a3b1be", "#8d9aa8",
+        ])
+    }
+
+    /// Fjord Day — the same family in daylight.
+    pub fn fjord_day() -> Self {
+        Self::palette("Fjord Day", "light", [
+            "#e3e9ee", "#f3f6f8", "#ecf1f4", "#ffffff", "#e6edf2", "#d6e0e7", "#bfccd6",
+            "#121a22", "#121a22", "#26323d", "#52606d", "#84919d",
+            "#0e7c78", "#0e7c78", "#d8e1e8",
+            "#c03b3b", "#1d7a4e", "#8f6a00", "#1f63b5", "#5a4bb8", "#0e7c78", "#b35a1e",
+            "#1f63b5", "#1d7a4e", "#6a7783", "#0e7c78", "#8f6a00", "#121a22", "#b35a1e", "#3d4a56", "#52606d",
+        ])
+    }
+
+    /// Kiln — stone neutrals with a terracotta accent.
+    pub fn kiln() -> Self {
+        Self::palette("Kiln", "dark", [
+            "#0e0c0b", "#141210", "#191614", "#1f1b18", "#292420", "#352f2a", "#453d37",
+            "#ebe6e1", "#ebe6e1", "#d2cbc4", "#9f968d", "#756c64",
+            "#e0835a", "#e0835a", "#2b2622",
+            "#e86f62", "#9fc48e", "#e3b964", "#86aed0", "#c09fd1", "#7fc1b5", "#e0835a",
+            "#e0835a", "#9fc48e", "#7a7068", "#e3b964", "#86aed0", "#ebe6e1", "#c09fd1", "#bfb3a8", "#9f968d",
+        ])
+    }
+
+    /// Kiln Light — warm stone daylight, fired-clay accent.
+    pub fn kiln_light() -> Self {
+        Self::palette("Kiln Light", "light", [
+            "#ebe6e1", "#f8f5f2", "#f2eee9", "#fffdfb", "#eee8e2", "#e1d9d1", "#cbc0b5",
+            "#1f1a16", "#1f1a16", "#352e28", "#665b51", "#93887e",
+            "#b0532c", "#b0532c", "#e3dbd3",
+            "#b8352a", "#3f6e33", "#8a6408", "#2f5f8f", "#6a4a8c", "#24706a", "#b0532c",
+            "#b0532c", "#3f6e33", "#7c7168", "#8a6408", "#2f5f8f", "#1f1a16", "#6a4a8c", "#574c43", "#665b51",
+        ])
+    }
+
     /// Parse a theme from TOML content.
     pub fn from_toml(content: &str) -> Result<Self, String> {
         toml::from_str(content).map_err(|e| format!("Invalid TOML theme: {}", e))
@@ -195,13 +306,25 @@ impl Theme {
             "Obsidian" => Some(Self::obsidian()),
             "Luxide Dark" => Some(Self::luxide_dark()),
             "Verdigris" => Some(Self::verdigris()),
+            "Graphite" => Some(Self::graphite()),
+            "Graphite Light" => Some(Self::graphite_light()),
+            "Ink" => Some(Self::ink()),
+            "Paper" => Some(Self::paper()),
+            "Fjord Night" => Some(Self::fjord_night()),
+            "Fjord Day" => Some(Self::fjord_day()),
+            "Kiln" => Some(Self::kiln()),
+            "Kiln Light" => Some(Self::kiln_light()),
             _ => None,
         }
     }
 
     /// List built-in theme names. Order matters — first entry is the visual
-    /// default shown at the top of the palette grid.
+    /// default shown at the top of the palette grid; families sit light-after-dark.
     pub fn builtin_names() -> Vec<&'static str> {
-        vec!["Obsidian", "Luxide Dark", "Verdigris"]
+        vec![
+            "Obsidian", "Luxide Dark", "Verdigris",
+            "Graphite", "Graphite Light", "Ink", "Paper",
+            "Fjord Night", "Fjord Day", "Kiln", "Kiln Light",
+        ]
     }
 }

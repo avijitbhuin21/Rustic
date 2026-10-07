@@ -42,11 +42,29 @@ struct ReporterInner {
     emitter: Arc<dyn EventEmitter>,
     direction: String,
     last_tick: std::sync::Mutex<std::time::Instant>,
+    transfer: Option<Arc<crate::transfers::Handle>>,
 }
 
 impl SyncReporter {
     /// Reporter that emits `rustic:sync-progress` for `direction` ("push"/"pull").
     pub fn new(direction: &str, emitter: Arc<dyn EventEmitter>) -> Self {
+        Self::build(direction, emitter, None)
+    }
+
+    /// Same as [`Self::new`], also feeding the transfers tray entry `transfer`.
+    pub fn with_transfer(
+        direction: &str,
+        emitter: Arc<dyn EventEmitter>,
+        transfer: Arc<crate::transfers::Handle>,
+    ) -> Self {
+        Self::build(direction, emitter, Some(transfer))
+    }
+
+    fn build(
+        direction: &str,
+        emitter: Arc<dyn EventEmitter>,
+        transfer: Option<Arc<crate::transfers::Handle>>,
+    ) -> Self {
         Self {
             inner: Some(Arc::new(ReporterInner {
                 emitter,
@@ -54,8 +72,14 @@ impl SyncReporter {
                 last_tick: std::sync::Mutex::new(
                     std::time::Instant::now() - std::time::Duration::from_secs(1),
                 ),
+                transfer,
             })),
         }
+    }
+
+    /// The tray entry this run reports to, if any (carries the cancel signal).
+    pub fn transfer(&self) -> Option<Arc<crate::transfers::Handle>> {
+        self.inner.as_ref().and_then(|i| i.transfer.clone())
     }
 
     /// Reporter that discards everything (server-side syncs, tests).
@@ -78,6 +102,13 @@ impl SyncReporter {
         let Some(inner) = &self.inner else {
             return;
         };
+        if let Some(t) = &inner.transfer {
+            if phase == "uploading" || phase == "downloading" {
+                t.progress(phase, done, total);
+            } else if force {
+                t.stage("running", phase, detail);
+            }
+        }
         if !force {
             let mut last = inner.last_tick.lock().unwrap_or_else(|p| p.into_inner());
             if last.elapsed() < std::time::Duration::from_millis(120) {

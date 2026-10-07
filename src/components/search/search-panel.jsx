@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { X, ChevronDown, ChevronRight, Regex, CaseSensitive, WholeWord, Check, ReplaceAll, Loader2, History } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Regex, CaseSensitive, WholeWord, Check, ReplaceAll, Loader2, History, Search } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Toggle } from '@/components/ui/toggle';
@@ -108,6 +108,12 @@ export function SearchPanel({ onOpenFile }) {
     : scopeIds.length === 1 ? (projects.find((p) => p.id === scopeIds[0])?.name ?? '1 project')
     : `${scopeIds.length} projects`;
 
+  const [scopeFilter, setScopeFilter] = useState('');
+  const activeProjectId = useExplorer((s) => s.activeProjectId);
+  const filteredProjects = scopeFilter.trim()
+    ? projects.filter((p) => p.name.toLowerCase().includes(scopeFilter.trim().toLowerCase()))
+    : projects;
+
   // Debounced auto-search.
   const debounceRef = useRef(null);
   useEffect(() => {
@@ -133,32 +139,64 @@ export function SearchPanel({ onOpenFile }) {
         <AddProjectButton />
 
         {/* Multi-project selector */}
-        <Popover>
+        <Popover onOpenChange={(o) => { if (!o) setScopeFilter(''); }}>
           <PopoverTrigger asChild>
             <button className="ml-auto flex h-5 max-w-[120px] items-center gap-1 rounded border border-border/60 px-1.5 text-[10px] text-muted-foreground hover:bg-muted/50 hover:text-foreground">
               <span className="truncate">{scopeLabel}</span>
               <ChevronDown className="size-2.5 shrink-0" />
             </button>
           </PopoverTrigger>
-          <PopoverContent className="w-44 p-1" align="end" sideOffset={4}>
+          <PopoverContent className="flex w-56 flex-col p-1" align="end" sideOffset={4}>
             {projects.length === 0 ? (
               <p className="px-2 py-1 text-[11px] text-muted-foreground">No projects open</p>
             ) : (
-              projects.map((p) => {
-                const selected = scopeIds.includes(p.id);
-                return (
+              <>
+                <div className="mb-1 flex items-center gap-1.5 rounded border border-border/60 px-1.5">
+                  <Search className="size-3 shrink-0 text-muted-foreground" />
+                  <input
+                    autoFocus
+                    value={scopeFilter}
+                    onChange={(e) => setScopeFilter(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && filteredProjects[0]) { e.preventDefault(); toggleProject(filteredProjects[0].id); }
+                      if (e.key === 'Escape' && scopeFilter) { e.preventDefault(); e.stopPropagation(); setScopeFilter(''); }
+                    }}
+                    placeholder="Filter projects…"
+                    className="h-6 min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground/60"
+                  />
+                </div>
+                <div className="mb-1 flex items-center gap-1 px-1 text-[10px] text-muted-foreground">
+                  <span className="flex-1">{scopeIds.length} of {projects.length} selected</span>
+                  <button type="button" className="rounded px-1 hover:bg-muted/50 hover:text-foreground" onClick={() => setScopeIds(projects.map((p) => p.id))}>All</button>
                   <button
-                    key={p.id}
-                    onClick={() => toggleProject(p.id)}
-                    className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs hover:bg-muted/50"
+                    type="button"
+                    className="rounded px-1 hover:bg-muted/50 hover:text-foreground"
+                    onClick={() => setScopeIds([(projects.find((p) => p.id === activeProjectId) || projects[0]).id])}
                   >
-                    <span className="flex size-3.5 shrink-0 items-center justify-center rounded-sm border border-border/60">
-                      {selected && <Check className="size-2.5 text-foreground" />}
-                    </span>
-                    <span className="truncate text-foreground">{p.name}</span>
+                    Only active
                   </button>
-                );
-              })
+                </div>
+                <div className="max-h-72 overflow-y-auto overscroll-contain">
+                  {filteredProjects.length === 0 && (
+                    <p className="px-2 py-1 text-[11px] text-muted-foreground">No matches</p>
+                  )}
+                  {filteredProjects.map((p) => {
+                    const selected = scopeIds.includes(p.id);
+                    return (
+                      <button
+                        key={p.id}
+                        onClick={() => toggleProject(p.id)}
+                        className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs hover:bg-muted/50"
+                      >
+                        <span className="flex size-3.5 shrink-0 items-center justify-center rounded-sm border border-border/60">
+                          {selected && <Check className="size-2.5 text-foreground" />}
+                        </span>
+                        <span className="truncate text-foreground" title={p.root_path}>{p.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
             )}
           </PopoverContent>
         </Popover>

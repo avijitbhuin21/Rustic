@@ -285,7 +285,7 @@ export function BrowserView({ targetId, device = null, paused = false }) {
   return (
     <div
       ref={containerRef}
-      className={`relative flex h-full w-full items-center justify-center overflow-hidden ${emulating ? 'bg-[#2a2c30]' : 'bg-white'}`}
+      className={`relative flex h-full w-full items-center justify-center overflow-hidden ${emulating ? 'bg-muted' : 'bg-white'}`}
     >
       <canvas
         ref={canvasRef}

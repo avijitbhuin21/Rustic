@@ -7,6 +7,7 @@ import {
   ClipboardEdit, X, Check, FileText, Copy, List, Loader2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
@@ -131,12 +132,10 @@ export function SubAgentSection() {
   };
 
   return (
-    <Section title="Sub Agent">
-      <p className="mb-3 text-[12px] italic leading-snug text-muted-foreground">
-        Pick a cheaper, faster model the agent can route mechanical sub-agent work to. When set, the main agent picks
-        per-spawn whether the sub-agent runs on the main chat model (best for reasoning) or this one (best for bulk reads,
-        simple edits, summarising). Leave unset to always reuse the main model.
-      </p>
+    <Section
+      title="Sub Agent"
+      info="Pick a cheaper, faster model the agent can route mechanical sub-agent work to. When set, the main agent picks per-spawn whether the sub-agent runs on the main chat model (best for reasoning) or this one (best for bulk reads, simple edits, summarising). Leave unset to always reuse the main model."
+    >
       <div className="flex items-center gap-2">
         <Select value={providerKey} onValueChange={onPick}>
           <SelectTrigger className="h-8 w-40 text-xs">
@@ -179,11 +178,13 @@ export function SubAgentSection() {
         <div className="-mx-4 border-y border-border/40 px-4 py-3">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0 flex-1">
-              <div className="text-[13px] font-medium">Cap parallel sub-agents per task</div>
-              <div className="text-[12px] text-muted-foreground mt-0.5">
-                How many <code className="text-[11px]">spawn_subagent</code> calls can run simultaneously under one parent
-                task. Default 10. Uncheck to lift the cap entirely (rate-limit safety still comes from the global stream
-                cap in the Budget panel).
+              <div className="flex items-center gap-1.5 text-[13px] font-medium">
+                Cap parallel sub-agents per task
+                <InfoTip>
+                  How many <code className="text-[11px]">spawn_subagent</code> calls can run simultaneously under one parent
+                  task. Default 10. Uncheck to lift the cap entirely (rate-limit safety still comes from the global stream
+                  cap in the Budget panel).
+                </InfoTip>
               </div>
             </div>
             <div className="flex items-center gap-2 shrink-0">

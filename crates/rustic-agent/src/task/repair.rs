@@ -55,9 +55,41 @@ fn stub_text(error: &str) -> String {
     )
 }
 
+/// Pixel cap named by a dimension-limit error, e.g. Anthropic's "image
+/// dimensions exceed max allowed size for many-image requests: 3000 pixels".
+/// `Some(REQUEST_IMAGE_SIDE)` when the error is about dimensions but names no number.
+fn dimension_limit(error: &str) -> Option<u32> {
+    let e = error.to_lowercase();
+    if !(e.contains("image") && (e.contains("dimension") || e.contains("many-image"))) {
+        return None;
+    }
+    let num = e
+        .find("pixels")
+        .and_then(|end| {
+            let head = e[..end].trim_end();
+            let digits: String = head.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+            digits.chars().rev().collect::<String>().parse::<u32>().ok()
+        });
+    Some(num.unwrap_or(crate::media_store::REQUEST_IMAGE_SIDE))
+}
+
 /// Repairs a task history that a provider deterministically rejects (4xx): stubs the
 /// offending block when the error names it, otherwise stubs all image blocks.
+/// Pixel-limit errors apply to every image in the request, so those downscale
+/// all images under the named limit instead (keeping them visible to the model).
 pub fn repair_history_for_provider_error(messages: &mut [Message], error: &str) -> RepairReport {
+    if let Some(limit) = dimension_limit(error) {
+        // A little under the stated limit so rounding never lands us on it.
+        let cap = limit.saturating_sub(16).clamp(256, crate::media_store::REQUEST_IMAGE_SIDE);
+        let shrunk: usize = messages
+            .iter_mut()
+            .flat_map(|m| m.content.iter_mut())
+            .map(|b| usize::from(crate::media_store::shrink_block(b, cap)))
+            .sum();
+        if shrunk > 0 {
+            return RepairReport { stubbed: shrunk, targeted: false };
+        }
+    }
     // Targeted pass: the Anthropic error path indexes the API request's
     // messages array, which usually lines up 1:1 with our history — but not
     // always: the wire drops ModelSwitch markers, skips messages emptied by
@@ -122,6 +154,48 @@ pub fn repair_history_for_provider_error(messages: &mut [Message], error: &str) 
 mod tests {
     use super::*;
     use crate::provider::Role;
+
+    /// A real `w`×`h` PNG as base64.
+    fn png_b64(w: u32, h: u32) -> String {
+        use base64::Engine as _;
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([200, 30, 30]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+    }
+
+    #[test]
+    fn parses_many_image_pixel_limit() {
+        let err = r#"Claude API error 400 Bad Request: {"message":"messages.92.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 3000 pixels"}"#;
+        assert_eq!(dimension_limit(err), Some(3000));
+        assert_eq!(dimension_limit("image dimensions too big"), Some(crate::media_store::REQUEST_IMAGE_SIDE));
+        assert_eq!(dimension_limit("messages.1.content.0.image.source: invalid base64"), None);
+    }
+
+    #[test]
+    fn pixel_limit_error_downscales_every_oversized_image_instead_of_stubbing() {
+        let big = || ContentBlock::Image { media_type: "image/png".into(), data: png_b64(3200, 900), path: None };
+        let small = ContentBlock::Image { media_type: "image/png".into(), data: png_b64(400, 300), path: None };
+        let mut messages = vec![
+            msg(Role::User, vec![text("first"), big()]),
+            msg(Role::Assistant, vec![text("ok")]),
+            msg(Role::User, vec![text("second"), big(), small]),
+        ];
+        let err = "Claude API error 400: messages.92.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 3000 pixels";
+        let report = repair_history_for_provider_error(&mut messages, err);
+        assert_eq!(report.stubbed, 2, "both oversized images resized, the small one untouched");
+        for m in &messages {
+            for b in &m.content {
+                if let ContentBlock::Image { data, .. } = b {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(data).unwrap();
+                    let (w, h) = crate::media_store::image_dimensions(&bytes).unwrap();
+                    assert!(w <= 2000 && h <= 2000, "still {w}x{h}");
+                }
+            }
+        }
+        assert!(messages.iter().flat_map(|m| &m.content).filter(|b| matches!(b, ContentBlock::Image { .. })).count() == 3);
+    }
 
     fn img() -> ContentBlock {
         ContentBlock::Image {

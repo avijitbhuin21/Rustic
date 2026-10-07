@@ -61,6 +61,60 @@ const TERMINAL_PALETTE = {
   brightWhite:   '#e5e5e5',
 };
 
+const TERMINAL_BASE = {
+  background:          '#0a0a0a',
+  foreground:          '#e5e5e5',
+  cursor:              '#e5e5e5',
+  selectionBackground: '#264f78',
+};
+
+// Active theme's terminal colors (theme-bridge `--theme-*` vars; xterm only
+// parses hex/rgb, so anything else falls back to the defaults above).
+const TERMINAL_VARS = {
+  background: '--theme-bg-hard',
+  foreground: '--theme-fg',
+  cursor: '--theme-fg',
+  selectionBackground: '--theme-bg3',
+  black: '--theme-bg2',
+  red: '--theme-bright-red',
+  green: '--theme-bright-green',
+  yellow: '--theme-bright-yellow',
+  blue: '--theme-bright-blue',
+  magenta: '--theme-bright-purple',
+  cyan: '--theme-bright-aqua',
+  white: '--theme-fg2',
+  brightBlack: '--theme-fg4',
+  brightRed: '--theme-bright-red',
+  brightGreen: '--theme-bright-green',
+  brightYellow: '--theme-bright-yellow',
+  brightBlue: '--theme-bright-blue',
+  brightMagenta: '--theme-bright-purple',
+  brightCyan: '--theme-bright-aqua',
+  brightWhite: '--theme-fg',
+};
+
+function terminalTheme() {
+  const out = { ...TERMINAL_BASE, ...TERMINAL_PALETTE };
+  if (typeof document === 'undefined') return out;
+  const cs = getComputedStyle(document.documentElement);
+  for (const [key, cssVar] of Object.entries(TERMINAL_VARS)) {
+    const v = cs.getPropertyValue(cssVar).trim();
+    if (/^(#[0-9a-f]{3,8}|rgba?\()/i.test(v)) out[key] = v;
+  }
+  return out;
+}
+
+const liveTerms = (globalThis.__rusticLiveTerms ??= new Set());
+if (typeof MutationObserver !== 'undefined' && typeof document !== 'undefined' && !globalThis.__rusticTermThemeObserver) {
+  globalThis.__rusticTermThemeObserver = new MutationObserver(() => {
+    const theme = terminalTheme();
+    for (const t of liveTerms) {
+      try { t.options.theme = theme; } catch (_) {}
+    }
+  });
+  globalThis.__rusticTermThemeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
+}
+
 // [term-diag] TEMP: hang the registry off globalThis so a Vite HMR module
 // reload does NOT reset it to empty. Without this, saving this file (or any
 // dependency) orphans every live xterm instance and forces a replay-from-ring
@@ -272,13 +326,7 @@ function createTerminalInstance(sessionId) {
       // element (e.g. while watching an agent/Claude Code work with focus in
       // the chat box) — so no cursor artifact shows on a repainting TUI row.
       cursorInactiveStyle: 'none',
-      theme: {
-        background:          '#0a0a0a',
-        foreground:          '#e5e5e5',
-        cursor:              '#e5e5e5',
-        selectionBackground: '#264f78',
-        ...TERMINAL_PALETTE,
-      },
+      theme: terminalTheme(),
       // Retain a deep scrollback so history is browsable for the life of the
       // terminal. Freed when the instance is disposed (terminal closed).
       scrollback: 10000,
@@ -298,6 +346,7 @@ function createTerminalInstance(sessionId) {
     });
 
     fit = new FitAddon();
+    liveTerms.add(term);
     term.loadAddon(fit);
 
     // Wait for the terminal font to actually load before opening — xterm
@@ -614,6 +663,7 @@ function createTerminalInstance(sessionId) {
       pasteListenerTarget = null;
     }
     const t = term;
+    if (t) liveTerms.delete(t);
     term = null;
     fit = null;
     search = null;

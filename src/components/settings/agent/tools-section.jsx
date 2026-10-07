@@ -9,6 +9,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import {
@@ -49,13 +50,15 @@ export function WebSearchDialog({ open, onClose, value, providers, onSave }) {
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent aria-describedby={undefined} className="w-[460px] sm:max-w-[460px] p-0 gap-0">
         <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">Web Search backend</DialogTitle>
+          <DialogTitle className="flex items-center gap-1.5 text-[14px]">
+            Web Search backend
+            <InfoTip side="bottom">
+              Used when the active provider can't run web_search server-side (OpenAI Chat Completions, OpenAI-compatible, OpenRouter).
+              Anthropic, Gemini, and GPT-5 already run it server-side — no key needed there.
+            </InfoTip>
+          </DialogTitle>
         </DialogHeader>
         <div className="px-5 py-4 space-y-3">
-          <p className="text-[11px] italic text-muted-foreground leading-snug">
-            Used when the active provider can't run web_search server-side (OpenAI Chat Completions, OpenAI-compatible, OpenRouter).
-            Anthropic, Gemini, and GPT-5 already run it server-side — no key needed there.
-          </p>
           <div>
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Backend</div>
             <Select value={backend} onValueChange={setBackend}>
@@ -142,10 +145,10 @@ export function MediaToolDialog({ open, onClose, title, badge, hint, providers, 
           <DialogTitle className="text-[14px] flex items-center gap-2">
             {title}
             <Badge variant="outline" className="h-5 text-[10px] font-mono">{badge}</Badge>
+            <InfoTip side="bottom">{hint}</InfoTip>
           </DialogTitle>
         </DialogHeader>
         <div className="px-5 py-4 space-y-3">
-          {hint && <p className="text-[11px] italic text-muted-foreground leading-snug">{hint}</p>}
           <div>
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Provider</div>
             <Select value={providerKey} onValueChange={(v) => { setProviderKey(v); setModel(''); }}>

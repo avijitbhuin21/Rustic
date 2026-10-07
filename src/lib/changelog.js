@@ -2,6 +2,19 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.7.6',
+    date: 'October 2026',
+    entries: [
+      { tag: 'new', text: 'Themes — a new theme manager with built-in Obsidian, Basalt, Hearth, Petal, Midnight, Onyx plus style starters Neo Brutal, Grove and Neon Grid. Import, download and edit `.rustic-theme.json` files; every theme with custom CSS is scanned and asks for your trust before it applies.' },
+      { tag: 'new', text: 'The agent can list, read, create and remove themes for you (new built-in `rustic-themes` skill); anything it writes waits for your approval.' },
+      { tag: 'new', text: 'Sync redesign — Cloud & Sync lives in the terminal island with a five-panel browser (machines, projects, files, preview, your explorer), per-file pull/upload, drag and drop both ways, and one approval per batch.' },
+      { tag: 'new', text: 'Transfers tray — see size, progress, speed and ETA for every sync transfer, cancel it, and open the destination when done.' },
+      { tag: 'improved', text: 'Sync no longer overwrites on name clashes — you choose rename, auto-number or replace. Paired machines must run the same Rustic version and show "update required" otherwise.' },
+      { tag: 'new', text: 'Queued messages — messages sent while the agent is busy now line up in a new Queued tab on the chat dock, where you can send one now or discard it. Multiple messages queue in order instead of overwriting each other.' },
+      { tag: 'improved', text: 'Settings help text moved behind (i) info icons for a cleaner layout.' },
+    ],
+  },
+  {
     version: '0.7.5',
     date: 'October 2026',
     entries: [

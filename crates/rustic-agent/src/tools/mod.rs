@@ -13,6 +13,7 @@ pub mod skill_tools;
 pub mod sleep;
 pub mod subagent_tools;
 pub mod terminal;
+pub mod theme_tools;
 pub mod todo_tools;
 pub mod web_tools;
 pub mod workflow_tools;
@@ -676,6 +677,7 @@ impl BuiltinTools {
         defs.extend(skill_tools::definitions());
         defs.extend(workflow_tools::definitions());
         defs.extend(extension_tools::definitions());
+        defs.extend(theme_tools::definitions());
         defs.extend(todo_tools::definitions());
         defs.extend(subagent_tools::definitions(fast_subagent_model));
         defs.extend(ask_user::definitions());
@@ -716,6 +718,7 @@ impl ToolExecutor for BuiltinTools {
             "install_extension" | "add_mcp_server" | "uninstall_extension" | "list_extensions" => {
                 extension_tools::execute(name, params, context).await
             }
+            n if theme_tools::handles(n) => theme_tools::execute(name, params, context).await,
             "todo_write" => todo_tools::execute(name, params, context).await,
             "spawn_subagent"
             | "list_subagents"

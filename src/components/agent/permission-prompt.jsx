@@ -34,13 +34,13 @@ function classifyRisk(pending) {
 const RISK_META = {
   destructive: {
     icon: TriangleAlert,
-    iconCls: 'text-red-500',
-    titleCls: 'text-red-600 dark:text-red-400',
+    iconCls: 'text-danger',
+    titleCls: 'text-danger',
     label: 'Potentially destructive',
   },
   write: {
     icon: ShieldAlert,
-    iconCls: 'text-amber-500',
+    iconCls: 'text-warning',
     titleCls: '',
     label: 'Modifies files or runs commands',
   },
@@ -87,6 +87,7 @@ export function PermissionPrompt() {
       }}
     >
       <DialogContent
+        data-rustic-protected=""
         className="overflow-hidden sm:max-w-md"
         onKeyDown={(e) => {
           if (e.key !== 'Enter') return;
@@ -115,9 +116,9 @@ export function PermissionPrompt() {
               className={cn(
                 'break-all rounded border px-2 py-1 font-mono',
                 risk === 'destructive'
-                  ? 'border-red-500/40 bg-red-500/10'
+                  ? 'border-danger/40 bg-danger/10'
                   : risk === 'write'
-                    ? 'border-amber-500/30 bg-amber-500/10'
+                    ? 'border-warning/30 bg-warning/10'
                     : 'border-border bg-muted/40',
               )}
             >
@@ -162,7 +163,7 @@ export function PermissionPrompt() {
           <Button
             className={cn(
               risk === 'destructive' &&
-                'bg-red-600 text-white hover:bg-red-600/90',
+                'bg-danger text-on-status hover:bg-danger/90',
             )}
             onClick={approve}
           >

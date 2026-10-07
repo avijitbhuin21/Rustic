@@ -392,61 +392,8 @@ pub async fn fh_revert(
     Ok(outcomes_to_payload(outcomes))
 }
 
-/// Preview a `revert_from_message` — returns each path that would be touched
-/// and the planned action ("restore" / "delete"). Used by the per-message
-/// revert dialog so the user knows what they're agreeing to.
-#[tauri::command]
-pub async fn fh_plan_revert_from_message(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    project_root: String,
-    message_id: String,
-) -> Result<Vec<RevertPlanRow>, String> {
-    let canon = std::path::PathBuf::from(&project_root)
-        .canonicalize()
-        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let handle = get_or_create_handle(&state, &app, &canon)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let plan = handle
-            .history
-            .plan_revert_from_message(&message_id)
-            .map_err(|e| format!("plan_revert_from_message: {e}"))?;
-        Ok(plan_to_payload(plan))
-    })
-    .await
-    .map_err(|e| format!("fh_plan_revert_from_message task panicked: {e}"))?
-}
-
-/// Apply `revert_from_message`: revert the snapshot anchored at `message_id`
-/// AND every later snapshot in the same task. Used by the per-message revert.
-#[tauri::command]
-pub async fn fh_revert_from_message(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    project_root: String,
-    message_id: String,
-) -> Result<Vec<RevertOutcome>, String> {
-    let canon = std::path::PathBuf::from(&project_root)
-        .canonicalize()
-        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let handle = get_or_create_handle(&state, &app, &canon)?;
-    let msg = message_id.clone();
-    let outcomes = tauri::async_runtime::spawn_blocking(move || {
-        handle
-            .history
-            .revert_from_message(&msg)
-            .map_err(|e| format!("revert_from_message: {e}"))
-    })
-    .await
-    .map_err(|e| format!("fh_revert_from_message task panicked: {e}"))??;
-    // Same restore as fh_revert — message_id anchors the pre-turn snapshot,
-    // and reverting "from this message forward" lands on that same pre-state.
-    restore_todos_for_message(&state, &app, &message_id);
-    Ok(outcomes_to_payload(outcomes))
-}
-
-/// Preview a `revert_task` — same shape as `fh_plan_revert_from_message` but
-/// covering every snapshot in the task.
+/// Preview a `revert_task` — returns each path that would be touched and the
+/// planned action ("restore" / "delete"), covering every snapshot in the task.
 #[tauri::command]
 pub async fn fh_plan_revert_task(
     state: State<'_, AppState>,

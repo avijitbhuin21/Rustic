@@ -29,15 +29,15 @@ function shortHash(h) {
 
 // Branch label badge colors (cycles through a small palette)
 const REF_COLORS = [
-  'bg-blue-500/20 text-blue-400 border-blue-500/30',
-  'bg-violet-500/20 text-violet-400 border-violet-500/30',
-  'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
-  'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  'bg-info/20 text-info border-info/30',
+  'bg-special/20 text-special border-special/30',
+  'bg-success/20 text-success border-success/30',
+  'bg-warning/20 text-warning border-warning/30',
 ];
 
 function refColor(name, index) {
-  if (name === 'HEAD' || name.includes('HEAD')) return 'bg-rose-500/20 text-rose-400 border-rose-500/30';
-  if (name.startsWith('origin/')) return 'bg-orange-500/20 text-orange-400 border-orange-500/30';
+  if (name === 'HEAD' || name.includes('HEAD')) return 'bg-danger/20 text-danger border-danger/30';
+  if (name.startsWith('origin/')) return 'bg-highlight/20 text-highlight border-highlight/30';
   return REF_COLORS[index % REF_COLORS.length];
 }
 
@@ -84,7 +84,7 @@ function CommitRow({ commit, projectId, onSelect, isLast }) {
           className={cn(
             'relative mt-[9px] size-2.5 shrink-0 rounded-full border-2 bg-background',
             isMerge
-              ? 'border-violet-400'
+              ? 'border-special'
               : 'border-muted-foreground/50'
           )}
         />
@@ -173,10 +173,10 @@ function CommitRow({ commit, projectId, onSelect, isLast }) {
                 const path = f.path ?? f.file ?? '';
                 const status = (f.status ?? 'M').toString().charAt(0).toUpperCase();
                 const statusColors = {
-                  A: 'text-emerald-500',
-                  D: 'text-red-500',
-                  R: 'text-blue-500',
-                  M: 'text-yellow-500',
+                  A: 'text-success',
+                  D: 'text-danger',
+                  R: 'text-info',
+                  M: 'text-warning',
                 };
                 return (
                   <button

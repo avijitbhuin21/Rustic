@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Files, Search, GitBranch, Settings, SquareTerminal, FolderOpen, Globe } from 'lucide-react';
+import { Files, Search, GitBranch, Settings, SquareTerminal, FolderOpen, Globe, Cloud } from 'lucide-react';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { Button } from '@/components/ui/button';
@@ -40,6 +40,7 @@ const ITEMS = [
   { id: SIDEBAR_PANELS.SEARCH, label: 'Search', icon: Search },
   { id: SIDEBAR_PANELS.SCM, label: 'Source Control', icon: GitBranch },
   { id: SIDEBAR_PANELS.AGENT, label: 'Agent', icon: AgentMarkIcon },
+  { id: SIDEBAR_PANELS.SYNC, label: 'Cloud & Sync', icon: Cloud },
 ];
 
 const BTN = 42;
@@ -206,9 +207,9 @@ export function ActivityBar() {
                 'pointer-events-auto ml-1.5',
                 'flex flex-col items-center px-1.5 py-3',
                 'rounded-[14px]',
-                'border border-white/[0.09]',
+                'border border-ink/[0.09]',
                 'bg-background/65 backdrop-blur-2xl',
-                'shadow-[0_8px_32px_rgba(0,0,0,0.55),inset_0_1px_0_rgba(255,255,255,0.05)]',
+                'shadow-[0_8px_32px_color-mix(in_oklab,var(--scrim)_55%,transparent),inset_0_1px_0_color-mix(in_oklab,var(--ink)_5%,transparent)]',
               )}
               onMouseEnter={show}
               onMouseLeave={scheduleHide}
@@ -236,7 +237,7 @@ export function ActivityBar() {
                           onClick={() => setActivePanel(id)}
                           className={cn(
                             'size-[42px] rounded-[10px] text-muted-foreground',
-                            'hover:bg-white/10 hover:text-foreground transition-colors',
+                            'hover:bg-ink/10 hover:text-foreground transition-colors',
                             isActive && 'text-foreground'
                           )}
                         >
@@ -250,7 +251,7 @@ export function ActivityBar() {
               </div>
 
               {/* Divider */}
-              <div className="my-2 h-px w-7 rounded-full bg-white/[0.08]" />
+              <div className="my-2 h-px w-7 rounded-full bg-ink/[0.08]" />
 
               {/* Terminal — project picker popover */}
               <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
@@ -262,8 +263,8 @@ export function ActivityBar() {
                         size="icon"
                         className={cn(
                           'size-[42px] rounded-[10px] text-muted-foreground',
-                          'hover:bg-white/10 hover:text-foreground transition-colors',
-                          pickerOpen && 'bg-white/10 text-foreground'
+                          'hover:bg-ink/10 hover:text-foreground transition-colors',
+                          pickerOpen && 'bg-ink/10 text-foreground'
                         )}
                       >
                         <SquareTerminal className="size-5" />
@@ -297,8 +298,8 @@ export function ActivityBar() {
                           size="icon"
                           className={cn(
                             'mt-1 size-[42px] rounded-[10px] text-muted-foreground',
-                            'hover:bg-white/10 hover:text-foreground transition-colors',
-                            browserPickerOpen && 'bg-white/10 text-foreground'
+                            'hover:bg-ink/10 hover:text-foreground transition-colors',
+                            browserPickerOpen && 'bg-ink/10 text-foreground'
                           )}
                         >
                           <Globe className="size-5" />
@@ -320,7 +321,7 @@ export function ActivityBar() {
               )}
 
               {/* Divider */}
-              <div className="my-2 h-px w-7 rounded-full bg-white/[0.08]" />
+              <div className="my-2 h-px w-7 rounded-full bg-ink/[0.08]" />
 
               {/* Settings */}
               <Tooltip>
@@ -331,7 +332,7 @@ export function ActivityBar() {
                     onClick={openSettings}
                     className={cn(
                       'size-[42px] rounded-[10px] text-muted-foreground',
-                      'hover:bg-white/10 hover:text-foreground transition-colors',
+                      'hover:bg-ink/10 hover:text-foreground transition-colors',
                     )}
                   >
                     <Settings className="size-5" />

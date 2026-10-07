@@ -70,7 +70,7 @@ function CellOutput({ output }) {
       <pre
         className={cn(
           'whitespace-pre-wrap break-words px-3 py-1 font-mono text-[11px] leading-relaxed',
-          output.name === 'stderr' ? 'text-amber-600 dark:text-amber-400' : 'text-foreground/90',
+          output.name === 'stderr' ? 'text-warning' : 'text-foreground/90',
         )}
       >
         {stripAnsi(text)}
@@ -499,9 +499,9 @@ export default function NotebookPreview({ tab }) {
           className={cn(
             'ml-2 inline-flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[10px] font-medium',
             kernelState === 'ready'
-              ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+              ? 'bg-success/10 text-success'
               : kernelState === 'starting'
-                ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                ? 'bg-warning/10 text-warning'
                 : 'bg-muted text-muted-foreground',
           )}
           title={kernelLabel || undefined}
@@ -509,7 +509,7 @@ export default function NotebookPreview({ tab }) {
           {kernelState === 'starting' && <Loader2 className="size-3 animate-spin" />}
           {kernelState === 'ready' ? 'Kernel ready' : kernelState === 'starting' ? 'Starting…' : 'Kernel stopped'}
         </span>
-        {dirty && <span className="ml-auto pr-1 text-[10px] text-yellow-500">● unsaved</span>}
+        {dirty && <span className="ml-auto pr-1 text-[10px] text-warning">● unsaved</span>}
       </div>
 
       {/* Cells */}

@@ -37,9 +37,7 @@ pub async fn dispatch(
         "fh_list_files" => fh_list_files(ctx, args).await,
         "fh_file_diff" => fh_file_diff(ctx, args).await,
         "fh_revert" => fh_revert(ctx, args).await,
-        "fh_revert_from_message" => fh_revert_from_message(ctx, args).await,
         "fh_revert_task" => fh_revert_task(ctx, args).await,
-        "fh_plan_revert_from_message" => fh_plan_revert_from_message(ctx, args).await,
         "fh_plan_revert_task" => fh_plan_revert_task(ctx, args).await,
         "fh_list_snapshots" => fh_list_snapshots(ctx, args).await,
         "fh_list_task_net_changes" => fh_list_task_net_changes(ctx, args).await,
@@ -467,40 +465,6 @@ async fn fh_revert(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
     })
     .await
     .map_err(|e| ApiError::from(format!("fh_revert task panicked: {e}")))?
-    .map_err(ApiError::from)?;
-    restore_todos_for_message(ctx, &message_id);
-    ok(outcomes_to_payload(outcomes))
-}
-
-async fn fh_plan_revert_from_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
-    let a: ProjectMessageArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
-    let message_id = a.message_id;
-    let result: Result<Vec<RevertPlanRow>, String> = tokio::task::spawn_blocking(move || {
-        let plan = handle
-            .history
-            .plan_revert_from_message(&message_id)
-            .map_err(|e| format!("plan_revert_from_message: {e}"))?;
-        Ok(plan_to_payload(plan))
-    })
-    .await
-    .map_err(|e| ApiError::from(format!("fh_plan_revert_from_message task panicked: {e}")))?;
-    ok(result?)
-}
-
-async fn fh_revert_from_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
-    let a: ProjectMessageArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
-    let message_id = a.message_id;
-    let msg = message_id.clone();
-    let outcomes = tokio::task::spawn_blocking(move || {
-        handle
-            .history
-            .revert_from_message(&msg)
-            .map_err(|e| format!("revert_from_message: {e}"))
-    })
-    .await
-    .map_err(|e| ApiError::from(format!("fh_revert_from_message task panicked: {e}")))?
     .map_err(ApiError::from)?;
     restore_todos_for_message(ctx, &message_id);
     ok(outcomes_to_payload(outcomes))

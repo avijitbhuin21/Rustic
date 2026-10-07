@@ -364,18 +364,18 @@ function SubagentStatusPill({ status }) {
       ? {
           label: 'Completed',
           icon: <CheckCircle2 className="size-3" />,
-          cls: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
+          cls: 'bg-success/15 text-success',
         }
       : status === 'failed'
         ? {
             label: 'Failed',
             icon: <XCircle className="size-3" />,
-            cls: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+            cls: 'bg-danger/15 text-danger',
           }
         : {
             label: 'Running',
             icon: <Loader2 className="size-3 animate-spin" />,
-            cls: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
+            cls: 'bg-info/15 text-info',
           };
   return (
     <span
@@ -1066,7 +1066,7 @@ export function ChatView() {
                         transition={{ duration: 0.2 }}
                         className="mx-auto flex w-full max-w-3xl items-center gap-2 px-6 pb-2 pt-1 text-xs text-muted-foreground"
                       >
-                        <Loader2 className="size-3.5 animate-spin text-blue-500" />
+                        <Loader2 className="size-3.5 animate-spin text-info" />
                         <span>Preparing…</span>
                       </motion.div>
                     )}
@@ -1082,7 +1082,7 @@ export function ChatView() {
                       exit={{ opacity: 0, y: 8, transition: { duration: 0.15 } }}
                       style={{ x: '-50%' }}
                       onClick={jumpToBottom}
-                      className="absolute bottom-3 left-1/2 z-30 flex items-center gap-1.5 rounded-full bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground shadow-lg ring-1 ring-black/10 transition-colors hover:bg-primary/90"
+                      className="absolute bottom-3 left-1/2 z-30 flex items-center gap-1.5 rounded-full bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground shadow-lg ring-1 ring-scrim/10 transition-colors hover:bg-primary/90"
                     >
                       <ArrowDown className="size-3" />
                       {isStreaming ? 'New messages' : 'Jump to bottom'}

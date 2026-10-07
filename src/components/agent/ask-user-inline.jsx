@@ -634,7 +634,7 @@ function AnsweredView({ questions, answers }) {
   return (
     <div className="relative py-1 pl-7">
       <span className="absolute left-1.5 top-2.5 grid size-3.5 place-items-center rounded-full bg-background">
-        <CheckCircle2 className="size-3 text-green-500" />
+        <CheckCircle2 className="size-3 text-success" />
       </span>
       <div className="min-w-0 space-y-2.5 overflow-hidden rounded-lg border border-border/60 bg-card/50 px-3 py-2.5">
         {questions.map((q, qi) => {

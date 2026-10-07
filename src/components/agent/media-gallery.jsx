@@ -252,7 +252,7 @@ function MediaThumb({ absPath, kind, onClick }) {
             preload="metadata"
             className="h-full w-full object-cover"
           />
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 transition-opacity group-hover:opacity-100 touch-reveal">
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-scrim/30 opacity-0 transition-opacity group-hover:opacity-100 touch-reveal">
             <div className="rounded-full bg-white/90 p-2 text-black shadow">
               <svg viewBox="0 0 24 24" className="size-4 fill-current">
                 <path d="M8 5v14l11-7z" />
@@ -406,7 +406,7 @@ function Lightbox({ items, index, onClose, onNavigate }) {
         {/* Surface */}
         <div
           ref={surfaceRef}
-          className="relative flex flex-1 items-center justify-center overflow-hidden bg-black/40"
+          className="relative flex flex-1 items-center justify-center overflow-hidden bg-scrim/40"
         >
           {loading && <Skeleton className="absolute inset-8" />}
           {error && !loading && (
@@ -450,7 +450,7 @@ function Lightbox({ items, index, onClose, onNavigate }) {
               <button
                 type="button"
                 onClick={() => onNavigate(-1)}
-                className="absolute left-3 top-1/2 -translate-y-1/2 rounded-full bg-black/40 p-2 text-white hover:bg-black/60"
+                className="absolute left-3 top-1/2 -translate-y-1/2 rounded-full bg-scrim/40 p-2 text-white hover:bg-scrim/60"
                 aria-label="Previous"
               >
                 <svg viewBox="0 0 24 24" className="size-4 fill-current"><path d="M15.5 19l-7-7 7-7v14z" /></svg>
@@ -458,7 +458,7 @@ function Lightbox({ items, index, onClose, onNavigate }) {
               <button
                 type="button"
                 onClick={() => onNavigate(1)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full bg-black/40 p-2 text-white hover:bg-black/60"
+                className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full bg-scrim/40 p-2 text-white hover:bg-scrim/60"
                 aria-label="Next"
               >
                 <svg viewBox="0 0 24 24" className="size-4 fill-current"><path d="M8.5 5l7 7-7 7V5z" /></svg>

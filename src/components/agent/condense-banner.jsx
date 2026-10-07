@@ -45,24 +45,24 @@ export function CondenseBanner() {
       role="status"
       aria-live="polite"
     >
-      <div className="overflow-hidden rounded-md border border-blue-500/40 bg-blue-500/10 text-sm">
+      <div className="overflow-hidden rounded-md border border-info/40 bg-info/10 text-sm">
         <div className="flex items-start gap-3 px-3 py-2">
-          <div className="mt-0.5 shrink-0 text-blue-600 dark:text-blue-400">
+          <div className="mt-0.5 shrink-0 text-info">
             <Loader2 className="size-4 animate-spin" />
           </div>
           <div className="min-w-0 flex-1">
-            <div className="font-medium text-blue-900 dark:text-blue-100">
+            <div className="font-medium text-foreground">
               Compacting context…
             </div>
-            <div className="mt-0.5 text-xs text-blue-800/90 dark:text-blue-200/80">
+            <div className="mt-0.5 text-xs text-foreground/80">
               {detail}
             </div>
           </div>
         </div>
         {/* Indeterminate progress bar */}
-        <div className="h-0.5 w-full overflow-hidden bg-blue-500/20">
+        <div className="h-0.5 w-full overflow-hidden bg-info/20">
           <div
-            className="h-full w-1/3 bg-blue-500 animate-pulse"
+            className="h-full w-1/3 bg-info animate-pulse"
           />
         </div>
       </div>

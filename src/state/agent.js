@@ -826,9 +826,9 @@ export const useAgent = create((set, get) => ({
   // when it completes. Shape: { original_messages, condensed_to } or null.
   // The UI shows a "Compacting context..." indicator while this is set.
   condensingByTask: {},
-  // Per-task queued message. When the user sends a message while condensing
-  // is active, we store it here and auto-send after condensing completes.
-  // Shape: { text, attachments, thinkingBudget } or null.
+  // Per-task FIFO of messages sent while the task was busy (running or
+  // condensing). One item is flushed per terminal status, so each queued
+  // message gets its own turn. Item: { id, text, attachments, extras, thinkingBudget }.
   queuedMessageByTask: {},
   // Per-task retry state. Set when the executor emits agent-stream-retry
   // (rate-limit, network blip, stalled stream, etc.) and cleared when the
@@ -1860,34 +1860,73 @@ export const useAgent = create((set, get) => ({
     // queue forever instead of reaching the backend.
     if (isTerminal && get().condensingByTask[taskId]) {
       get()._flushCondenseQueue(taskId);
-    } else if (isTerminal && get().queuedMessageByTask[taskId]) {
-      // A message queued during the run: send it now unless the user stopped
-      // the task themselves (restarting the agent after Stop would be a
-      // surprise) — in that case drop it and say so.
+    } else if (isTerminal && get().queuedMessageByTask[taskId]?.length) {
+      // Queued messages: send the next one unless the user stopped the task
+      // themselves (restarting the agent after Stop would be a surprise).
+      // On Stop the queue is kept — the user can send or discard from the
+      // dock's Queued tab.
       const st = String(status).toLowerCase();
       if (st === 'cancelled' || st === 'canceled' || st === 'aborted') {
-        set((s) => {
-          const next = { ...s.queuedMessageByTask };
-          delete next[taskId];
-          return { queuedMessageByTask: next };
-        });
-        toast.info('Queued message discarded because the task was stopped');
+        toast.info('Task stopped — queued messages are held in the Queued tab');
       } else {
         get()._flushQueuedMessage(taskId);
       }
     }
   },
 
-  // Sends the message the user queued while the task was busy, if any.
+  /** Appends a message to the task's pending queue and returns its id. */
+  _enqueueMessage(taskId, item) {
+    const id = `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    set((s) => ({
+      queuedMessageByTask: {
+        ...s.queuedMessageByTask,
+        [taskId]: [...(s.queuedMessageByTask[taskId] || []), { id, ...item }],
+      },
+    }));
+    return id;
+  },
+
+  /** Removes one queued message by id and returns it (or null). */
+  _takeQueued(taskId, id) {
+    const list = get().queuedMessageByTask[taskId] || [];
+    const item = id ? list.find((q) => q.id === id) : list[0];
+    if (!item) return null;
+    set((s) => {
+      const rest = (s.queuedMessageByTask[taskId] || []).filter((q) => q.id !== item.id);
+      const next = { ...s.queuedMessageByTask };
+      if (rest.length) next[taskId] = rest;
+      else delete next[taskId];
+      return { queuedMessageByTask: next };
+    });
+    return item;
+  },
+
+  // Sends the oldest queued message, if any. Later items wait for the next
+  // terminal status.
   _flushQueuedMessage(taskId) {
-    const queued = get().queuedMessageByTask[taskId];
+    const queued = get()._takeQueued(taskId);
     if (!queued) return;
+    get()._sendMessageDirect(taskId, queued.text, queued.attachments, queued.thinkingBudget, queued.extras || {});
+  },
+
+  /** Sends a specific queued message immediately, interrupting the running turn. */
+  sendQueuedNow(taskId, id) {
+    const q = get()._takeQueued(taskId, id);
+    if (!q) return;
+    get()._sendMessageDirect(taskId, q.text, q.attachments, q.thinkingBudget, q.extras || {});
+  },
+
+  /** Drops one queued message, or the whole queue when `id` is omitted. */
+  discardQueued(taskId, id) {
+    if (id) {
+      get()._takeQueued(taskId, id);
+      return;
+    }
     set((s) => {
       const next = { ...s.queuedMessageByTask };
       delete next[taskId];
       return { queuedMessageByTask: next };
     });
-    get()._sendMessageDirect(taskId, queued.text, queued.attachments, queued.thinkingBudget, queued.extras || {});
   },
 
   // True while the backend is still producing a turn for `taskId`.
@@ -2254,17 +2293,12 @@ export const useAgent = create((set, get) => ({
     // If condensing is active for this task, queue the message instead of
     // sending it. The condense-completed handler will auto-send it.
     if (get().condensingByTask[taskId]) {
-      set((s) => ({
-        queuedMessageByTask: {
-          ...s.queuedMessageByTask,
-          [taskId]: {
-            text,
-            attachments,
-            extras,
-            thinkingBudget: thinkingTierToBudget(state.thinkingTier),
-          },
-        },
-      }));
+      get()._enqueueMessage(taskId, {
+        text,
+        attachments,
+        extras,
+        thinkingBudget: thinkingTierToBudget(state.thinkingTier),
+      });
       toast.info('Message queued — will send after context compacting completes');
       return;
     }
@@ -2273,39 +2307,22 @@ export const useAgent = create((set, get) => ({
     // backend's supersession path). Queue it instead and flush when the turn
     // reaches a terminal status; "Send now" keeps the old interrupt behaviour.
     if (get()._isTaskRunning(taskId)) {
-      const queued = {
+      const queuedId = get()._enqueueMessage(taskId, {
         text,
         attachments,
         extras,
         thinkingBudget: thinkingTierToBudget(state.thinkingTier),
-      };
-      set((s) => ({
-        queuedMessageByTask: { ...s.queuedMessageByTask, [taskId]: queued },
-      }));
+      });
       toast.info('Message queued — will send when the current turn finishes', {
         id: `queued-${taskId}`,
         duration: 8000,
         action: {
           label: 'Send now',
-          onClick: () => {
-            const q = get().queuedMessageByTask[taskId];
-            if (!q) return;
-            set((s) => {
-              const next = { ...s.queuedMessageByTask };
-              delete next[taskId];
-              return { queuedMessageByTask: next };
-            });
-            get()._sendMessageDirect(taskId, q.text, q.attachments, q.thinkingBudget, q.extras || {});
-          },
+          onClick: () => get().sendQueuedNow(taskId, queuedId),
         },
         cancel: {
           label: 'Discard',
-          onClick: () =>
-            set((s) => {
-              const next = { ...s.queuedMessageByTask };
-              delete next[taskId];
-              return { queuedMessageByTask: next };
-            }),
+          onClick: () => get().discardQueued(taskId, queuedId),
         },
       });
       return;

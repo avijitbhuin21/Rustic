@@ -193,7 +193,7 @@ export function McpPanel() {
             <h3 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Pending consent
             </h3>
-            <div className="flex items-center gap-1.5 rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-xs">
+            <div className="flex items-center gap-1.5 rounded border border-warning/30 bg-warning/5 px-2 py-1.5 text-xs">
               <span className="font-mono truncate">{pending.projectPath || pending.project_path || 'project'}</span>
               <div className="ml-auto flex items-center gap-1">
                 <Button

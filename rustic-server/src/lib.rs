@@ -68,6 +68,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let shared = build_shared(config.clone())?;
     crate::peer::restore(&shared.ctx).await;
+    rustic_app::themes::AgentThemeHost::register(crate::peer::ServerPeerHost::arc(&shared.ctx));
 
     // Same one-time inline-image conversion + orphan sweep + VACUUM the desktop
     // host runs, on its own connection so no request waits on it.

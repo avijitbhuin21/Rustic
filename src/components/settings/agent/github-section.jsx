@@ -7,6 +7,7 @@ import {
   ClipboardEdit, X, Check, FileText, Copy, List, Loader2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
@@ -119,16 +120,21 @@ export function GithubAutoResolveSection() {
   }
 
   return (
-    <Section title="GitHub Auto-Resolve" badge="server">
-      <p className="mb-3 text-[12px] italic leading-snug text-muted-foreground">
-        Issues labeled <span className="font-mono">{cfg.label || 'rustic'}</span> on connected
-        repos are pulled into <span className="font-mono">issues/</span>, fixed by a dedicated
-        agent task (queued one at a time), and committed locally — never pushed. Clarifying
-        questions go back and forth as issue comments.
-      </p>
+    <Section
+      title="GitHub Auto-Resolve"
+      badge="server"
+      info={(
+        <>
+          Issues labeled <span className="font-mono">{cfg.label || 'rustic'}</span> on connected
+          repos are pulled into <span className="font-mono">issues/</span>, fixed by a dedicated
+          agent task (queued one at a time), and committed locally — never pushed. Clarifying
+          questions go back and forth as issue comments.
+        </>
+      )}
+    >
 
       {!signedIn && (
-        <div className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12px] text-amber-600 dark:text-amber-400">
+        <div className="mb-3 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-warning">
           Sign in to GitHub (status bar, bottom left) first — the integration reuses that account
           to read issues, post comments and create webhooks.
         </div>
@@ -137,9 +143,9 @@ export function GithubAutoResolveSection() {
       <RowGroup inset>
         <div className="flex items-start justify-between gap-3 px-3 py-3">
           <div className="min-w-0">
-            <div className="text-[13px] font-medium">Auto issue resolve</div>
-            <div className="text-[12px] text-muted-foreground mt-0.5">
-              Master switch. Off = webhooks are ignored and the queue pauses.
+            <div className="flex items-center gap-1.5 text-[13px] font-medium">
+              Auto issue resolve
+              <InfoTip>Master switch. Off = webhooks are ignored and the queue pauses.</InfoTip>
             </div>
           </div>
           <Switch
@@ -149,9 +155,9 @@ export function GithubAutoResolveSection() {
         </div>
 
         <div className="px-3 py-3">
-          <div className="text-[13px] font-medium">Public server URL</div>
-          <div className="text-[12px] text-muted-foreground mt-0.5 mb-2">
-            Where GitHub delivers webhooks, e.g. <span className="font-mono">https://rustic.example.com</span>.
+          <div className="mb-2 flex items-center gap-1.5 text-[13px] font-medium">
+            Public server URL
+            <InfoTip>Where GitHub delivers webhooks, e.g. <span className="font-mono">https://rustic.example.com</span>.</InfoTip>
           </div>
           <div className="flex items-center gap-2">
             <Input
@@ -188,14 +194,12 @@ export function GithubAutoResolveSection() {
             <div className="mt-3 space-y-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
-                  <div className="text-[12px] font-medium">
+                  <div className="flex items-center gap-1.5 text-[12px] font-medium">
                     Enable for this project
+                    <InfoTip>Enabling creates the repo webhook automatically (needs the public URL above).</InfoTip>
                     {detectedRepo && (
-                      <span className="ml-2 font-mono text-[11px] text-muted-foreground">{detectedRepo}</span>
+                      <span className="ml-0.5 font-mono text-[11px] text-muted-foreground">{detectedRepo}</span>
                     )}
-                  </div>
-                  <div className="text-[11px] text-muted-foreground mt-0.5">
-                    Enabling creates the repo webhook automatically (needs the public URL above).
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">

@@ -26,7 +26,9 @@ pub mod search_ops;
 pub mod secrets;
 pub mod state;
 pub mod sync_ext;
+pub mod themes;
 pub mod transfer;
+pub mod transfers;
 pub mod watcher;
 
 pub use bootstrap::{bootstrap, Bootstrapped};

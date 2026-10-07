@@ -15,6 +15,7 @@
 pub mod client;
 pub mod consent;
 pub mod discovery;
+pub mod files;
 pub mod listener;
 pub mod ops;
 pub mod tunnel;
@@ -100,6 +101,33 @@ pub const TICKET_HEADER: &str = "x-rustic-ticket";
 /// Header naming the project a push upload carries (checked against the ticket).
 pub const PROJECT_HEADER: &str = "x-rustic-project";
 
+/// Header carrying the caller's Rustic version. Peers only talk to an
+/// identical version (user decision): anything else gets HTTP 409.
+pub const VERSION_HEADER: &str = "x-rustic-version";
+
+/// Error code in a 409 body when the versions differ.
+pub const VERSION_MISMATCH: &str = "version_mismatch";
+
+/// This build's product version (root `package.json`, shared by the desktop
+/// app and rustic-server).
+pub fn app_version() -> &'static str {
+    env!("RUSTIC_APP_VERSION")
+}
+
+/// User-facing message for a version mismatch with `name` running `theirs`.
+pub fn version_mismatch_message(name: &str, theirs: Option<&str>) -> String {
+    match theirs.filter(|v| !v.is_empty()) {
+        Some(v) => format!(
+            "{name} is on Rustic v{v}, this machine is on v{}. Update both to the same version to connect.",
+            app_version()
+        ),
+        None => format!(
+            "{name} is on an older Rustic version than this machine (v{}). Update both to the same version to connect.",
+            app_version()
+        ),
+    }
+}
+
 /// This machine's public tunnel URL, sent in [`URL_HEADER`].
 static PUBLIC_URL: Mutex<Option<String>> = Mutex::new(None);
 
@@ -151,6 +179,10 @@ pub struct Peer {
     /// What this device may see and pull from us. Empty = nothing (default).
     #[serde(default)]
     pub share: Share,
+    /// We approved this device browsing all our metadata (one-time grant,
+    /// revocable). Pulling items still needs a batch approval.
+    #[serde(default)]
+    pub meta_view: bool,
 }
 
 /// Per-device sharing allowlist: project ids and metadata keys (`category/name`).
@@ -198,6 +230,9 @@ pub struct Discovered {
     pub name: String,
     pub fingerprint: String,
     pub addr: String,
+    /// Rustic version from its mDNS record / `/lan/info` (`None` = unknown).
+    #[serde(default)]
+    pub version: Option<String>,
     #[serde(skip)]
     pub fullname: String,
 }
@@ -222,6 +257,21 @@ pub struct LanInner {
     pub tickets: HashMap<String, consent::Ticket>,
     /// Running Cloudflare quick tunnel exposing the listener, if any.
     pub tunnel: Option<tunnel::Tunnel>,
+    /// Last version each device reported (from `/lan/info` or a 409).
+    pub versions: HashMap<String, String>,
+    /// Paired devices that rejected our token ("unknown device"): they forgot
+    /// us, so the pairing must be redone.
+    pub needs_repair: std::collections::HashSet<String>,
+    /// Incoming pairing prompt per requesting device id → request id, so the
+    /// requester can cancel it.
+    pub pair_by_device: HashMap<String, String>,
+    /// Incoming transfer prompts per requesting device id → request ids.
+    pub transfer_by_device: HashMap<String, Vec<String>>,
+    /// Our outgoing pair / transfer-approval requests per target device, so
+    /// the user can cancel the wait.
+    pub outgoing: HashMap<String, tokio::sync::watch::Sender<bool>>,
+    /// Address that last answered for each device (preferred by `connect`).
+    pub working_addr: HashMap<String, (String, std::time::Instant)>,
 }
 
 impl LanInner {
@@ -602,6 +652,17 @@ fn build_client(
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
+    reqwest::Client::builder()
+        .use_preconfigured_tls(cfg)
+        .default_headers(base_headers())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Headers every peer request carries: our listener port, public tunnel URL
+/// and version.
+fn base_headers() -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
     let port = LISTEN_PORT.load(std::sync::atomic::Ordering::Relaxed);
     if port != 0 {
@@ -609,18 +670,16 @@ fn build_client(
             headers.insert(PORT_HEADER, v);
         }
     }
-    let public = PUBLIC_URL.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    if let Some(url) = public {
+    if let Some(url) = PUBLIC_URL.lock().unwrap_or_else(|p| p.into_inner()).clone() {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&url) {
             headers.insert(URL_HEADER, v);
         }
     }
-    reqwest::Client::builder()
-        .use_preconfigured_tls(cfg)
-        .default_headers(headers)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())
+    headers.insert(
+        VERSION_HEADER,
+        reqwest::header::HeaderValue::from_static(app_version()),
+    );
+    headers
 }
 
 /// Whether `addr` is a public tunnel URL rather than a LAN `host:port`.
@@ -646,18 +705,7 @@ pub fn peer_client(
     addr: &str,
     extra: &[(&'static str, String)],
 ) -> Result<reqwest::Client, String> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    let port = LISTEN_PORT.load(std::sync::atomic::Ordering::Relaxed);
-    if port != 0 {
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(&port.to_string()) {
-            headers.insert(PORT_HEADER, v);
-        }
-    }
-    if let Some(url) = PUBLIC_URL.lock().unwrap_or_else(|p| p.into_inner()).clone() {
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(&url) {
-            headers.insert(URL_HEADER, v);
-        }
-    }
+    let mut headers = base_headers();
     for (k, v) in extra {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(v) {
             headers.insert(*k, v);
@@ -810,6 +858,7 @@ mod tests {
             addr: None,
             nickname: None,
             share: Share::default(),
+            meta_view: false,
         };
         upsert_peer(&dir, p.clone()).unwrap();
         upsert_peer(

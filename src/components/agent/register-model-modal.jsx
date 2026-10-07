@@ -14,6 +14,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
+import { InfoTip } from '@/components/ui/info-tip';
 import {
   Select,
   SelectContent,
@@ -497,8 +498,15 @@ export function RegisterModelModal({
         className="max-h-[85vh] w-full max-w-md overflow-y-auto explorer-scroll sm:max-w-md"
       >
         <DialogHeader>
-          <DialogTitle>{isEdit ? 'Edit model' : 'Register model'}</DialogTitle>
-          <DialogDescription>
+          <DialogTitle className="flex items-center gap-1.5">
+            {isEdit ? 'Edit model' : 'Register model'}
+            <InfoTip>
+              {isEdit
+                ? `Update specs or capabilities for "${modelId}".`
+                : `"${modelId}" isn't in the built-in model registry. Fill in its specs so cost and context-window calculations stay accurate.`}
+            </InfoTip>
+          </DialogTitle>
+          <DialogDescription className="sr-only">
             {isEdit
               ? `Update specs or capabilities for "${modelId}".`
               : `"${modelId}" isn't in the built-in model registry. Fill in its specs so cost and context-window calculations stay accurate.`}

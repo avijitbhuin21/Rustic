@@ -6,12 +6,16 @@ import {
   CheckCircle2,
   Circle,
   CircleDotDashed,
+  Clock,
   FileEdit,
   Folder,
   ListChecks,
   Loader2,
+  Paperclip,
   RotateCcw,
+  Send,
   TerminalSquare,
+  Trash2,
   X,
 } from 'lucide-react';
 import { useAgent } from '@/state/agent';
@@ -37,11 +41,11 @@ const EMPTY = [];
 
 function PlanStatusIcon({ status }) {
   if (status === 'completed') {
-    return <CheckCircle2 className="size-3.5 shrink-0 text-green-500" />;
+    return <CheckCircle2 className="size-3.5 shrink-0 text-success" />;
   }
   if (status === 'in_progress') {
     return (
-      <CircleDotDashed className="size-3.5 shrink-0 animate-spin text-blue-500 [animation-duration:3s]" />
+      <CircleDotDashed className="size-3.5 shrink-0 animate-spin text-info [animation-duration:3s]" />
     );
   }
   return <Circle className="size-3.5 shrink-0 text-muted-foreground/60" />;
@@ -168,6 +172,72 @@ function TerminalsContent({ terminals, onOpenTerminal, onCloseTerminal }) {
   );
 }
 
+/** Lists messages waiting to be sent, with per-item send-now / discard. */
+function QueuedContent({ items, onSendNow, onDiscard, onDiscardAll }) {
+  return (
+    <div className="flex flex-col">
+      <div className="flex items-center justify-between border-b border-border/30 px-3 py-1.5 text-[11px] text-muted-foreground">
+        <span>
+          {items.length} pending message{items.length === 1 ? '' : 's'} · sent in order as each turn finishes
+        </span>
+        <button
+          type="button"
+          onClick={onDiscardAll}
+          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground/80 transition-colors hover:bg-foreground/[0.06] hover:text-danger"
+          title="Discard every queued message"
+        >
+          <Trash2 className="size-3" />
+          Discard all
+        </button>
+      </div>
+      <ul className="flex flex-col">
+        {items.map((q, i) => {
+          const attachCount = Array.isArray(q.attachments) ? q.attachments.length : 0;
+          return (
+            <li
+              key={q.id}
+              className="group flex items-start gap-2 border-b border-border/20 px-3 py-1.5 text-xs last:border-b-0"
+            >
+              <span className="mt-0.5 w-4 shrink-0 text-right text-[10px] tabular-nums text-muted-foreground">
+                {i + 1}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="line-clamp-2 whitespace-pre-wrap break-words text-foreground/90">
+                  {q.text?.trim() || <span className="italic text-muted-foreground">(no text)</span>}
+                </p>
+                {attachCount > 0 && (
+                  <span className="mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground">
+                    <Paperclip className="size-3" />
+                    {attachCount} attachment{attachCount === 1 ? '' : 's'}
+                  </span>
+                )}
+              </div>
+              <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                <button
+                  type="button"
+                  onClick={() => onSendNow(q.id)}
+                  className="rounded p-1 text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+                  title="Send now (interrupts the current turn)"
+                >
+                  <Send className="size-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDiscard(q.id)}
+                  className="rounded p-1 text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-danger"
+                  title="Discard this message"
+                >
+                  <X className="size-3.5" />
+                </button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 function FilesContent({ entries, onOpenDiff, onRevertPath, onRevertAll, busyPath }) {
   if (!entries || entries.length === 0) {
     return (
@@ -207,10 +277,10 @@ function FilesContent({ entries, onOpenDiff, onRevertPath, onRevertAll, busyPath
         <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
           <span>{fileEntries.length} file{fileEntries.length === 1 ? '' : 's'}</span>
           {totalAdditions > 0 && (
-            <span className="font-mono text-emerald-500">+{totalAdditions}</span>
+            <span className="font-mono text-success">+{totalAdditions}</span>
           )}
           {totalDeletions > 0 && (
-            <span className="font-mono text-rose-500">-{totalDeletions}</span>
+            <span className="font-mono text-danger">-{totalDeletions}</span>
           )}
         </div>
         <button
@@ -273,7 +343,7 @@ function revertActionForEntry(entry) {
 function RevertEntryPreview({ entry, compact = false }) {
   const action = revertActionForEntry(entry);
   const actionColour =
-    action === 'delete' ? 'text-rose-500' : 'text-emerald-500';
+    action === 'delete' ? 'text-danger' : 'text-success';
   const actionLabel = action === 'delete' ? 'will delete' : 'will restore';
   const { additions, deletions, binary } = entry;
 
@@ -294,10 +364,10 @@ function RevertEntryPreview({ entry, compact = false }) {
       {!binary && (additions > 0 || deletions > 0) && (
         <span className="flex shrink-0 items-center gap-1 font-mono text-[10px]">
           {additions > 0 && (
-            <span className="text-emerald-500">+{additions}</span>
+            <span className="text-success">+{additions}</span>
           )}
           {deletions > 0 && (
-            <span className="text-rose-500">-{deletions}</span>
+            <span className="text-danger">-{deletions}</span>
           )}
         </span>
       )}
@@ -332,10 +402,10 @@ function FileEntryRow({ entry, onOpenDiff, onRevertPath, busy, anyBusy }) {
 
   const kindColour =
     kind === 'created'
-      ? 'text-emerald-500'
+      ? 'text-success'
       : kind === 'deleted'
-      ? 'text-rose-500'
-      : 'text-amber-500';
+      ? 'text-danger'
+      : 'text-warning';
   const kindGlyph =
     kind === 'created' ? 'A' : kind === 'deleted' ? 'D' : 'M';
 
@@ -368,8 +438,8 @@ function FileEntryRow({ entry, onOpenDiff, onRevertPath, busy, anyBusy }) {
             are always zero — the kind glyph already conveys the change. */}
         {!binary && (additions > 0 || deletions > 0) && (
           <span className="ml-1 flex shrink-0 items-center gap-1 font-mono text-[10px]">
-            {additions > 0 && <span className="text-emerald-500">+{additions}</span>}
-            {deletions > 0 && <span className="text-rose-500">-{deletions}</span>}
+            {additions > 0 && <span className="text-success">+{additions}</span>}
+            {deletions > 0 && <span className="text-danger">-{deletions}</span>}
           </span>
         )}
         {binary && (
@@ -416,6 +486,11 @@ const panelVariants = {
 
 export function AgentToolDock() {
   const activeTaskId = useAgent((s) => s.activeTaskId);
+  const queuedItems = useAgent((s) =>
+    activeTaskId ? s.queuedMessageByTask[activeTaskId] || EMPTY : EMPTY,
+  );
+  const sendQueuedNow = useAgent((s) => s.sendQueuedNow);
+  const discardQueued = useAgent((s) => s.discardQueued);
   const todos = useAgent((s) =>
     activeTaskId ? s.todosByTask[activeTaskId] || EMPTY : EMPTY,
   );
@@ -590,12 +665,12 @@ export function AgentToolDock() {
                 {previewEntries.length === 1 ? '' : 's'}
               </span>
               {totalAdditions > 0 && (
-                <span className="font-mono text-emerald-500">
+                <span className="font-mono text-success">
                   +{totalAdditions}
                 </span>
               )}
               {totalDeletions > 0 && (
-                <span className="font-mono text-rose-500">
+                <span className="font-mono text-danger">
                   -{totalDeletions}
                 </span>
               )}
@@ -744,7 +819,10 @@ export function AgentToolDock() {
   const autoOpened = useAgent((s) => s.dockAutoOpenedByTask);
   const setDockActiveTab = useAgent((s) => s.setDockActiveTab);
   const markDockAutoOpened = useAgent((s) => s.markDockAutoOpened);
-  const activeTab = activeTaskId ? activeByTask[activeTaskId] || null : null;
+  const activeTabRaw = activeTaskId ? activeByTask[activeTaskId] || null : null;
+  // The Queued tab disappears once its last message is sent or discarded;
+  // collapse rather than render an orphaned panel.
+  const activeTab = activeTabRaw === 'queued' && queuedItems.length === 0 ? null : activeTabRaw;
   const setActiveTab = (val) => setDockActiveTab(activeTaskId, val);
 
   // Auto-open the Plan tab the first time todos appear for a task — same
@@ -808,6 +886,9 @@ export function AgentToolDock() {
       label: 'Terminals',
       badge: agentTerminals.length > 0 ? String(agentTerminals.length) : null,
     },
+    ...(queuedItems.length > 0
+      ? [{ id: 'queued', icon: Clock, label: 'Queued', badge: String(queuedItems.length) }]
+      : []),
   ];
 
   return (
@@ -816,7 +897,7 @@ export function AgentToolDock() {
         className={cn(
           'overflow-hidden rounded-3xl rounded-b-none border border-border/70 border-b-0 bg-popover',
           'transition-shadow duration-200',
-          activeTab ? 'shadow-[0_-4px_18px_rgba(0,0,0,0.12)]' : '',
+          activeTab ? 'shadow-[0_-4px_18px_color-mix(in_oklab,var(--scrim)_12%,transparent)]' : '',
         )}
       >
         {/* Tab row. The seam between tabs is a 1px border-r on each except
@@ -883,6 +964,14 @@ export function AgentToolDock() {
                     terminals={agentTerminals}
                     onOpenTerminal={handleOpenTerminal}
                     onCloseTerminal={handleCloseTerminal}
+                  />
+                )}
+                {activeTab === 'queued' && (
+                  <QueuedContent
+                    items={queuedItems}
+                    onSendNow={(id) => sendQueuedNow(activeTaskId, id)}
+                    onDiscard={(id) => discardQueued(activeTaskId, id)}
+                    onDiscardAll={() => discardQueued(activeTaskId)}
                   />
                 )}
               </div>

@@ -55,8 +55,8 @@ async function chooseFolder(name) {
 }
 
 /** Expandable "My machine" card: name, LAN address, local-network sync and internet tunnel. */
-function MyMachine({ status, busy, onToggleLan, onRename, onRefresh }) {
-  const [open, setOpen] = useState(true);
+export function MyMachine({ status, busy, onToggleLan, onRename, onRefresh, defaultOpen = true }) {
+  const [open, setOpen] = useState(defaultOpen);
   const [name, setName] = useState('');
   const [tunnelBusy, setTunnelBusy] = useState(false);
   const [download, setDownload] = useState(null);
@@ -143,16 +143,18 @@ function MyMachine({ status, busy, onToggleLan, onRename, onRefresh }) {
                 ) : <span className="text-[11.5px] text-muted-foreground">port {status?.port || '—'}</span>}
               </SettingRow>
             )}
-            {enabled && !IS_WEB && (
+            {!IS_WEB && (
               <SettingRow
                 label="Reachable over the internet"
-                description="Let machines outside your network add you — through a free Cloudflare tunnel, or by forwarding a port on your router."
+                description={enabled
+                  ? 'Let machines outside your network add you — through a free Cloudflare tunnel, or by forwarding a port on your router. With the tunnel, anyone with the link can ask to pair — pairing still needs your approval and the matching code. If cloudflared isn\u2019t installed, Rustic downloads it from Cloudflare\u2019s official GitHub releases.'
+                  : 'Turn on Local network sync above first — internet access goes through the same listener.'}
               >
                 <div className="flex items-center gap-1.5">
                   {tunnelBusy && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
                   <Switch
-                    checked={!!mode}
-                    disabled={tunnelBusy}
+                    checked={enabled && !!mode}
+                    disabled={tunnelBusy || !enabled}
                     onCheckedChange={(on) => setMode(on ? 'cloudflare' : 'off')}
                   />
                 </div>
@@ -191,7 +193,7 @@ function MyMachine({ status, busy, onToggleLan, onRename, onRefresh }) {
                       <Button size="icon-sm" variant="ghost" className="size-7" title="Copy" onClick={() => copyText(status.tunnel_url, 'URL copied')}><Copy className="size-3.5" /></Button>
                     </div>
                   ) : (
-                    <div className="flex items-center justify-between gap-2 text-[11.5px] text-amber-500">
+                    <div className="flex items-center justify-between gap-2 text-[11.5px] text-warning">
                       Tunnel isn't running.
                       <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setMode('cloudflare')}>Start</Button>
                     </div>
@@ -205,11 +207,6 @@ function MyMachine({ status, busy, onToggleLan, onRename, onRefresh }) {
                     <li>Allow port {status?.default_port || 47820} through this machine's firewall.</li>
                     <li>Share <code className="rounded bg-muted px-1 font-mono">your-public-IP:{status?.default_port || 47820}</code> — the other machine adds it under Add machine → Over the internet.</li>
                   </ol>
-                )}
-                {mode === 'cloudflare' && (
-                  <p className="text-[10.5px] text-muted-foreground">
-                    Anyone with the link can ask to pair — pairing still needs your approval and the matching code. If cloudflared isn't installed, Rustic downloads it from Cloudflare's official GitHub releases.
-                  </p>
                 )}
               </div>
             )}
@@ -258,12 +255,12 @@ function MachineView({ machine, localProjects, localMeta, onRunning }) {
   const myMetaItems = (localMeta || []).map((m) => ({ id: m.key, label: m.name, sub: META_LABELS[m.category] || m.category }));
   const theirProjectItems = (theirProjects || []).map((p) => ({
     id: p.id, label: p.name, sub: p.root_path,
-    badge: localIds.has(p.id) ? 'replaces yours' : 'new', badgeTone: localIds.has(p.id) ? 'text-amber-500' : 'text-emerald-500',
+    badge: localIds.has(p.id) ? 'replaces yours' : 'new', badgeTone: localIds.has(p.id) ? 'text-warning' : 'text-success',
   }));
   const theirMetaItems = (theirMeta || []).map((m) => ({
     id: m.key, label: m.name, sub: META_LABELS[m.category] || m.category,
     badge: m.status === 'new' ? 'new' : m.status === 'conflict' ? 'differs' : 'same',
-    badgeTone: m.status === 'new' ? 'text-emerald-500' : m.status === 'conflict' ? 'text-amber-500' : 'text-muted-foreground',
+    badgeTone: m.status === 'new' ? 'text-success' : m.status === 'conflict' ? 'text-warning' : 'text-muted-foreground',
   }));
 
   const run = async (direction) => {
@@ -656,7 +653,7 @@ function SyncProgressRow({ progress }) {
     <div className={cn(GROUP_BOX, 'mt-2 space-y-1.5 px-3 py-2.5')}>
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="flex items-center gap-1.5 font-medium text-foreground">
-          {finished ? <CloudUpload className="size-3 text-emerald-500" /> : <Loader2 className="size-3 animate-spin text-muted-foreground" />}
+          {finished ? <CloudUpload className="size-3 text-success" /> : <Loader2 className="size-3 animate-spin text-muted-foreground" />}
           {direction === 'pull' ? 'Pull' : 'Push'} — {label}
         </span>
         {pct !== null && !finished && <span className="tabular-nums text-muted-foreground">{pct}%</span>}

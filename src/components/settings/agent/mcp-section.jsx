@@ -7,6 +7,7 @@ import {
   ClipboardEdit, X, Check, FileText, Copy, List, Loader2, Settings2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
@@ -64,13 +65,13 @@ export function McpJsonDialog({ open, onClose }) {
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent aria-describedby={undefined} className="w-[640px] sm:max-w-[640px] p-0 gap-0">
         <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">Edit mcp.json</DialogTitle>
+          <DialogTitle className="flex items-center gap-1.5 text-[14px]">
+            Edit mcp.json
+            <InfoTip side="bottom">Global pool — every server here is available to all projects. Use Configure on a server to change it per project.</InfoTip>
+          </DialogTitle>
         </DialogHeader>
         <div className="min-w-0 px-5 py-4">
           <JsonArea value={json} onChange={setJson} />
-          <p className="mt-2 text-[10.5px] text-muted-foreground">
-            Global pool — every server here is available to all projects. Use Configure on a server to change it per project.
-          </p>
         </div>
         <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
           <Button variant="outline" size="sm" className="text-xs" onClick={onClose}>Cancel</Button>
@@ -140,7 +141,7 @@ export function McpServerRow({ server, onRemove, onConfigure }) {
         </Button>
       </div>
       {st.state === 'failed' && st.error && (
-        <p className="px-3 pb-2 text-[11px] text-rose-500/90 break-all">{st.error}</p>
+        <p className="px-3 pb-2 text-[11px] text-danger/90 break-all">{st.error}</p>
       )}
       {open && connected && (
         <div className="border-t border-border/40 bg-muted/10">

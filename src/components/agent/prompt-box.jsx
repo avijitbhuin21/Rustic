@@ -278,13 +278,13 @@ function MentionMenu({ kind, items, activeIndex, onHover, onSelect, query }) {
           ? `No skills or workflows match "${query}"`
           : 'No skills or workflows installed.';
     return (
-      <div className="absolute bottom-full left-0 z-50 mb-2 w-full overflow-hidden rounded-lg border border-border/70 bg-popover p-2 text-xs text-muted-foreground shadow-[0_8px_30px_rgba(0,0,0,0.24)]">
+      <div className="absolute bottom-full left-0 z-50 mb-2 w-full overflow-hidden rounded-lg border border-border/70 bg-popover p-2 text-xs text-muted-foreground shadow-[0_8px_30px_color-mix(in_oklab,var(--scrim)_24%,transparent)]">
         {empty}
       </div>
     );
   }
   return (
-    <div className="absolute bottom-full left-0 z-50 mb-2 w-full overflow-hidden rounded-lg border border-border/70 bg-popover p-1 shadow-[0_8px_30px_rgba(0,0,0,0.24)]">
+    <div className="absolute bottom-full left-0 z-50 mb-2 w-full overflow-hidden rounded-lg border border-border/70 bg-popover p-1 shadow-[0_8px_30px_color-mix(in_oklab,var(--scrim)_24%,transparent)]">
       <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
         {kind === 'at' ? 'Reference a file or terminal' : 'Commands, skills & workflows'}
       </div>
@@ -485,14 +485,14 @@ function ModelRow({ providerKey, baseUrl, modelId, label, registered, active, on
       className={cn(
         'flex h-7 w-full items-center justify-between gap-2 rounded-md pl-7 pr-2 text-xs transition-colors',
         active
-          ? 'bg-amber-500/15 text-amber-500'
+          ? 'bg-warning/15 text-warning'
           : 'text-foreground hover:bg-muted',
       )}
     >
       <span className="truncate">{label}</span>
       <div className="flex items-center gap-1.5">
         {!registered && (
-          <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-500">
+          <span className="rounded-full bg-warning/15 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-warning">
             Setup
           </span>
         )}
@@ -553,10 +553,10 @@ const MODE_LABELS = Object.fromEntries(MODE_ITEMS.map((m) => [m.id, m.label]));
 // the budget climbs. Class strings are literal so Tailwind keeps them.
 const TIER_META = {
   off: { label: 'Off', text: 'text-muted-foreground', bg: 'bg-muted-foreground', ring: 'ring-muted-foreground/40' },
-  low: { label: 'Low', text: 'text-sky-500', bg: 'bg-sky-500', ring: 'ring-sky-500/40' },
-  medium: { label: 'Medium', text: 'text-emerald-500', bg: 'bg-emerald-500', ring: 'ring-emerald-500/40' },
-  high: { label: 'High', text: 'text-amber-500', bg: 'bg-amber-500', ring: 'ring-amber-500/40' },
-  max: { label: 'Max', text: 'text-rose-500', bg: 'bg-rose-500', ring: 'ring-rose-500/40' },
+  low: { label: 'Low', text: 'text-info', bg: 'bg-info', ring: 'ring-info/40' },
+  medium: { label: 'Medium', text: 'text-success', bg: 'bg-success', ring: 'ring-success/40' },
+  high: { label: 'High', text: 'text-warning', bg: 'bg-warning', ring: 'ring-warning/40' },
+  max: { label: 'Max', text: 'text-danger', bg: 'bg-danger', ring: 'ring-danger/40' },
 };
 function tierMeta(tier) {
   return TIER_META[tier] || TIER_META.off;
@@ -638,7 +638,7 @@ function ThinkingNodeRail({ tiers, value, onChange }) {
                 <span
                   className={cn(
                     'size-1.5 rounded-full transition-colors',
-                    reached ? 'bg-white' : 'bg-muted-foreground/40',
+                    reached ? 'bg-on-status' : 'bg-muted-foreground/40',
                   )}
                 />
               </span>
@@ -2130,7 +2130,7 @@ export function PromptBox({
   return (
     <div
       className={cn(
-        'rounded-3xl border border-border/70 bg-popover p-2 shadow-[0_8px_30px_rgba(0,0,0,0.24)] transition-all duration-300',
+        'rounded-3xl border border-border/70 bg-popover p-2 shadow-[0_8px_30px_color-mix(in_oklab,var(--scrim)_24%,transparent)] transition-all duration-300',
         // Flatten the top edge when the dock is sitting above this prompt,
         // so the two share a single rounded shell with no visible seam.
         flatTop && 'rounded-t-none border-t-0',
@@ -2266,8 +2266,8 @@ export function PromptBox({
           {!isStreaming && waitingOnSubagents > 0 && (
             <div className="flex min-w-0 items-center gap-1.5 px-1.5 text-[11px] text-muted-foreground">
               <span className="relative flex size-2 shrink-0">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-500/50" />
-                <span className="relative inline-flex size-2 rounded-full bg-amber-500/80" />
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning/50" />
+                <span className="relative inline-flex size-2 rounded-full bg-warning/80" />
               </span>
               <span className="shrink-0 font-medium">
                 Waiting on {waitingOnSubagents} sub-agent{waitingOnSubagents > 1 ? 's' : ''}
@@ -2311,7 +2311,7 @@ export function PromptBox({
                   ? 'bg-destructive text-white hover:bg-destructive/85 ring-2 ring-destructive/25 animate-pulse'
                   : recording
                     // Recording: red, pulsing, click to stop.
-                    ? 'bg-red-500 text-white hover:bg-red-500/85 animate-pulse'
+                    ? 'bg-danger text-on-status hover:bg-danger/85 animate-pulse'
                     : hasContent
                       ? 'bg-foreground text-background hover:bg-foreground/85'
                       : 'bg-transparent text-muted-foreground',
@@ -2320,9 +2320,9 @@ export function PromptBox({
               )}
             >
               {isStreaming ? (
-                <span className="size-2.5 rounded-[2px] bg-white" />
+                <span className="size-2.5 rounded-[2px] bg-current" />
               ) : recording ? (
-                <span className="size-2.5 rounded-[2px] bg-white" />
+                <span className="size-2.5 rounded-[2px] bg-current" />
               ) : transcribing ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : showMic ? (

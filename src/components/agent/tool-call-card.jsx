@@ -66,9 +66,9 @@ function useSleepCountdown(timestamp, seconds, active) {
 }
 
 const STATUS_BADGE = {
-  completed: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
-  'in-progress': 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
-  failed: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+  completed: 'bg-success/15 text-success',
+  'in-progress': 'bg-info/15 text-info',
+  failed: 'bg-danger/15 text-danger',
   pending: 'bg-muted text-muted-foreground',
 };
 
@@ -244,10 +244,10 @@ function SpawnedSubagentRow({ agentId }) {
   const model = sub?.model || '';
   const statusCls =
     status === 'completed'
-      ? 'text-green-600 dark:text-green-400'
+      ? 'text-success'
       : status === 'failed'
-        ? 'text-red-600 dark:text-red-400'
-        : 'text-blue-600 dark:text-blue-400';
+        ? 'text-danger'
+        : 'text-info';
 
   return (
     <motion.button
@@ -295,12 +295,12 @@ function SpawnedSubagentBatchRow({ index, entry, agentId }) {
   const model = sub?.model || '';
   const statusCls =
     status === 'completed'
-      ? 'text-green-600 dark:text-green-400'
+      ? 'text-success'
       : status === 'failed'
-        ? 'text-red-600 dark:text-red-400'
+        ? 'text-danger'
         : status === 'pending'
           ? 'text-muted-foreground'
-          : 'text-blue-600 dark:text-blue-400';
+          : 'text-info';
 
   const disabled = !agentId || !activeTaskId;
   const handleClick = (e) => {
@@ -384,17 +384,17 @@ function StatusIcon({ status, toolName }) {
         className="flex"
       >
         {status === 'completed' ? (
-          <CheckCircle2 className="size-4 text-green-500" />
+          <CheckCircle2 className="size-4 text-success" />
         ) : status === 'in-progress' ? (
           toolName === 'ask_user' ? (
             <HelpCircle className="size-4 animate-pulse text-primary" />
           ) : toolName === 'sleep' ? (
             <Timer className="size-4 animate-pulse text-primary" />
           ) : (
-            <CircleDotDashed className="size-4 animate-spin text-blue-500 [animation-duration:3s]" />
+            <CircleDotDashed className="size-4 animate-spin text-info [animation-duration:3s]" />
           )
         ) : status === 'failed' ? (
-          <CircleX className="size-4 text-red-500" />
+          <CircleX className="size-4 text-danger" />
         ) : (
           <Circle className="size-4 text-muted-foreground" />
         )}
@@ -644,7 +644,7 @@ function ToolCallCardInner({
           {/* Inner overlay carries the row's hover tint so the icon blends
               with the rest of the row on hover. Outer stays opaque so the
               dashed turn-rail behind it remains hidden. */}
-          <span className="flex items-center justify-center px-0.5 group-hover:bg-[rgba(127,127,127,0.06)]">
+          <span className="flex items-center justify-center px-0.5 group-hover:bg-ink/[0.06]">
             <StatusIcon status={status} toolName={name} />
           </span>
         </span>

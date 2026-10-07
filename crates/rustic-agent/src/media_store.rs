@@ -109,25 +109,49 @@ pub fn store_bytes(bytes: &[u8]) -> Option<String> {
 const MAX_IMAGE_SIDE: u32 = 8000;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
-/// Shrinks an image that would be rejected by the provider: longest side capped at `MAX_IMAGE_SIDE`, then re-encoded (PNG, falling back to JPEG at decreasing sizes) until it fits `MAX_IMAGE_BYTES`. Returns `None` when the image is already within limits or cannot be decoded.
-pub fn normalize_for_providers(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
-    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
+/// Longest side an image may have when it goes out in a request. Anthropic
+/// rejects larger images once a request carries many images (its "many-image"
+/// limit), and every provider downsamples beyond ~1568–2048 px anyway, so
+/// capping here loses nothing the model would have seen.
+pub const REQUEST_IMAGE_SIDE: u32 = 2000;
+
+/// `(width, height)` of an encoded image from its header (no full decode).
+pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?
         .into_dimensions()
-        .ok()?;
-    let oversized = w > MAX_IMAGE_SIDE || h > MAX_IMAGE_SIDE;
-    let too_heavy = bytes.len() > MAX_IMAGE_BYTES;
-    if !oversized && !too_heavy {
+        .ok()
+}
+
+/// Re-encode `bytes` with its longest side capped at `max_side` and the
+/// payload under the provider byte limit. `None` when already within both
+/// limits or undecodable.
+pub fn shrink_to(bytes: &[u8], max_side: u32) -> Option<(Vec<u8>, &'static str)> {
+    let (w, h) = image_dimensions(bytes)?;
+    if w <= max_side && h <= max_side && bytes.len() <= MAX_IMAGE_BYTES {
         return None;
     }
+    normalize_with_cap(bytes, max_side)
+}
+
+/// Shrinks an image that would be rejected by the provider: longest side capped at [`REQUEST_IMAGE_SIDE`], then re-encoded (PNG, falling back to JPEG at decreasing sizes) until it fits `MAX_IMAGE_BYTES`. Returns `None` when the image is already within limits or cannot be decoded.
+pub fn normalize_for_providers(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    let (w, h) = image_dimensions(bytes)?;
+    let cap = REQUEST_IMAGE_SIDE.min(MAX_IMAGE_SIDE);
+    if w <= cap && h <= cap && bytes.len() <= MAX_IMAGE_BYTES {
+        return None;
+    }
+    normalize_with_cap(bytes, cap)
+}
+
+/// Resize to fit `cap` px per side (when larger) and re-encode under the byte limit.
+fn normalize_with_cap(bytes: &[u8], cap: u32) -> Option<(Vec<u8>, &'static str)> {
+    let (w, h) = image_dimensions(bytes)?;
+    let oversized = w > cap || h > cap;
     let mut img = image::load_from_memory(bytes).ok()?;
     if oversized {
-        img = img.resize(
-            MAX_IMAGE_SIDE,
-            MAX_IMAGE_SIDE,
-            image::imageops::FilterType::Triangle,
-        );
+        img = img.resize(cap, cap, image::imageops::FilterType::Triangle);
     }
     let encode = |img: &image::DynamicImage, fmt: image::ImageFormat| -> Option<Vec<u8>> {
         let mut out = std::io::Cursor::new(Vec::new());
@@ -265,22 +289,95 @@ pub fn dehydrate(content: &mut [ContentBlock]) -> usize {
     moved
 }
 
+/// Stored payload `name` as base64 for a provider request, capped at
+/// [`REQUEST_IMAGE_SIDE`]. A downscaled copy is cached next to the original
+/// (`<name>.r<side>`) so the resize happens once. Returns the base64 and,
+/// when it was re-encoded, the new media type.
+pub fn load_base64_for_request(name: &str) -> Option<(String, Option<&'static str>)> {
+    let path = path_for(name)?;
+    let cache = path.with_file_name(format!(
+        "{}.r{REQUEST_IMAGE_SIDE}",
+        path.file_name()?.to_string_lossy()
+    ));
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    if let Ok(cached) = std::fs::read(&cache) {
+        let mt = crate::tools::sniff_image_media_type(&cached);
+        return Some((b64(&cached), mt));
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("[media_store] missing payload {name}: {e}");
+            return None;
+        }
+    };
+    match shrink_to(&bytes, REQUEST_IMAGE_SIDE) {
+        Some((small, mt)) => {
+            let _ = std::fs::write(&cache, &small);
+            tracing::info!(name, from = bytes.len(), to = small.len(), "[media_store] downscaled stored image for request");
+            Some((b64(&small), Some(mt)))
+        }
+        None => Some((b64(&bytes), None)),
+    }
+}
+
+/// Re-encode one image block (stored or inline) so its longest side is at most
+/// `cap`. Returns true when the block changed. Used by history repair when a
+/// provider names a lower pixel limit than [`REQUEST_IMAGE_SIDE`].
+pub fn shrink_block(block: &mut ContentBlock, cap: u32) -> bool {
+    let ContentBlock::Image { media_type, data, path } = block else {
+        return false;
+    };
+    let bytes = if !data.is_empty() {
+        base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok()
+    } else {
+        path.as_deref().and_then(path_for).and_then(|p| std::fs::read(p).ok())
+    };
+    let Some(bytes) = bytes else { return false };
+    let Some((small, mt)) = shrink_to(&bytes, cap) else { return false };
+    *media_type = mt.to_string();
+    match store_bytes(&small) {
+        Some(name) => {
+            *path = Some(name);
+            data.clear();
+        }
+        None => {
+            *path = None;
+            *data = base64::engine::general_purpose::STANDARD.encode(&small);
+        }
+    }
+    true
+}
+
 /// Refill inline `data` for every image block that only carries a `path`.
 /// Returns the number of blocks hydrated. A payload that has gone missing from
 /// disk leaves `data` empty rather than failing the whole turn — providers skip
 /// empty image blocks and the rest of the conversation still goes through.
+/// Images are capped at [`REQUEST_IMAGE_SIDE`] on the way out.
 pub fn hydrate(content: &mut [ContentBlock]) -> usize {
     let mut filled = 0;
     for block in content.iter_mut() {
-        if let ContentBlock::Image { data, path, .. } = block {
+        if let ContentBlock::Image { data, path, media_type } = block {
             if !data.is_empty() {
+                if path.is_none() {
+                    // Legacy inline payload: shrink in place if it's oversized.
+                    if let Some(raw) = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok() {
+                        if let Some((small, mt)) = shrink_to(&raw, REQUEST_IMAGE_SIDE) {
+                            *data = base64::engine::general_purpose::STANDARD.encode(&small);
+                            *media_type = mt.to_string();
+                        }
+                    }
+                }
                 continue;
             }
             let Some(name) = path.as_deref() else {
                 continue;
             };
-            if let Some(b64) = load_base64(name) {
+            if let Some((b64, mt)) = load_base64_for_request(name) {
                 *data = b64;
+                if let Some(mt) = mt {
+                    *media_type = mt.to_string();
+                }
                 filled += 1;
             }
         }

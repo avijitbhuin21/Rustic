@@ -9,6 +9,7 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
@@ -21,21 +22,21 @@ import { cn } from '@/lib/utils';
 function StatusBadge({ status }) {
   if (status.kind === 'bundled') {
     return (
-      <Badge variant="outline" className="h-5 gap-1 border-violet-500/40 bg-violet-500/10 px-1.5 text-[10px] text-violet-400">
+      <Badge variant="outline" className="h-5 gap-1 border-special/40 bg-special/10 px-1.5 text-[10px] text-special">
         <Check className="size-3" /> Bundled
       </Badge>
     );
   }
   if (status.kind === 'installed') {
     return (
-      <Badge variant="outline" className="h-5 gap-1 border-emerald-500/40 bg-emerald-500/10 px-1.5 text-[10px] text-emerald-500">
+      <Badge variant="outline" className="h-5 gap-1 border-success/40 bg-success/10 px-1.5 text-[10px] text-success">
         <Check className="size-3" /> Installed{status.installed_version ? ` ${status.installed_version}` : ''}
       </Badge>
     );
   }
   if (status.kind === 'detected') {
     return (
-      <Badge variant="outline" className="h-5 gap-1 border-sky-500/40 bg-sky-500/10 px-1.5 text-[10px] text-sky-500">
+      <Badge variant="outline" className="h-5 gap-1 border-info/40 bg-info/10 px-1.5 text-[10px] text-info">
         <Check className="size-3" /> Detected on PATH
       </Badge>
     );
@@ -136,12 +137,12 @@ function CustomFormatterDialog({ open, initial, onClose, onSaved }) {
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent aria-describedby={undefined} className="w-[520px] sm:max-w-[520px] gap-0 p-0 overflow-hidden">
         <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">
+          <DialogTitle className="flex items-center gap-1.5 text-[14px]">
             {isEdit ? `Edit "${initial.display_name}"` : 'Add custom formatter'}
+            <InfoTip side="bottom">
+              Define how to invoke an external formatter. Use <code className="text-[11px]">{'{file}'}</code> in args to substitute the file path; the source is piped via stdin when enabled.
+            </InfoTip>
           </DialogTitle>
-          <p className="text-[12px] text-muted-foreground mt-1">
-            Define how to invoke an external formatter. Use <code className="text-[11px]">{'{file}'}</code> in args to substitute the file path; the source is piped via stdin when enabled.
-          </p>
         </DialogHeader>
 
         <div className="px-5 py-4 space-y-3">
@@ -173,9 +174,9 @@ function CustomFormatterDialog({ open, initial, onClose, onSaved }) {
               className="h-7 text-xs" placeholder="--stdin-filepath {file} -" />
           </Field>
           <div className="flex items-center justify-between py-1">
-            <div className="flex flex-col">
+            <div className="flex items-center gap-1.5">
               <Label className="text-[13px] font-normal">Pipe source via stdin</Label>
-              <span className="text-[11px] text-muted-foreground">Disable if the formatter only reads from disk.</span>
+              <InfoTip>Disable if the formatter only reads from disk.</InfoTip>
             </div>
             <Switch checked={form.stdin}
               onCheckedChange={(v) => setForm((f) => ({ ...f, stdin: v }))} />
@@ -204,9 +205,11 @@ function CustomFormatterDialog({ open, initial, onClose, onSaved }) {
 function Field({ label, hint, children, disabled }) {
   return (
     <label className={cn('flex flex-col gap-1', disabled && 'opacity-60')}>
-      <span className="text-[12px] text-muted-foreground">{label}</span>
+      <span className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
+        {label}
+        <InfoTip>{hint}</InfoTip>
+      </span>
       {children}
-      {hint && <span className="text-[10px] text-muted-foreground/70">{hint}</span>}
     </label>
   );
 }
@@ -372,17 +375,13 @@ function Row({ entry, children }) {
         <div className="flex items-center gap-2">
           <span className="text-[13px] font-medium truncate">{meta.display_name}</span>
           <span className="text-[11px] text-muted-foreground truncate">{languages}</span>
+          <InfoTip>{meta.description}</InfoTip>
           {entry.custom && (
             <Badge variant="outline" className="h-4 px-1 text-[10px] text-muted-foreground border-border/60">
               Custom
             </Badge>
           )}
         </div>
-        {meta.description && (
-          <p className="text-[11px] italic text-muted-foreground/80 leading-snug truncate mt-0.5">
-            {meta.description}
-          </p>
-        )}
       </div>
       <div className="flex items-center gap-2 shrink-0">
         <StatusBadge status={entry.status} />

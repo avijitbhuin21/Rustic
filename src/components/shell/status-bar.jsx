@@ -16,6 +16,7 @@ import { useEditor } from '@/state/editor';
 import { useGithubAuth } from '@/state/github';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
+import { InfoTip } from '@/components/ui/info-tip';
 import {
   Dialog,
   DialogContent,
@@ -276,8 +277,14 @@ function ProcessManager() {
       </Tooltip>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Task Manager</DialogTitle>
-          <DialogDescription>
+          <DialogTitle className="flex items-center gap-1.5">
+            Task Manager
+            <InfoTip>
+              Processes running in this VM. Protected system processes (shown in red) can&apos;t be
+              stopped. Stopping a dev server, build, or agent is safe — your files aren&apos;t touched.
+            </InfoTip>
+          </DialogTitle>
+          <DialogDescription className="sr-only">
             Processes running in this VM. Protected system processes (shown in red) can&apos;t be
             stopped. Stopping a dev server, build, or agent is safe — your files aren&apos;t touched.
           </DialogDescription>

@@ -14,6 +14,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
+import { InfoTip } from '@/components/ui/info-tip';
 import { useGithubAuth } from '@/state/github';
 
 function PatPanel({ onSignedIn }) {
@@ -44,7 +45,13 @@ function PatPanel({ onSignedIn }) {
   return (
     <form onSubmit={submit} className="flex flex-col gap-3 py-2">
       <div className="flex flex-col gap-1.5">
-        <Label htmlFor="gh-pat">Personal Access Token</Label>
+        <div className="flex items-center gap-1.5">
+          <Label htmlFor="gh-pat">Personal Access Token</Label>
+          <InfoTip>
+            Needs the <code className="rounded bg-muted px-1 py-px text-[10px]">repo</code> scope (and{' '}
+            <code className="rounded bg-muted px-1 py-px text-[10px]">read:user</code> to show your username).
+          </InfoTip>
+        </div>
         <Input
           id="gh-pat"
           type="password"
@@ -55,10 +62,6 @@ function PatPanel({ onSignedIn }) {
           autoComplete="off"
           spellCheck={false}
         />
-        <p className="text-[11px] italic leading-snug text-muted-foreground">
-          Needs the <code className="rounded bg-muted px-1 py-px text-[10px]">repo</code> scope (and{' '}
-          <code className="rounded bg-muted px-1 py-px text-[10px]">read:user</code> to show your username).
-        </p>
       </div>
       <div className="flex items-center justify-between gap-2">
         <button
@@ -221,8 +224,9 @@ export default function GithubSignInDialog() {
           <DialogTitle className="flex items-center gap-2">
             <GithubIcon className="size-4" />
             Sign in to GitHub
+            <InfoTip>Connect Rustic to your GitHub account to publish, push, and pull repositories.</InfoTip>
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription className="sr-only">
             Connect Rustic to your GitHub account to publish, push, and pull repositories.
           </DialogDescription>
         </DialogHeader>

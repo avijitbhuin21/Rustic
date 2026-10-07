@@ -81,7 +81,7 @@ export function BrowserDevtools({ targetId }) {
 
   if (!src) {
     return (
-      <div className="flex h-full w-full items-center justify-center bg-[#1e1e1e] text-xs text-muted-foreground">
+      <div className="flex h-full w-full items-center justify-center bg-background text-xs text-muted-foreground">
         No active tab
       </div>
     );

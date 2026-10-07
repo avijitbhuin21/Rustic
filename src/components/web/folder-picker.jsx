@@ -148,7 +148,7 @@ export function FolderPicker({ open, options, onResolve }) {
     : 'Open file';
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 p-4" onMouseDown={() => onResolve(null)}>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-scrim/50 p-4" onMouseDown={() => onResolve(null)}>
       <div
         className="flex h-[560px] max-h-[88vh] w-[760px] max-w-[94vw] flex-col overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-2xl"
         onMouseDown={(e) => e.stopPropagation()}

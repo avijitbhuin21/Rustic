@@ -37,6 +37,7 @@ fn to_skill_info(s: &SkillDef) -> SkillInfo {
         scope: match s.scope {
             SkillScope::Project => "project".to_string(),
             SkillScope::Global => "global".to_string(),
+            SkillScope::Builtin => "builtin".to_string(),
         },
         allowed_tools: s.allowed_tools.clone(),
     }

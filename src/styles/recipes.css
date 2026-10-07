@@ -1,0 +1,125 @@
+/* Theme style recipes (theme pack `style`). The theme bridge sets
+   data-rt-* attributes / --rt-* vars on <html>; nothing here applies unless
+   the active theme opts in. Protected prompts ([data-rustic-protected]) are
+   always excluded so a theme can't restyle trust / permission dialogs. */
+
+/* ── Density: Tailwind v4 derives every spacing utility from --spacing ── */
+:root[data-rt-density="compact"] { --spacing: 0.225rem; }
+:root[data-rt-density="comfortable"] { --spacing: 0.28rem; }
+
+/* ── Border width on outlined controls and floating surfaces ── */
+:root[data-rt-border] :is(
+  [data-slot="button"][data-variant="outline"], [data-slot="input"], [data-slot="textarea"],
+  [data-slot="select-trigger"], [data-slot="tabs-list"], [data-slot="dialog-content"],
+  [data-slot="popover-content"], [data-slot="dropdown-menu-content"], [data-slot="context-menu-content"],
+  [data-slot="select-content"], [data-slot="sheet-content"]
+):not([data-rustic-protected], [data-rustic-protected] *) {
+  border-width: var(--rt-border-w);
+}
+
+/* ── Shadows on floating surfaces ── */
+:root[data-rt-shadow] :is(
+  [data-slot="dialog-content"], [data-slot="popover-content"], [data-slot="dropdown-menu-content"],
+  [data-slot="context-menu-content"], [data-slot="select-content"], [data-slot="sheet-content"],
+  [data-slot="tooltip-content"]
+):not([data-rustic-protected]) {
+  box-shadow: var(--rt-shadow);
+}
+:root[data-rt-shadow="none"] { --rt-shadow: none; }
+:root[data-rt-shadow="soft"] { --rt-shadow: 0 8px 24px -6px rgb(0 0 0 / 0.25); }
+:root[data-rt-shadow="strong"] { --rt-shadow: 0 18px 50px -10px rgb(0 0 0 / 0.55); }
+:root[data-rt-shadow="glow"] {
+  --rt-shadow:
+    0 0 0 1px color-mix(in oklab, var(--primary) 35%, transparent),
+    0 10px 40px -8px color-mix(in oklab, var(--primary) 40%, transparent);
+}
+:root[data-rt-shadow="hard"] { --rt-shadow: 4px 4px 0 0 var(--foreground); }
+:root[data-rt-shadow="hard"] :is(
+  [data-slot="dialog-content"], [data-slot="popover-content"], [data-slot="dropdown-menu-content"],
+  [data-slot="context-menu-content"], [data-slot="select-content"], [data-slot="input"],
+  [data-slot="textarea"], [data-slot="select-trigger"]
+):not([data-rustic-protected], [data-rustic-protected] *) {
+  border-color: var(--foreground);
+}
+
+/* ── Glass surfaces ── */
+:root[data-rt-surface="glass"] :is(
+  [data-slot="popover-content"], [data-slot="dropdown-menu-content"], [data-slot="context-menu-content"],
+  [data-slot="select-content"], [data-slot="tooltip-content"]
+) {
+  background-color: color-mix(in oklab, var(--popover) 72%, transparent);
+  backdrop-filter: blur(16px) saturate(1.4);
+}
+:root[data-rt-surface="glass"] :is([data-slot="dialog-content"], [data-slot="sheet-content"]):not([data-rustic-protected]) {
+  background-color: color-mix(in oklab, var(--background) 78%, transparent);
+  backdrop-filter: blur(20px) saturate(1.4);
+}
+:root[data-rt-surface="glass"] :is([data-slot="dialog-overlay"], [data-slot="sheet-overlay"]) {
+  backdrop-filter: blur(3px);
+}
+
+/* ── Buttons (ghost / link stay untouched: they are the dense toolbar icons) ── */
+:root[data-rt-button="pill"] [data-slot="button"]:not([data-rustic-protected] *) {
+  border-radius: 9999px;
+}
+
+:root[data-rt-button="raised"] [data-slot="button"]:is([data-variant="default"], [data-variant="secondary"], [data-variant="outline"], [data-variant="destructive"]):not([data-rustic-protected] *) {
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.14), 0 1px 2px rgb(0 0 0 / 0.3), 0 2px 6px -2px rgb(0 0 0 / 0.3);
+}
+:root[data-rt-button="raised"] [data-slot="button"]:is([data-variant="default"], [data-variant="secondary"], [data-variant="outline"], [data-variant="destructive"]):not([data-rustic-protected] *):hover {
+  transform: translateY(-1px);
+}
+
+:root[data-rt-button="brutal"] [data-slot="button"]:is([data-variant="default"], [data-variant="secondary"], [data-variant="outline"], [data-variant="destructive"]):not([data-rustic-protected] *) {
+  border: var(--rt-border-w, 2px) solid var(--foreground);
+  box-shadow: 3px 3px 0 0 var(--foreground);
+  font-weight: 700;
+  transition: transform 80ms ease, box-shadow 80ms ease;
+}
+:root[data-rt-button="brutal"] [data-slot="button"]:is([data-variant="default"], [data-variant="secondary"], [data-variant="outline"], [data-variant="destructive"]):not([data-rustic-protected] *):hover {
+  transform: translate(-1px, -1px);
+  box-shadow: 4px 4px 0 0 var(--foreground);
+}
+:root[data-rt-button="brutal"] [data-slot="button"]:is([data-variant="default"], [data-variant="secondary"], [data-variant="outline"], [data-variant="destructive"]):not([data-rustic-protected] *):active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 0 var(--foreground);
+}
+
+:root[data-rt-button="glow"] [data-slot="button"][data-variant="default"]:not([data-rustic-protected] *) {
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--primary) 60%, transparent), 0 0 14px -2px color-mix(in oklab, var(--primary) 55%, transparent);
+}
+:root[data-rt-button="glow"] [data-slot="button"][data-variant="default"]:not([data-rustic-protected] *):hover {
+  box-shadow: 0 0 0 1px var(--primary), 0 0 22px 0 color-mix(in oklab, var(--primary) 65%, transparent);
+}
+:root[data-rt-button="glow"] [data-slot="button"][data-variant="outline"]:not([data-rustic-protected] *) {
+  border-color: color-mix(in oklab, var(--primary) 45%, transparent);
+}
+:root[data-rt-button="glow"] [data-slot="button"][data-variant="outline"]:not([data-rustic-protected] *):hover {
+  box-shadow: 0 0 14px -4px color-mix(in oklab, var(--primary) 60%, transparent);
+}
+
+/* ── Background texture: a faint fixed overlay that never takes clicks ── */
+:root[data-rt-texture]:not([data-rt-texture="none"]) body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2147483000;
+}
+:root[data-rt-texture="grain"] body::after {
+  opacity: 0.07;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 1 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+:root[data-rt-texture="grid"] body::after {
+  background-image:
+    linear-gradient(color-mix(in oklab, var(--primary) 7%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in oklab, var(--primary) 7%, transparent) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+:root[data-rt-texture="dots"] body::after {
+  background-image: radial-gradient(color-mix(in oklab, var(--foreground) 10%, transparent) 1px, transparent 1.4px);
+  background-size: 18px 18px;
+}
+:root[data-rt-texture="scanlines"] body::after {
+  background-image: repeating-linear-gradient(0deg, color-mix(in oklab, var(--foreground) 5%, transparent) 0 1px, transparent 1px 3px);
+}

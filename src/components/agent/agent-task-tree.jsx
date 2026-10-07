@@ -157,7 +157,7 @@ function TaskRow({
           className="flex size-3 shrink-0 items-center justify-center"
         >
           {task.pinned ? (
-            <Star className={cn('size-3 fill-amber-400 text-amber-400', running && 'animate-pulse')} />
+            <Star className={cn('size-3 fill-warning text-warning', running && 'animate-pulse')} />
           ) : running ? (
             <Loader2 className="size-3 animate-spin text-primary" />
           ) : (

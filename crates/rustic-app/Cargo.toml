@@ -53,5 +53,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 [lints]
 workspace = true
 
+[build-dependencies]
+serde_json = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "time"] }

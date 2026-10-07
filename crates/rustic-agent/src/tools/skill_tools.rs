@@ -68,6 +68,14 @@ async fn read_skill(params: Value, context: &ToolContext) -> Result<ToolOutput> 
             is_error: true,
             attachments: Vec::new(),
         }),
+        Some(skill_def) if skill_def.scope == crate::skills::SkillScope::Builtin => {
+            let text = crate::skills::builtin_skill_text(&skill_def.name).unwrap_or_default();
+            Ok(ToolOutput {
+                content: format!("# Skill: {}\n\n{}", skill_def.name, skill_body(text)),
+                is_error: false,
+                attachments: Vec::new(),
+            })
+        }
         Some(skill_def) => match std::fs::read_to_string(&skill_def.path) {
             Ok(content) => {
                 let body = skill_body(&content);
