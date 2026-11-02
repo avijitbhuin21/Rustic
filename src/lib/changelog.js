@@ -2,6 +2,20 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.7.7',
+    date: 'November 2026',
+    entries: [
+      { tag: 'new', text: 'macOS — the maximise button enters a clean full screen (no title strip dropping down), with rounded top corners that follow the display; the window keeps square corners otherwise.' },
+      { tag: 'fixed', text: 'macOS — the microphone works (Rustic now asks for microphone permission).' },
+      { tag: 'improved', text: 'macOS — ⌘ shortcuts work everywhere (⌘P, ⌘B, ⌘S…) and hints show ⌘. Terminal uses ⌘C/⌘V, passes Ctrl keys to the shell, and supports ⌘/⌥ + arrows/backspace line editing, with an optional "Option as Meta" setting.' },
+      { tag: 'fixed', text: 'macOS — tools from your shell profile (node, npx, bun, formatters, MCP servers, CLI agents) are found when Rustic is opened from the Dock or Finder. ⌘Q goes through the normal quit path.' },
+      { tag: 'new', text: 'Restore last session now works: open files (including splits), the active chat and project reopen when you restart. "Confirm before quit" now asks before closing.' },
+      { tag: 'improved', text: 'Security hardening — LAN pairing tokens are stored hashed, the web server refuses to serve internal data files, Docker runs as a non-root user, and CI actions are pinned.' },
+      { tag: 'improved', text: 'Faster — read-only database connections for reads and a single file watcher per project.' },
+      { tag: 'fixed', text: 'LAN push from macOS/Linux no longer fails with "No such file".' },
+    ],
+  },
+  {
     version: '0.7.6',
     date: 'October 2026',
     entries: [
