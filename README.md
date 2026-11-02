@@ -31,6 +31,13 @@ bundled SQLite, `portable-pty` for terminals).
 - **Multi-project workspace**, file explorer (`react-arborist`), global search,
   and git integration.
 - **Secrets in the OS keychain** — API keys never reach the webview.
+- **External CLI agents** — run Claude Code, Codex and Antigravity as chats in
+  the agent panel (hidden PTYs, session tracking via hooks).
+- **Cloud & LAN sync** — push/pull projects or metadata to a self-hosted
+  `rustic-server`, or directly between machines on the same network (paired,
+  TLS-pinned).
+- **Self-hosting** — `rustic-server` serves the same UI headlessly over HTTPS
+  (see `rustic-server/README.md` and the root `Dockerfile`).
 
 ## Quick start
 
@@ -58,20 +65,24 @@ State-mutating git operations (commit, merge, rebase, clone) shell out to the
 
 ```
 crates/
+  rustic-io/          Shared IO helpers (atomic writes, encoding)
   rustic-core/        Editor primitives: rope buffer, search, formatter, LSP, workspace
   rustic-treesitter/  Tree-sitter grammars + incremental highlighting
   rustic-db/          SQLite (rusqlite) storage: tasks, checkpoints, settings, projects (WAL + transactional migrations)
   rustic-git/         Pure-Rust git via gix: status, diff, log, shadow repo for checkpoints
   rustic-terminal/    PTY backend (ConPTY on Windows / portable-pty elsewhere)
   rustic-agent/       AI agent: providers, MCP, tools, skills, workflows, sub-agents, checkpoints
+  rustic-app/         Host-agnostic app layer shared by desktop + server: state, sync, LAN peers, watchers
 src-tauri/            Tauri 2 shell: command handlers, app lifecycle, IPC
+rustic-server/        Headless axum server hosting the same frontend over HTTP/WebSocket
 src/                  React 19 frontend (Vite + Tailwind 4 + Radix UI)
   components/         editor (Monaco), agent chat, explorer, terminal (xterm.js), settings, onboarding
   state/              Zustand stores: agent, editor, workspace, terminal, settings, models, …
   lib/                Tauri-API wrappers, commands, clipboard, markdown, utils
   styles/             Tailwind layers + global CSS
-docs/                 Design decisions, perf findings, educated guesses
-audit-report/         Standing performance-audit tracking
+vendor/lattice-merge/ Vendored 3-way structural merge used by the concurrent-write guard
+website/              Standalone marketing site (separate Railway service)
+deploy/               Caddyfile + container entrypoint
 ```
 
 ## Architecture notes
@@ -90,13 +101,15 @@ audit-report/         Standing performance-audit tracking
 - **Checkpoints** — every user message opens a whole-project snapshot in a `gix`
   shadow repo; reverting restores files from the snapshot mirror and truncates the
   chat to that point.
-- **Secrets** — API keys live in the OS keychain (`keyring` crate). The webview
-  only ever sees the sentinel `"__STORED__"`; the backend resolves the real key.
+- **Secrets** — on desktop, API keys live in the OS keychain (`keyring` crate);
+  `rustic-server` stores them in `<data_dir>/secrets.json` or reads
+  `RUSTIC_SECRET_*` env vars. The webview only ever sees the sentinel
+  `"__STORED__"`; the backend resolves the real key.
 - **Safe file writes** — every save goes through `atomic_write` (temp + fsync +
   rename) so a crash mid-write can't corrupt source files.
 - **Path scope** — agent tools refuse paths resolving outside the project root
   after canonicalization; filesystem commands refuse system directories
-  (`src-tauri/src/path_scope.rs`).
+  (`crates/rustic-app/src/path_scope.rs`).
 
 ## Security & privacy
 
@@ -111,13 +124,12 @@ audit-report/         Standing performance-audit tracking
 ## Building & distribution
 
 `bun run tauri build` produces locally-installable bundles (on Windows: an NSIS
-`*_x64-setup.exe` and an MSI). A few production concerns are intentionally **not**
-configured yet:
+`*_x64-setup.exe` and an MSI). Tagged releases are built by
+`.github/workflows/release.yml`, which signs update artifacts for the built-in
+auto-updater (`tauri-plugin-updater`). Still not configured:
 
-- **Code signing** — builds are unsigned, so Windows SmartScreen warns on install.
-  Enabling it needs a code-signing certificate and `bundle.windows` config.
-- **Auto-updater** — not wired up. Enabling it needs `tauri-plugin-updater`, a
-  signing keypair, and a hosted `latest.json` manifest.
+- **Code signing** — installers are not Authenticode-signed, so Windows
+  SmartScreen warns on install.
 - **Cross-platform** — primary development and CI are on Windows; macOS/Linux
   paths (default shell selection, line endings, file watching) are largely
   untested.

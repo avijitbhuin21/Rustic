@@ -76,14 +76,14 @@ fn summarize(body: &str) -> String {
     }
 }
 
-#[tauri::command]
-pub fn list_skills() -> Result<Vec<SkillInfo>, String> {
+#[tauri::command(async)]
+pub fn  list_skills() -> Result<Vec<SkillInfo>, String> {
     let skills = discover_global_skills();
     Ok(skills.iter().map(to_skill_info).collect())
 }
 
-#[tauri::command]
-pub fn get_skill_body(name: String) -> Result<String, String> {
+#[tauri::command(async)]
+pub fn  get_skill_body(name: String) -> Result<String, String> {
     validate_simple_name(&name)?;
     let skills = discover_global_skills();
     let skill = skills
@@ -94,8 +94,8 @@ pub fn get_skill_body(name: String) -> Result<String, String> {
     Ok(skill_body(&content).to_string())
 }
 
-#[tauri::command]
-pub fn create_skill(name: String, body: String) -> Result<SkillInfo, String> {
+#[tauri::command(async)]
+pub fn  create_skill(name: String, body: String) -> Result<SkillInfo, String> {
     let root = skills_root()?;
     let safe_name = sanitize_name(&name);
     if safe_name.is_empty() {
@@ -129,8 +129,8 @@ pub fn create_skill(name: String, body: String) -> Result<SkillInfo, String> {
 /// Update an existing skill. If `name` differs from `original_name`, the
 /// underlying folder is renamed. Rewrites SKILL.md with the new frontmatter
 /// and body.
-#[tauri::command]
-pub fn update_skill(
+#[tauri::command(async)]
+pub fn  update_skill(
     original_name: String,
     name: String,
     body: String,
@@ -176,8 +176,8 @@ pub fn update_skill(
     })
 }
 
-#[tauri::command]
-pub fn delete_skill(name: String) -> Result<(), String> {
+#[tauri::command(async)]
+pub fn  delete_skill(name: String) -> Result<(), String> {
     validate_simple_name(&name)?;
     let root = skills_root()?;
     let skill_dir = root.join(&name);
@@ -550,7 +550,11 @@ fn extract_skills_from_zip(
             } else {
                 &entry_name[dir_prefix.len()..]
             };
-            if relative.is_empty() || relative.contains('/') {
+            if relative.is_empty()
+                || relative.contains(['/', '\\', ':'])
+                || relative == "."
+                || relative == ".."
+            {
                 continue;
             }
             let out_path = skill_out_dir.join(relative);

@@ -421,14 +421,14 @@ export function CloudSettings() {
   useEffect(() => {
     if (!lanEnabled) { setDevices([]); return undefined; }
     refreshDevices();
-    const t = setInterval(refreshDevices, 3000);
+    const t = setInterval(() => { if (!document.hidden) refreshDevices(); }, 3000);
     return () => clearInterval(t);
   }, [lanEnabled, refreshDevices]);
   useEffect(() => {
     if (IS_WEB) return undefined;
     const load = () => invoke('remote_backend_open_urls').then((u) => setOpenOrigins(Array.isArray(u) ? u : [])).catch(() => {});
     load();
-    const t = setInterval(load, 3000);
+    const t = setInterval(() => { if (!document.hidden) load(); }, 3000);
     return () => clearInterval(t);
   }, []);
   const backendUrls = backends.map((b) => b.url).join('\n');

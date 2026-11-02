@@ -138,21 +138,26 @@ pub fn get_or_create_handle(
         .map_err(|e| format!("FileHistory::new: {e}"))?,
     );
 
-    // Watcher registration may fail on resource-constrained systems (Linux
-    // inotify limit, network drives without poll fallback). We log and
-    // continue — the sweep will revert to the libgit2-era full-walk path.
-    let watcher = match rustic_agent::FileWatcher::spawn(
+    // The OS watch is owned by `FileWatcherManager` (one per project, shared
+    // with the UI fs-change pipeline); this only builds the debounced
+    // file-history consumer and subscribes it.
+    let watcher = match rustic_agent::FileWatcher::attach(
         project_root.to_path_buf(),
         Arc::clone(&accumulator),
     ) {
-        Ok(w) => Some(Arc::new(w)),
+        Ok((w, feed)) => {
+            state
+                .file_watcher
+                .lock()
+                .map_err(|e| format!("file_watcher mutex poisoned: {e}"))?
+                .subscribe_file_history(project_root, feed);
+            Some(Arc::new(w))
+        }
         Err(e) => {
             tracing::warn!(
                 root = %project_root.display(),
                 ?e,
-                "fs watcher registration failed — falling back to full-walk sweeps. \
-                 On Linux this is often the per-user inotify watch limit; raise it \
-                 with: echo fs.inotify.max_user_watches=524288 | sudo tee /etc/sysctl.d/40-watches.conf && sudo sysctl --system"
+                "file-history watcher setup failed — falling back to full-walk sweeps"
             );
             None
         }

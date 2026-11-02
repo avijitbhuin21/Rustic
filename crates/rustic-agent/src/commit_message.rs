@@ -109,7 +109,7 @@ pub async fn generate_commit_message(
         content: vec![ContentBlock::Text { text: user_prompt }],
     }];
     let response = provider
-        .chat(messages, Vec::new(), &config, None)
+        .chat(&messages, &[], &config, None)
         .await
         .map_err(|e| e.to_string())?;
 

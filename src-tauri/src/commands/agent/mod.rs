@@ -53,7 +53,7 @@ pub struct TurnUsage {
 /// `content` holds display stubs (see `rustic_agent::history_dto`), not raw
 /// `ContentBlock`s: oversized text is truncated and image payloads are dropped,
 /// each carrying a marker the UI uses to fetch the full block on demand.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct MessageDto {
     pub role: String,
     pub content: Vec<serde_json::Value>,
@@ -401,7 +401,6 @@ pub async fn create_task(
                 sensitive_files_allowed: false,
                 is_plan_mode: false,
                 shared_permissions: None,
-                cost: Default::default(),
                 goal: rustic_agent::task::goal::new_goal_slot(),
                 last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
@@ -2632,22 +2631,23 @@ pub fn list_tasks(
             .find(|p| p.id.to_string() == *pid)
             .map(|p| p.root_path.to_string_lossy().to_string())
     });
-    let db = state.db.lock_safe();
     let rows = if let Some(ref pid) = project_id {
-        let mut rows = db.list_tasks_for_project(pid).map_err(|e| e.to_string())?;
-        // First-send persistence maps the task to the DB project that owns
-        // this root path, which can have a different id than the workspace
-        // project (issue #1). Include those rows so the chat isn't orphaned.
-        if let Some(root) = pid_root {
-            if let Ok(Some(alias)) = db.get_project_by_path(&root) {
-                if alias.id != *pid {
-                    if let Ok(extra) = db.list_tasks_for_project(&alias.id) {
-                        rows.extend(extra);
+        state.read_db(|db| -> Result<_, String> {
+            let mut rows = db.list_tasks_for_project(pid).map_err(|e| e.to_string())?;
+            // First-send persistence maps the task to the DB project that owns
+            // this root path, which can have a different id than the workspace
+            // project (issue #1). Include those rows so the chat isn't orphaned.
+            if let Some(root) = pid_root {
+                if let Ok(Some(alias)) = db.get_project_by_path(&root) {
+                    if alias.id != *pid {
+                        if let Ok(extra) = db.list_tasks_for_project(&alias.id) {
+                            rows.extend(extra);
+                        }
                     }
                 }
             }
-        }
-        rows
+            Ok(rows)
+        })?
     } else {
         // No project filter: load all in-memory tasks as fallback
         let agent = state.agent.lock_safe();
@@ -2656,18 +2656,20 @@ pub fn list_tasks(
 
     // Treat any DB-persisted "Running" tasks as Completed — they cannot be running
     // after a fresh app start (they were left over from a crashed session).
-    for row in &rows {
-        if row.status == "Running" || row.status == "Waiting" {
-            tracing::warn!(
-                target: "rustic::list_tasks",
-                task = %row.id,
-                db_status = %row.status,
-                "found stale Running/Waiting task on startup — defensively marking Completed",
-            );
-            let _ = db.update_task_status(&row.id, "Completed");
+    if rows.iter().any(|r| r.status == "Running" || r.status == "Waiting") {
+        let db = state.db.lock_safe();
+        for row in &rows {
+            if row.status == "Running" || row.status == "Waiting" {
+                tracing::warn!(
+                    target: "rustic::list_tasks",
+                    task = %row.id,
+                    db_status = %row.status,
+                    "found stale Running/Waiting task on startup — defensively marking Completed",
+                );
+                let _ = db.update_task_status(&row.id, "Completed");
+            }
         }
     }
-    drop(db);
 
     let mut agent = state.agent.lock_safe();
     for row in &rows {
@@ -2779,7 +2781,6 @@ pub fn list_tasks(
                     sensitive_files_allowed: false,
                     is_plan_mode: false,
                     shared_permissions: None,
-                    cost,
                     goal: std::sync::Arc::new(std::sync::Mutex::new(row.goal.clone().map(
                         |condition| rustic_agent::task::goal::GoalState {
                             condition,
@@ -2954,34 +2955,34 @@ fn merge_archived_history(archived: Vec<MessageDto>, current: Vec<MessageDto>) -
     out
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_task_messages(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Vec<MessageDto>, String> {
-    // If task is in memory and has messages, return those (turn_usage not included
-    // here — the frontend already has it from the live session's RequestUsage events).
     // Synthetic executor-injected user messages (sub-agent result blocks, terminal
     // exit notices, orchestrator nudges) are stripped from the DTO so the frontend
-    // never renders them as visible chat bubbles — they were never emitted as stream
-    // events during live execution so the UI didn't show them then either.
+    // never renders them as visible chat bubbles.
+    let times: std::collections::HashMap<i64, String> = state
+        .read_db(|db| db.get_message_times(&task_id).unwrap_or_default())
+        .into_iter()
+        .collect();
     let mem_dtos: Option<Vec<MessageDto>> = {
-        // Timestamps live only in the DB; pull them up front so the in-memory
-        // fast path can still hand the frontend real per-message times.
-        let times: std::collections::HashMap<i64, String> = {
-            let db = state.db.lock_safe();
-            db.get_message_times(&task_id)
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        };
         let agent = state.agent.lock_safe();
         agent
             .tasks
             .get(&task_id)
             .filter(|task| !task.messages.is_empty())
             .map(|task| {
-                task.messages
+                let fingerprint = rustic_agent::history_dto::history_fingerprint(&task.messages);
+                let mut cache = message_dto_cache().lock_safe();
+                if let Some((cached_fp, cached)) = cache.get(&task_id) {
+                    if *cached_fp == fingerprint {
+                        return cached.clone();
+                    }
+                }
+                let built: Vec<MessageDto> = task
+                    .messages
                     .iter()
                     .enumerate()
                     .filter_map(|(i, m)| {
@@ -2995,25 +2996,28 @@ pub fn get_task_messages(
                             content: rustic_agent::history_dto::slim_content(&clean),
                             turn_usage: None,
                             sort_order: Some(i as i64),
-                            created_at: times.get(&(i as i64)).cloned(),
+                            created_at: None,
                         })
                     })
-                    .collect()
+                    .collect();
+                if cache.len() >= MESSAGE_DTO_CACHE_CAP {
+                    cache.clear();
+                }
+                cache.insert(task_id.clone(), (fingerprint, built.clone()));
+                built
             })
     };
-    if let Some(dtos) = mem_dtos {
-        let db = state.db.lock_safe();
-        let archived = archived_history_dtos(&db, &task_id);
-        drop(db);
+    if let Some(mut dtos) = mem_dtos {
+        for dto in dtos.iter_mut() {
+            dto.created_at = dto.sort_order.and_then(|i| times.get(&i).cloned());
+        }
+        let archived = state.read_db(|db| archived_history_dtos(db, &task_id));
         return Ok(merge_archived_history(archived, dtos));
     }
 
-    // Load from DB and deserialize
-    let db = state.db.lock_safe();
-    let rows = db
-        .get_messages_for_task(&task_id)
+    let rows = state
+        .read_db(|db| db.get_messages_for_task(&task_id))
         .map_err(|e| e.to_string())?;
-    drop(db);
 
     let mut dtos = Vec::new();
     let mut messages_for_cache = Vec::new();
@@ -3058,10 +3062,19 @@ pub fn get_task_messages(
         }
     }
 
-    let db = state.db.lock_safe();
-    let archived = archived_history_dtos(&db, &task_id);
-    drop(db);
+    let archived = state.read_db(|db| archived_history_dtos(db, &task_id));
     Ok(merge_archived_history(archived, dtos))
+}
+
+const MESSAGE_DTO_CACHE_CAP: usize = 32;
+
+/// Per-task cache of slimmed in-memory transcripts, keyed by an exact history fingerprint.
+fn message_dto_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<MessageDto>)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<MessageDto>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
 /// Read the persisted todo list for a task. Returns an empty list when the
@@ -3074,7 +3087,7 @@ pub fn get_task_messages(
 ///
 /// Reads a single row rather than the task's history: the whole point of the
 /// slimmed DTO is that no caller has to pay for the full transcript.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_message_block(
     state: State<'_, AppState>,
     task_id: String,
@@ -3095,25 +3108,23 @@ pub fn get_message_block(
         }
     }
 
-    let db = state.db.lock_safe();
-    let json = db
-        .get_message_content(&task_id, sort_order)
+    let json = state
+        .read_db(|db| db.get_message_content(&task_id, sort_order))
         .map_err(|e| e.to_string())?;
-    drop(db);
     let json = json.ok_or_else(|| format!("no message at sort_order {sort_order}"))?;
     let content: Vec<ContentBlock> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
     rustic_agent::history_dto::full_block(&content, block_index)
         .ok_or_else(|| format!("no block at index {block_index}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_task_todos(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Vec<TodoItem>, String> {
-    let db = state.db.lock_safe();
-    let json = db.get_task_todos(&task_id).map_err(|e| e.to_string())?;
-    drop(db);
+    let json = state
+        .read_db(|db| db.get_task_todos(&task_id))
+        .map_err(|e| e.to_string())?;
     let Some(json) = json else {
         return Ok(Vec::new());
     };
@@ -3129,7 +3140,7 @@ pub fn get_task_todos(
 /// from message N (zero-indexed), the frontend asks for `keep_count = N` so
 /// message N and every later message are dropped — the user message text is
 /// loaded back into the input box on the frontend side.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn truncate_task_messages(
     state: State<'_, AppState>,
     task_id: String,
@@ -3168,7 +3179,7 @@ pub struct RepairOutcome {
     pub summary: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn repair_task_history(
     state: State<'_, AppState>,
     task_id: String,
@@ -3416,7 +3427,7 @@ pub async fn delete_tasks_for_project(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rename_task(
     state: State<'_, AppState>,
     task_id: String,
@@ -3433,7 +3444,7 @@ pub fn rename_task(
 }
 
 /// Toggle a task's sticky-note pin; pinned tasks stay at the top of the task tree.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_task_pinned(
     state: State<'_, AppState>,
     task_id: String,
@@ -3452,7 +3463,7 @@ pub fn set_task_pinned(
 
 /// Set or clear a task's /goal condition. Returns the kickoff message the
 /// frontend should send as the goal's first turn when setting; None on clear.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_task_goal(
     state: State<'_, AppState>,
     task_id: String,
@@ -3481,7 +3492,7 @@ pub fn set_task_goal(
     Ok(goal.map(|c| rustic_agent::task::goal::kickoff_message(&c)))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_ai_provider(
     state: State<'_, AppState>,
     provider_type: String,
@@ -3998,7 +4009,7 @@ pub fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, String> {
 
 /// Probe for a local FreeBuff (codebuff CLI) login. Read-only; drives the
 /// Settings FreeBuff toggle. Returns `{available, email, reason}`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn detect_freebuff() -> rustic_agent::provider::freebuff::DetectInfo {
     rustic_agent::provider::freebuff::detect()
 }
@@ -4173,7 +4184,7 @@ pub fn set_tool_config(state: State<'_, AppState>, config: ToolConfig) -> Result
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_ai_provider(state: State<'_, AppState>, provider_key: String) -> Result<(), String> {
     let mut agent = state.agent.lock_safe();
 

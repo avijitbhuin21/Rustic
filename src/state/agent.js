@@ -603,13 +603,6 @@ function applySnapshotAnchors(messages, snapshots) {
     };
   });
   
-  // eslint-disable-next-line no-console
-  console.log('[applySnapshotAnchors] Applied snapshots', {
-    messagesCount: messages.length,
-    snapshotsCount: snapshots.length,
-    userMessagesWithSnapshots: result.filter(m => m.role === 'user' && m.snapshotMessageId).length,
-    userMessagesTotal: result.filter(m => m.role === 'user').length,
-  });
 
   return result;
 }
@@ -1063,12 +1056,6 @@ export const useAgent = create((set, get) => ({
     const prev = get().activeProject;
     if (prev.id === next.id) return;
 
-    console.log('[agent.setActiveProject] switching projects', {
-      from: prev.id,
-      to: next.id,
-      preservingTasks: Object.keys(get().messagesByTask),
-    });
-
     // Preserve state for tasks in both the previous AND next project when switching.
     // This keeps the chat history in memory so we don't have to reload from DB.
     const preserveTaskIds = new Set();
@@ -1105,10 +1092,6 @@ export const useAgent = create((set, get) => ({
       return filtered;
     };
 
-    console.log('[agent.setActiveProject] preserving state for tasks', {
-      preservedTaskIds: Array.from(preserveTaskIds),
-      messagesKept: Object.keys(filterState(get().messagesByTask)),
-    });
 
     set((s) => ({
       activeProject: next,
@@ -3325,12 +3308,6 @@ export const useAgent = create((set, get) => ({
         const taskId = p.task_id;
         if (!taskId) return;
 
-        // Log for debugging
-        if (p.original_messages && p.condensed_to) {
-          // eslint-disable-next-line no-console
-          console.log(`[agent] Context condensed: ${p.original_messages} → ${p.condensed_to} messages`);
-        }
-
         // Clear the condensing flag and send any queued message
         get()._flushCondenseQueue(taskId);
       },
@@ -3557,10 +3534,7 @@ export const useAgent = create((set, get) => ({
         // them to the real per-file values.
         const taskId = p.task_id;
         const paths = Array.isArray(p.paths) ? p.paths : [];
-        
-        // eslint-disable-next-line no-console
-        console.log('[agent] agent-file-tracked event', { taskId, pathCount: paths.length, paths });
-        
+                
         if (!taskId || paths.length === 0) return;
         set((s) => {
           const prev = s.filesByTask[taskId] || { entries: [], lastMessageId: null };

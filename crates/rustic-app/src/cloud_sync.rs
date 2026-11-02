@@ -1175,6 +1175,9 @@ pub fn apply_sync_archive_from(
     // 4. Swap the live DB. A temporary in-memory handle releases the file so
     //    it can be replaced on Windows; reopening runs any newer migrations.
     let db_path = data_dir.join("rustic.db");
+    if let Some(pool) = &state.db_read {
+        pool.clear();
+    }
     {
         let mut db = state.db.lock_safe();
         let _ = db.checkpoint_truncate();

@@ -25,6 +25,29 @@ use serde_json::{json, Value};
 /// transcript of truncated blocks stays a few hundred KB.
 pub const BLOCK_TRUNCATE_BYTES: usize = 24 * 1024;
 
+struct HashWriter(std::collections::hash_map::DefaultHasher);
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::hash::Hasher::write(&mut self.0, buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Exact 64-bit fingerprint of a message history, streamed through serde without allocating the JSON.
+pub fn history_fingerprint(messages: &[crate::provider::Message]) -> u64 {
+    let mut w = HashWriter(std::collections::hash_map::DefaultHasher::new());
+    std::hash::Hasher::write_usize(&mut w.0, messages.len());
+    for m in messages {
+        let _ = serde_json::to_writer(&mut w, m);
+    }
+    std::hash::Hasher::finish(&w.0)
+}
+
 /// Truncate `s` to at most `BLOCK_TRUNCATE_BYTES`, respecting UTF-8 boundaries.
 /// Returns `None` when it already fits.
 fn cut(s: &str) -> Option<String> {
@@ -217,6 +240,23 @@ pub fn full_block(content: &[ContentBlock], index: usize) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_fingerprint_tracks_any_change() {
+        use crate::provider::{Message, Role};
+        let msg = |role: Role, text: &str| Message {
+            role,
+            content: vec![ContentBlock::Text { text: text.to_string() }],
+        };
+        let a = vec![msg(Role::User, "hello"), msg(Role::Assistant, "hi")];
+        let same = vec![msg(Role::User, "hello"), msg(Role::Assistant, "hi")];
+        assert_eq!(history_fingerprint(&a), history_fingerprint(&same));
+        let edited = vec![msg(Role::User, "hello"), msg(Role::Assistant, "hj")];
+        assert_ne!(history_fingerprint(&a), history_fingerprint(&edited));
+        let role_flip = vec![msg(Role::User, "hello"), msg(Role::User, "hi")];
+        assert_ne!(history_fingerprint(&a), history_fingerprint(&role_flip));
+        assert_ne!(history_fingerprint(&a), history_fingerprint(&a[..1]));
+    }
 
     #[test]
     fn short_blocks_pass_through_untouched() {

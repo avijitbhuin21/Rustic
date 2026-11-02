@@ -49,13 +49,13 @@ export function StreamRetryBanner() {
     }
   };
 
-  // Tick state purely so the countdown re-renders every 250 ms. The actual
+  // Tick state purely so the countdown re-renders every second. The actual
   // remaining-time math derives from retry.started_at_ms + retry.waiting_ms
   // so we never drift from wall clock.
   const [, setTick] = useState(0);
   useEffect(() => {
     if (!retry && !slow) return;
-    const id = setInterval(() => setTick((t) => t + 1), 250);
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(id);
   }, [retry, slow]);
 

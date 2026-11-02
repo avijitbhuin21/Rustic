@@ -192,11 +192,11 @@ pub async fn evaluate_goal(
 
     let response = provider
         .chat(
-            vec![Message {
+            &[Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: user_message }],
             }],
-            vec![],
+            &[],
             &eval_config,
             None,
         )

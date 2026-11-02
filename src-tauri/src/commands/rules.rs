@@ -92,15 +92,15 @@ fn to_info(rule: &RuleDef, project_root: Option<&std::path::Path>) -> RuleInfo {
     }
 }
 
-#[tauri::command]
-pub fn list_rules(project_root: Option<String>) -> Result<Vec<RuleInfo>, String> {
+#[tauri::command(async)]
+pub fn  list_rules(project_root: Option<String>) -> Result<Vec<RuleInfo>, String> {
     let rules = discover_global_rules();
     let root_buf = project_root.as_deref().map(std::path::Path::new);
     Ok(rules.iter().map(|r| to_info(r, root_buf)).collect())
 }
 
-#[tauri::command]
-pub fn get_rule_body(name: String) -> Result<String, String> {
+#[tauri::command(async)]
+pub fn  get_rule_body(name: String) -> Result<String, String> {
     validate_simple_name(&name)?;
     let rules = discover_global_rules();
     let rule = rules
@@ -111,8 +111,8 @@ pub fn get_rule_body(name: String) -> Result<String, String> {
     Ok(rule_body(&content).to_string())
 }
 
-#[tauri::command]
-pub fn create_rule(name: String, body: String) -> Result<RuleInfo, String> {
+#[tauri::command(async)]
+pub fn  create_rule(name: String, body: String) -> Result<RuleInfo, String> {
     let root = rules_root()?;
     let safe_name = sanitize_name(&name);
     if safe_name.is_empty() {
@@ -140,8 +140,8 @@ pub fn create_rule(name: String, body: String) -> Result<RuleInfo, String> {
     })
 }
 
-#[tauri::command]
-pub fn update_rule(original_name: String, name: String, body: String) -> Result<RuleInfo, String> {
+#[tauri::command(async)]
+pub fn  update_rule(original_name: String, name: String, body: String) -> Result<RuleInfo, String> {
     validate_simple_name(&original_name)?;
     let root = rules_root()?;
     let original_path = root.join(format!("{}.md", original_name));
@@ -211,8 +211,8 @@ pub fn update_rule(original_name: String, name: String, body: String) -> Result<
     })
 }
 
-#[tauri::command]
-pub fn delete_rule(name: String) -> Result<(), String> {
+#[tauri::command(async)]
+pub fn  delete_rule(name: String) -> Result<(), String> {
     validate_simple_name(&name)?;
     let root = rules_root()?;
     let path = root.join(format!("{}.md", name));
@@ -229,8 +229,8 @@ pub fn delete_rule(name: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn set_rule_activation(
+#[tauri::command(async)]
+pub fn  set_rule_activation(
     name: String,
     state: String,
     project_root: Option<String>,
@@ -263,8 +263,8 @@ pub fn set_rule_activation(
 /// from `active_global` too). Used by the Rules settings panel's project
 /// picker — the user checks one or more projects from a list and we
 /// replace the rule's project membership wholesale.
-#[tauri::command]
-pub fn set_rule_projects(name: String, project_roots: Vec<String>) -> Result<RuleInfo, String> {
+#[tauri::command(async)]
+pub fn  set_rule_projects(name: String, project_roots: Vec<String>) -> Result<RuleInfo, String> {
     validate_simple_name(&name)?;
     let bufs: Vec<PathBuf> = project_roots
         .into_iter()

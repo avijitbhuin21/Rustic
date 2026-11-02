@@ -278,7 +278,7 @@ fn which(binary: &str) -> Option<PathBuf> {
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn formatter_list(
     app: AppHandle,
     state: State<'_, AppState>,

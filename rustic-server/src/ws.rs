@@ -27,9 +27,8 @@ async fn client_loop(mut socket: WebSocket, shared: Arc<Shared>) {
         tokio::select! {
             // Server → client: forward every published event as JSON text.
             recv = rx.recv() => match recv {
-                Ok(msg) => {
-                    let Ok(text) = serde_json::to_string(&msg) else { continue };
-                    if socket.send(Message::Text(text)).await.is_err() {
+                Ok(text) => {
+                    if socket.send(Message::Text(text.to_string())).await.is_err() {
                         break; // client went away
                     }
                 }

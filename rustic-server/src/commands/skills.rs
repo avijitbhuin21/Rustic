@@ -598,7 +598,11 @@ fn extract_skills_from_zip(
             } else {
                 &entry_name[dir_prefix.len()..]
             };
-            if relative.is_empty() || relative.contains('/') {
+            if relative.is_empty()
+                || relative.contains(['/', '\\', ':'])
+                || relative == "."
+                || relative == ".."
+            {
                 continue;
             }
             let out_path = skill_out_dir.join(relative);

@@ -62,7 +62,7 @@ fn project_root_for(state: &State<'_, AppState>, project_id: &str) -> Result<Pat
 /// Returns a human-readable view of the project's memory: the index followed by
 /// each fragment file's contents. Falls back to the legacy single file. Used by
 /// the memory viewer UI.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_memory(state: State<'_, AppState>, project_id: String) -> Result<String, String> {
     let root = project_root_for(&state, &project_id)?;
     let dir = memory_dir(&root);
@@ -117,7 +117,7 @@ pub fn get_memory(state: State<'_, AppState>, project_id: String) -> Result<Stri
 
 /// Wipe the project's memory: removes every fragment and resets the index.
 /// Also clears the legacy single file if present.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn clear_memory(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
     let root = project_root_for(&state, &project_id)?;
     let dir = memory_dir(&root);

@@ -38,6 +38,26 @@ fn router(password: &str) -> axum::Router {
     rustic_server::app::build_router(shared)
 }
 
+/// Run an async test body on its own runtime, dropping the last router handle outside any async context.
+fn run<F, Fut>(password: &str, body: F)
+where
+    F: FnOnce(axum::Router) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let app = {
+        let _guard = rt.enter();
+        router(password)
+    };
+    rt.block_on(body(app.clone()));
+    drop(app);
+    drop(rt);
+}
+
 /// Build a request with a fake ConnectInfo so the login handler's extractor
 /// resolves (oneshot doesn't populate it automatically).
 fn req(method: &str, uri: &str) -> axum::http::request::Builder {
@@ -55,115 +75,90 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
 }
 
-#[tokio::test]
-async fn health_is_open() {
-    let resp = router("pw")
-        .oneshot(req("GET", "/healthz").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["status"], "ok");
+#[test]
+fn health_is_open() {
+    run("pw", |app| async move {
+        let resp = app
+            .oneshot(req("GET", "/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["status"], "ok");
+    });
 }
 
-#[tokio::test]
-async fn api_requires_auth() {
-    let resp = router("pw")
-        .oneshot(
-            req("POST", "/api/list_projects")
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+#[test]
+fn api_requires_auth() {
+    run("pw", |app| async move {
+        let resp = app
+            .oneshot(
+                req("POST", "/api/list_projects")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    });
 }
 
-#[tokio::test]
-async fn wrong_password_rejected() {
-    let resp = router("correct-horse")
-        .oneshot(with_peer(
-            req("POST", "/login")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"password":"nope"}"#))
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+#[test]
+fn wrong_password_rejected() {
+    run("correct-horse", |app| async move {
+        let resp = app
+            .oneshot(with_peer(
+                req("POST", "/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"nope"}"#))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    });
 }
 
-#[tokio::test]
-async fn login_then_call_api() {
-    let app = router("correct-horse");
-
-    // 1. Log in.
-    let login = app
-        .clone()
-        .oneshot(with_peer(
-            req("POST", "/login")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"password":"correct-horse"}"#))
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(login.status(), StatusCode::OK);
-    let token = body_json(login).await["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(!token.is_empty());
-
-    // 2. Use the token to call a real command.
-    let resp = app
-        .oneshot(
-            req("POST", "/api/list_projects")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    // Fresh DB -> no projects yet.
-    assert_eq!(body_json(resp).await, serde_json::json!([]));
+#[test]
+fn login_then_call_api() {
+    run("correct-horse", |app| async move {
+        let token = login_token(&app, "correct-horse").await;
+        assert!(!token.is_empty());
+        let resp = app
+            .oneshot(
+                req("POST", "/api/list_projects")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await, serde_json::json!([]));
+    });
 }
 
-#[tokio::test]
-async fn unwired_command_returns_501() {
-    let app = router("pw");
-    let login = app
-        .clone()
-        .oneshot(with_peer(
-            req("POST", "/login")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"password":"pw"}"#))
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
-    let token = body_json(login).await["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let resp = app
-        .oneshot(
-            req("POST", "/api/totally_made_up_command")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-    assert!(body_json(resp).await["error"]
-        .as_str()
-        .unwrap()
-        .contains("totally_made_up_command"));
+#[test]
+fn unwired_command_returns_501() {
+    run("pw", |app| async move {
+        let token = login_token(&app, "pw").await;
+        let resp = app
+            .oneshot(
+                req("POST", "/api/totally_made_up_command")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("totally_made_up_command"));
+    });
 }
 
 async fn login_token(app: &axum::Router, pw: &str) -> String {
@@ -183,129 +178,158 @@ async fn login_token(app: &axum::Router, pw: &str) -> String {
         .to_string()
 }
 
-#[tokio::test]
-async fn upload_then_download_file_roundtrips() {
-    let app = router("pw");
-    let token = login_token(&app, "pw").await;
+#[test]
+fn upload_then_download_file_roundtrips() {
+    run("pw", |app| async move {
+        let token = login_token(&app, "pw").await;
 
-    let dir = std::env::temp_dir().join(format!("rustic-upl-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::env::temp_dir().join(format!("rustic-upl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
 
-    // First chunk: dstDir + name resolves the target path.
-    let up = app
-        .clone()
-        .oneshot(
-            req(
-                "POST",
-                &format!(
-                    "/api/upload_stream?dstDir={}&name=greet.txt&offset=0",
-                    urlencode(&dir.to_string_lossy())
-                ),
+        let up = app
+            .clone()
+            .oneshot(
+                req(
+                    "POST",
+                    &format!(
+                        "/api/upload_stream?dstDir={}&name=greet.txt&offset=0",
+                        urlencode(&dir.to_string_lossy())
+                    ),
+                )
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from("hello "))
+                .unwrap(),
             )
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::from("hello "))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(up.status(), StatusCode::OK);
-    let written = body_json(up).await["path"].as_str().unwrap().to_string();
+            .await
+            .unwrap();
+        assert_eq!(up.status(), StatusCode::OK);
+        let written = body_json(up).await["path"].as_str().unwrap().to_string();
 
-    // Second chunk: continuation via path + offset appends in place.
-    let up2 = app
-        .clone()
-        .oneshot(
-            req(
-                "POST",
-                &format!("/api/upload_stream?path={}&offset=6", urlencode(&written)),
+        let up2 = app
+            .clone()
+            .oneshot(
+                req(
+                    "POST",
+                    &format!("/api/upload_stream?path={}&offset=6", urlencode(&written)),
+                )
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from("upload"))
+                .unwrap(),
             )
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::from("upload"))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(up2.status(), StatusCode::OK);
-    assert_eq!(body_json(up2).await["size"].as_u64().unwrap(), 12);
-    assert_eq!(std::fs::read(&written).unwrap(), b"hello upload");
+            .await
+            .unwrap();
+        assert_eq!(up2.status(), StatusCode::OK);
+        assert_eq!(body_json(up2).await["size"].as_u64().unwrap(), 12);
+        assert_eq!(std::fs::read(&written).unwrap(), b"hello upload");
 
-    // Download it back through the GET route and compare bytes.
-    let down = app
-        .oneshot(
-            req(
-                "GET",
-                &format!("/api/download?path={}", urlencode(&written)),
+        let down = app
+            .oneshot(
+                req("GET", &format!("/api/download?path={}", urlencode(&written)))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
             )
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(down.status(), StatusCode::OK);
-    let bytes = to_bytes(down.into_body(), 1 << 20).await.unwrap();
-    assert_eq!(&bytes[..], b"hello upload");
+            .await
+            .unwrap();
+        assert_eq!(down.status(), StatusCode::OK);
+        let bytes = to_bytes(down.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&bytes[..], b"hello upload");
+    });
 }
 
-#[tokio::test]
-async fn upload_rejects_path_traversal() {
-    let app = router("pw");
-    let token = login_token(&app, "pw").await;
-    let dir = std::env::temp_dir().join(format!("rustic-trav-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+#[test]
+fn upload_rejects_path_traversal() {
+    run("pw", |app| async move {
+        let token = login_token(&app, "pw").await;
+        let dir = std::env::temp_dir().join(format!("rustic-trav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
 
-    let up = app
-        .oneshot(
-            req(
-                "POST",
-                &format!(
-                    "/api/upload_stream?dstDir={}&name=evil&relativePath={}",
-                    urlencode(&dir.to_string_lossy()),
-                    urlencode("../escape.txt")
-                ),
+        let up = app
+            .oneshot(
+                req(
+                    "POST",
+                    &format!(
+                        "/api/upload_stream?dstDir={}&name=evil&relativePath={}",
+                        urlencode(&dir.to_string_lossy()),
+                        urlencode("../escape.txt")
+                    ),
+                )
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from("x"))
+                .unwrap(),
             )
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::from("x"))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(up.status(), StatusCode::BAD_REQUEST);
+            .await
+            .unwrap();
+        assert_eq!(up.status(), StatusCode::BAD_REQUEST);
+    });
 }
 
-#[tokio::test]
-async fn download_folder_returns_zip() {
-    let app = router("pw");
-    let token = login_token(&app, "pw").await;
+#[test]
+fn download_folder_returns_zip() {
+    run("pw", |app| async move {
+        let token = login_token(&app, "pw").await;
 
-    let dir = std::env::temp_dir().join(format!("rustic-zip-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("sub")).unwrap();
-    std::fs::write(dir.join("a.txt"), b"aaa").unwrap();
-    std::fs::write(dir.join("sub").join("b.txt"), b"bbb").unwrap();
+        let dir = std::env::temp_dir().join(format!("rustic-zip-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(dir.join("sub").join("b.txt"), b"bbb").unwrap();
 
-    let down = app
-        .oneshot(
-            req(
-                "GET",
-                &format!("/api/download?path={}", urlencode(&dir.to_string_lossy())),
+        let down = app
+            .oneshot(
+                req(
+                    "GET",
+                    &format!("/api/download?path={}", urlencode(&dir.to_string_lossy())),
+                )
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
             )
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap(),
-        )
-        .await
+            .await
+            .unwrap();
+        assert_eq!(down.status(), StatusCode::OK);
+        let ct = down
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(ct, "application/zip");
+        let bytes = to_bytes(down.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
+    });
+}
+
+#[test]
+fn download_refuses_internal_data() {
+    let cfg = test_config("pw");
+    let data_dir = cfg.data_dir.clone();
+    std::fs::write(data_dir.join("secrets.json"), b"{}").unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
         .unwrap();
-    assert_eq!(down.status(), StatusCode::OK);
-    let ct = down
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    assert_eq!(ct, "application/zip");
-    let bytes = to_bytes(down.into_body(), 1 << 20).await.unwrap();
-    // Zip local-file-header magic.
-    assert_eq!(&bytes[..4], b"PK\x03\x04");
+    let app = {
+        let _guard = rt.enter();
+        rustic_server::app::build_router(rustic_server::build_shared(cfg).unwrap())
+    };
+    let inner = app.clone();
+    rt.block_on(async move {
+        let token = login_token(&inner, "pw").await;
+        let secret = data_dir.join("secrets.json");
+        let resp = inner
+            .oneshot(
+                req("GET", &format!("/api/download?path={}", urlencode(&secret.to_string_lossy())))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    });
+    drop(app);
+    drop(rt);
 }
 
 /// Browser lifecycle: `browser_open` starts Chromium (its CDP port answers),
@@ -313,14 +337,13 @@ async fn download_folder_returns_zip() {
 /// process is left behind). Skipped when the host has no Chromium binary, so
 /// dev boxes / CI without it still pass — the real assertion runs on the
 /// container image where `chromium` is installed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn browser_open_starts_and_close_reaps_chromium() {
+#[test]
+fn browser_open_starts_and_close_reaps_chromium() {
     if rustic_server::browser::cdp::find_chromium().is_none() {
         eprintln!("skipping browser lifecycle test: no Chromium binary on host");
         return;
     }
-
-    let app = router("pw");
+    run("pw", |app| async move {
     let token = login_token(&app, "pw").await;
 
     // Open → Chromium up, at least one tab.
@@ -377,6 +400,7 @@ async fn browser_open_starts_and_close_reaps_chromium() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     assert!(refused, "CDP port must stop answering after browser_close");
+    });
 }
 
 /// True iff a GET to `url` returns a 2xx within a short timeout.

@@ -728,8 +728,8 @@ pub trait AiProvider: Send + Sync {
     /// with each text/thinking delta as the response streams in.
     async fn chat(
         &self,
-        messages: Vec<Message>,
-        tools: Vec<ToolDef>,
+        messages: &[Message],
+        tools: &[ToolDef],
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse>;

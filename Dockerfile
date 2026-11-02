@@ -12,22 +12,35 @@ COPY . .
 RUN bun run build:web   # outputs ./dist
 
 # ---- stage 2: rust server ---------------------------------------------------
-FROM rust:1-bookworm AS server
+# cargo-chef splits dependency compilation into its own layer, keyed only on the
+# Cargo manifests/lockfile, so a source-only change skips rebuilding every crate.
+FROM rust:1-bookworm AS chef
 WORKDIR /build
-# System deps for the pure-Rust stack are minimal; git is needed at RUNTIME for
-# state-mutating VCS ops, not for the build.
-COPY . .
-# Cloud builders intermittently drop crates.io downloads mid-stream ("unexpected
-# eof"). Retry aggressively and disable HTTP/2 multiplexing, which is the usual
-# trigger for those resets.
 ENV CARGO_NET_RETRY=10 \
     CARGO_HTTP_MULTIPLEXING=false \
     CARGO_NET_GIT_FETCH_WITH_CLI=true
-# Build ONLY the server crate — cargo will compile its dependency graph and skip
-# the `src-tauri` member entirely, so no webkit/webview toolchain is required.
-# Wrapped in a retry loop: cloud builders occasionally time out mid-download of a
-# crate `.crate` file ([28] curl timeout); each retry resumes against the cargo
-# cache populated by previous attempts, so a transient stall self-heals.
+RUN cargo install cargo-chef --version 0.1.78 --locked
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS server
+# System deps for the pure-Rust stack are minimal; git is needed at RUNTIME for
+# state-mutating VCS ops, not for the build.
+COPY --from=planner /build/recipe.json recipe.json
+COPY rust-toolchain.toml rust-toolchain.toml
+# Cloud builders intermittently drop crates.io downloads mid-stream; each retry
+# resumes against the cargo cache populated by previous attempts.
+RUN for i in 1 2 3 4 5; do \
+      echo "=== cargo chef cook attempt $i ==="; \
+      cargo chef cook --release -p rustic-server --recipe-path recipe.json && break; \
+      echo "attempt $i failed (likely a transient crates.io download); retrying in 20s"; \
+      sleep 20; \
+    done
+COPY . .
+# Build ONLY the server crate — the `src-tauri` member is skipped entirely, so no
+# webkit/webview toolchain is required.
 RUN for i in 1 2 3 4 5; do \
       echo "=== cargo build attempt $i ==="; \
       cargo build --release -p rustic-server && break; \
@@ -74,9 +87,9 @@ RUN set -eux; \
         --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'; \
     rm /tmp/node.tar.xz; \
     node --version; npm --version
-# uvx (for Python-based MCP servers) — best-effort; ignore failure on networks
-# without PyPI access.
-RUN pip3 install --break-system-packages uv 2>/dev/null || true
+# uvx (for Python-based MCP servers) — pinned.
+ARG UV_VERSION=0.12.22
+RUN pip3 install --break-system-packages "uv==${UV_VERSION}" && uv --version
 
 # cloudflared — powers the Cloudflare quick-tunnel preview mode (open a VM dev
 # server on a public https URL with no Cloudflare account or domain). Installed
@@ -117,8 +130,9 @@ RUN set -eux; \
 
 # air — live-reload for Go. Installed to /usr/local/bin so it's on the global
 # PATH (GOBIN override keeps it out of the volume-backed GOPATH).
+ARG AIR_VERSION=v1.67.4
 RUN set -eux; \
-    GOBIN=/usr/local/bin go install github.com/air-verse/air@latest; \
+    GOBIN=/usr/local/bin go install "github.com/air-verse/air@${AIR_VERSION}"; \
     air -v
 
 # Rust — stable toolchain via rustup, with clippy + rustfmt.
@@ -131,8 +145,20 @@ RUN set -eux; \
 # Bun — copy the binary straight out of the frontend build stage (no download).
 COPY --from=web /usr/local/bin/bun /usr/local/bin/bun
 
-# Global TypeScript toolchain (handles .ts/.tsx/.jsx via tsc/ts-node).
-RUN npm install -g typescript ts-node 2>/dev/null || true
+# Global TypeScript toolchain (handles .ts/.tsx/.jsx via tsc/ts-node) — pinned.
+ARG TYPESCRIPT_VERSION=7.0.2
+ARG TS_NODE_VERSION=10.9.2
+RUN npm install -g "typescript@${TYPESCRIPT_VERSION}" "ts-node@${TS_NODE_VERSION}"
+
+# Unprivileged runtime user. The entrypoint starts as root only to fix /data
+# ownership (PaaS volumes mount root-owned), then drops to this user.
+# The toolchain homes are handed over so `cargo build` / `rustup` work as it.
+RUN set -eux; \
+    useradd --create-home --uid 1000 --shell /bin/bash rustic; \
+    mkdir -p /data; \
+    chown -R rustic:rustic /data /usr/local/cargo /usr/local/rustup
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 WORKDIR /app
 COPY --from=server /build/target/release/rustic-server /usr/local/bin/rustic-server
@@ -150,7 +176,8 @@ ENV RUSTIC_DATA_DIR=/data \
     GOPATH=/data/go \
     CARGO_INSTALL_ROOT=/data/cargo \
     BUN_INSTALL=/data/bun \
-    PATH=/data/go/bin:/data/cargo/bin:/data/bun/bin:/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+    NPM_CONFIG_PREFIX=/data/npm-global \
+    PATH=/data/npm-global/bin:/data/go/bin:/data/cargo/bin:/data/bun/bin:/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 EXPOSE 8787
 
 # Healthcheck hits the unauthenticated /healthz endpoint. Honors $PORT (set by
@@ -158,4 +185,4 @@ EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT:-8787}/healthz" || exit 1
 
-ENTRYPOINT ["rustic-server"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

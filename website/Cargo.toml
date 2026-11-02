@@ -10,7 +10,6 @@ description = "Marketing website for Rustic, served by axum"
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
-tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "compression-br", "compression-gzip", "set-header", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

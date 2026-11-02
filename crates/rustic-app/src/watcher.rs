@@ -117,11 +117,20 @@ struct PendingChanges {
     last_event: Option<Instant>,
 }
 
+type UiHandler = Arc<dyn Fn(&Result<Event, notify::Error>) + Send + Sync>;
+type FeedList = Arc<Mutex<Vec<rustic_agent::FileWatcherFeed>>>;
+
 struct WatcherEntry {
     /// `None` while a background retry is pending (the retry thread owns the
     /// watcher once it starts; dropping this entry stops it via the flag).
     _watcher: Option<RecommendedWatcher>,
     flush_running: Arc<std::sync::atomic::AtomicBool>,
+    has_ui: bool,
+}
+
+struct Subscribers {
+    root: PathBuf,
+    feeds: FeedList,
 }
 
 /// Background retry cadence for a watcher that failed to start.
@@ -149,15 +158,56 @@ impl Drop for WatcherEntry {
     }
 }
 
+/// Push a synthetic watcher error to every live feed so file history falls back to a full walk.
+fn signal_feeds_lost(feeds: &FeedList, root: &Path, why: &str) {
+    let err: Result<Event, notify::Error> = Err(notify::Error::generic(why));
+    feeds.lock_safe().retain(|f| f.feed(root, &err));
+}
+
 pub struct FileWatcherManager {
     watchers: HashMap<String, WatcherEntry>,
+    subscribers: HashMap<String, Subscribers>,
 }
 
 impl FileWatcherManager {
     pub fn new() -> Self {
         Self {
             watchers: HashMap::new(),
+            subscribers: HashMap::new(),
         }
+    }
+
+    /// Feed `project_root`'s raw events into a file-history pipeline, sharing (or starting) the project's single OS watcher.
+    pub fn subscribe_file_history(
+        &mut self,
+        project_root: &Path,
+        feed: rustic_agent::FileWatcherFeed,
+    ) {
+        let raw = normalize(&project_root.to_string_lossy());
+        let norm = strip_verbatim(&raw).to_string();
+        let key = watch_key(&norm);
+        let subs = self.subscribers.entry(key.clone()).or_insert_with(|| Subscribers {
+            root: native_path(&norm),
+            feeds: Arc::new(Mutex::new(Vec::new())),
+        });
+        subs.feeds.lock_safe().push(feed);
+        if !self.watchers.contains_key(&key) {
+            let entry = Self::start_entry(
+                &norm,
+                native_path(&norm),
+                subs.feeds.clone(),
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            );
+            self.watchers.insert(key, entry);
+        }
+    }
+
+    fn feeds_for(&mut self, key: &str) -> FeedList {
+        self.subscribers
+            .get(key)
+            .map(|s| s.feeds.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())))
     }
 
     /// Start watching a project directory. Changes are debounced and emitted
@@ -175,9 +225,18 @@ impl FileWatcherManager {
         workspace_services: Option<Arc<WorkspaceRegistry>>,
     ) {
         let norm = normalize(project_path);
-        if self.watchers.contains_key(&norm) {
-            return; // Already watching
-        }
+        let key = watch_key(&norm);
+        let restarted = match self.watchers.get(&key) {
+            Some(e) if e.has_ui => return, // Already watching
+            Some(_) => {
+                // A file-history-only watcher exists; replace it so the UI's
+                // own path string is the watch root (fs-change paths must
+                // match what the frontend holds).
+                self.watchers.remove(&key);
+                true
+            }
+            None => false,
+        };
 
         let project_path_owned = norm.clone();
 
@@ -246,18 +305,11 @@ impl FileWatcherManager {
             }
         });
 
-        // Handler factory: a fresh notify callback per start attempt, so a
-        // failed start can be retried later (issue #12, cause D).
-        let make_handler = {
-            let pending_f = pending.clone();
-            let workspace_f = workspace_services.clone();
-            let project_f = project_path_owned.clone();
-            move || {
-                let pending_for_handler = pending_f.clone();
-                let workspace_for_handler = workspace_f.clone();
-                let project_path_for_handler = project_f.clone();
-
-                move |res: Result<Event, notify::Error>| {
+        let ui_handler: UiHandler = {
+            let pending_for_handler = pending.clone();
+            let workspace_for_handler = workspace_services.clone();
+            let project_path_for_handler = project_path_owned.clone();
+            Arc::new(move |res: &Result<Event, notify::Error>| {
                     let event = match res {
                         Ok(event) => event,
                         Err(e) => {
@@ -345,29 +397,61 @@ impl FileWatcherManager {
 
                         lock.last_event = Some(Instant::now());
                     }
+            })
+        };
+
+        let feeds = self.feeds_for(&key);
+        let entry = Self::start_entry(
+            &norm,
+            native_path(&project_path_owned),
+            feeds.clone(),
+            Some(ui_handler),
+            flush_running,
+        );
+        self.watchers.insert(key, entry);
+        if restarted {
+            signal_feeds_lost(&feeds, &native_path(&norm), "watcher restarted");
+        }
+    }
+
+    /// Start the single OS watcher for one project, fanning raw events out to `feeds` before the optional UI handler.
+    fn start_entry(
+        label: &str,
+        path: PathBuf,
+        feeds: FeedList,
+        ui: Option<UiHandler>,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+    ) -> WatcherEntry {
+        let has_ui = ui.is_some();
+        // Handler factory: a fresh notify callback per start attempt, so a
+        // failed start can be retried later (issue #12, cause D).
+        let make_handler = {
+            let feeds = feeds.clone();
+            let root = path.clone();
+            move || {
+                let feeds = feeds.clone();
+                let ui = ui.clone();
+                let root = root.clone();
+                move |res: Result<Event, notify::Error>| {
+                    {
+                        let mut list = feeds.lock_safe();
+                        if !list.is_empty() {
+                            list.retain(|f| f.feed(&root, &res));
+                        }
+                    }
+                    if let Some(ui) = ui.as_ref() {
+                        ui(&res);
+                    }
                 }
             }
         };
 
-        // Windows notify wants native separators; POSIX paths must keep their
-        // forward slashes — converting them there produced a bogus
-        // `\home\user\project` path, so `watch()` always failed and the server
-        // build never emitted a single fs-change event.
-        #[cfg(windows)]
-        let path = PathBuf::from(project_path_owned.replace('/', "\\"));
-        #[cfg(not(windows))]
-        let path = PathBuf::from(&project_path_owned);
-
         match start_watcher(make_handler(), &path) {
-            Ok(watcher) => {
-                self.watchers.insert(
-                    norm,
-                    WatcherEntry {
-                        _watcher: Some(watcher),
-                        flush_running,
-                    },
-                );
-            }
+            Ok(watcher) => WatcherEntry {
+                _watcher: Some(watcher),
+                flush_running: alive,
+                has_ui,
+            },
             Err(e) => {
                 // Previously the project silently stayed unwatched until a
                 // restart (e.g. root not ready yet after a cloud-sync
@@ -376,17 +460,18 @@ impl FileWatcherManager {
                 // starts and drops it when the entry is removed.
                 tracing::warn!(
                     "[watcher] Failed to watch {}: {} — retrying in background",
-                    norm,
+                    label,
                     e
                 );
-                let alive = flush_running.clone();
-                let project_for_retry = norm.clone();
+                signal_feeds_lost(&feeds, &path, "watcher failed to start");
+                let alive_retry = alive.clone();
+                let project_for_retry = label.to_string();
                 std::thread::spawn(move || {
                     use std::sync::atomic::Ordering;
                     let mut held: Option<RecommendedWatcher> = None;
                     for attempt in 1..=WATCH_RETRY_ATTEMPTS {
                         std::thread::sleep(WATCH_RETRY_INTERVAL);
-                        if !alive.load(Ordering::Relaxed) {
+                        if !alive_retry.load(Ordering::Relaxed) {
                             return;
                         }
                         match start_watcher(make_handler(), &path) {
@@ -397,6 +482,7 @@ impl FileWatcherManager {
                                     project_for_retry
                                 );
                                 held = Some(w);
+                                signal_feeds_lost(&feeds, &path, "watcher started after retry");
                                 break;
                             }
                             Err(e) => {
@@ -412,30 +498,180 @@ impl FileWatcherManager {
                         );
                         return;
                     }
-                    while alive.load(Ordering::Relaxed) {
+                    while alive_retry.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(500));
                     }
                     drop(held);
                 });
-                self.watchers.insert(
-                    norm,
-                    WatcherEntry {
-                        _watcher: None,
-                        flush_running,
-                    },
-                );
+                WatcherEntry {
+                    _watcher: None,
+                    flush_running: alive,
+                    has_ui,
+                }
             }
         }
     }
 
     /// Stop watching a project directory.
     pub fn unwatch_project(&mut self, project_path: &str) {
-        let norm = normalize(project_path);
+        let key = watch_key(&normalize(project_path));
         // Dropping the WatcherEntry drops the watcher, stopping it
-        self.watchers.remove(&norm);
+        self.watchers.remove(&key);
+        // File history may still be live for this project; re-arm a fresh
+        // watcher for it (cloud sync unwatches to re-establish after a folder
+        // swap, so a new OS handle is the desired outcome either way).
+        let Some(subs) = self.subscribers.get(&key) else {
+            return;
+        };
+        let live = {
+            let mut list = subs.feeds.lock_safe();
+            list.retain(|f| f.is_alive());
+            !list.is_empty()
+        };
+        if !live {
+            self.subscribers.remove(&key);
+            return;
+        }
+        let root = subs.root.clone();
+        let feeds = subs.feeds.clone();
+        let label = normalize(&root.to_string_lossy());
+        let entry = Self::start_entry(
+            &label,
+            root.clone(),
+            feeds.clone(),
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        self.watchers.insert(key, entry);
+        signal_feeds_lost(&feeds, &root, "watcher restarted");
+    }
+}
+
+impl Default for FileWatcherManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 fn normalize(p: &str) -> String {
     p.replace('\\', "/")
+}
+
+/// Drop a Windows verbatim prefix (`//?/C:/x` → `C:/x`, `//?/UNC/s/x` → `//s/x`) from a normalized path.
+fn strip_verbatim(norm: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = norm.strip_prefix("//?/UNC/") {
+        std::borrow::Cow::Owned(format!("//{rest}"))
+    } else if let Some(rest) = norm.strip_prefix("//?/") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(norm)
+    }
+}
+
+/// Map key identifying a project root regardless of separator, verbatim prefix, trailing slash, or (Windows) case.
+fn watch_key(norm: &str) -> String {
+    let s = strip_verbatim(norm);
+    let s = s.trim_end_matches('/');
+    #[cfg(windows)]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s.to_string()
+    }
+}
+
+/// Native watch path from a `/`-normalized project path.
+fn native_path(norm: &str) -> PathBuf {
+    // Windows notify wants native separators; POSIX paths must keep their
+    // forward slashes — converting them there produced a bogus
+    // `\home\user\project` path, so `watch()` always failed and the server
+    // build never emitted a single fs-change event.
+    #[cfg(windows)]
+    {
+        PathBuf::from(norm.replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(norm)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RecordingEmitter(Mutex<Vec<serde_json::Value>>);
+
+    impl EventEmitter for RecordingEmitter {
+        fn emit_json(&self, event: &str, payload: serde_json::Value) {
+            if event == "rustic:fs-change" {
+                self.0.lock_safe().push(payload);
+            }
+        }
+    }
+
+    #[test]
+    fn watch_key_ignores_verbatim_separator_and_trailing_slash() {
+        assert_eq!(watch_key("//?/C:/proj/"), watch_key("C:/proj"));
+        assert_eq!(watch_key(&normalize("\\\\?\\UNC\\srv\\share")), watch_key("//srv/share"));
+    }
+
+    #[test]
+    fn one_os_watcher_feeds_ui_and_file_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustic-watch-fanout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.canonicalize().unwrap();
+
+        let acc = Arc::new(rustic_agent::DirtyPathAccumulator::new(root.clone()));
+        acc.set_active("t", "m");
+        let (fh_watcher, feed) = rustic_agent::FileWatcher::attach(root.clone(), Arc::clone(&acc)).unwrap();
+
+        let mut mgr = FileWatcherManager::new();
+        // File history first: must work before the UI watcher exists.
+        mgr.subscribe_file_history(&root, feed);
+        assert_eq!(mgr.watchers.len(), 1);
+
+        let emitter = Arc::new(RecordingEmitter(Mutex::new(Vec::new())));
+        let ui_path = strip_verbatim(&normalize(&root.to_string_lossy())).to_string();
+        mgr.watch_project(&ui_path, emitter.clone(), None);
+        assert_eq!(mgr.watchers.len(), 1, "UI must reuse the project's single OS watcher");
+        assert!(mgr.watchers.values().all(|e| e.has_ui));
+
+        // The UI re-arm sends a rescan to file history; drain it so the
+        // assertion below proves real events arrive.
+        std::thread::sleep(Duration::from_millis(400));
+        acc.drain("t", "m");
+
+        std::fs::write(root.join("hello.txt"), b"hi").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut ui_seen, mut fh_seen) = (false, false);
+        while Instant::now() < deadline && !(ui_seen && fh_seen) {
+            std::thread::sleep(Duration::from_millis(100));
+            ui_seen = emitter.0.lock_safe().iter().any(|p| {
+                p["changed_paths"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v.as_str().is_some_and(|s| s.ends_with("/hello.txt"))))
+            });
+            fh_seen = acc
+                .peek_active()
+                .is_some_and(|s| s.modified.contains("hello.txt"));
+        }
+        assert!(ui_seen, "fs-change batch should report hello.txt");
+        assert!(fh_seen, "file-history accumulator should record hello.txt");
+
+        drop(fh_watcher);
+        mgr.unwatch_project(&ui_path);
+        assert!(mgr.watchers.is_empty(), "dropped file-history consumer must not re-arm a watcher");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

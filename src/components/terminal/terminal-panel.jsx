@@ -23,7 +23,7 @@ import { cn } from '@/lib/utils';
 import { confirm } from '@/components/confirm-dialog';
 import { useTerminal, orderedSessions, terminalTabLabel } from '@/state/terminal';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
-import { TerminalPane } from './terminal-pane';
+import { TerminalPane } from './lazy-terminal-pane';
 import {
   ResizablePanelGroup,
   ResizablePanel,

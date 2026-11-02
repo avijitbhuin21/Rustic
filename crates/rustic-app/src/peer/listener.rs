@@ -57,7 +57,7 @@ fn authorize(ctx: &Ctx, headers: &HeaderMap) -> Result<Peer, Response> {
     let dir = data_dir(ctx)?;
     super::load_peers(&dir)
         .into_iter()
-        .find(|p| !p.token_in.is_empty() && p.token_in == token)
+        .find(|p| super::peer_token_matches(&p.token_in, token))
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "unknown device — pair again"))
 }
 
@@ -109,15 +109,23 @@ async fn track_seen(
     if let Some(token) = token.filter(|t| !t.is_empty()) {
         let remote = req.extensions().get::<Remote>().copied();
         let addr = caller_addr(req.headers(), remote);
+        let mut matched = false;
         if let Ok(dir) = ctx.host.data_dir() {
             let mut peers = super::load_peers(&dir);
-            if let Some(p) = peers.iter_mut().find(|p| p.token_in == token) {
+            if let Some(p) = peers
+                .iter_mut()
+                .find(|p| super::peer_token_matches(&p.token_in, &token))
+            {
+                matched = true;
                 ctx.lan.lock().mark_seen(&p.device_id, addr.clone());
                 if addr.is_some() && p.addr != addr {
                     p.addr = addr;
                     let _ = super::save_peers(&dir, &peers);
                 }
             }
+        }
+        if !matched {
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
         }
     }
     next.run(req).await

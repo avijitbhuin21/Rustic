@@ -122,7 +122,7 @@ pub struct GitAvailability {
 /// git. When git isn't found, returns `available: false` with the
 /// install-guidance message in `message`. Sub-50 ms on every supported
 /// platform; safe to call eagerly.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_check_available() -> GitAvailability {
     if is_git_available() {
         GitAvailability {

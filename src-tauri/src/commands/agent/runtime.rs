@@ -9,7 +9,7 @@ use rustic_db::SubagentRecord;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, State};
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_task_cost(state: State<'_, AppState>, task_id: String) -> Result<TaskCost, String> {
     let map = state.task_costs.lock().map_err(|e| e.to_string())?;
     Ok(map.get(&task_id).cloned().unwrap_or_default())
@@ -63,7 +63,7 @@ struct AgentInputDeliveredEvent {
     count: u32,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_subagent_records(
     state: State<'_, AppState>,
     task_id: String,
@@ -85,7 +85,7 @@ pub fn get_subagent_records(
 }
 
 /// One sub-agent's untrimmed text + tool calls, fetched when its view is opened.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_subagent_replay(
     state: State<'_, AppState>,
     task_id: String,

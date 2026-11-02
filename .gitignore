@@ -66,3 +66,6 @@ audit-report/
 plan.md
 
 .claude/
+
+# Per-project MCP config written for external CLI agents
+.codex/

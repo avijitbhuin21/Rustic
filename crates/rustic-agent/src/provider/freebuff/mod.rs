@@ -244,8 +244,8 @@ fn build_body(
 impl AiProvider for FreeBuffProvider {
     async fn chat(
         &self,
-        messages: Vec<Message>,
-        tools: Vec<ToolDef>,
+        messages: &[Message],
+        tools: &[ToolDef],
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
@@ -266,7 +266,7 @@ impl AiProvider for FreeBuffProvider {
                 .await
                 .map_err(|e| anyhow!(e.to_string()))?;
 
-            let body = build_body(&messages, &tools, config, &run_id, &instance_id);
+            let body = build_body(messages, tools, config, &run_id, &instance_id);
 
             let resp: FbResult<reqwest::Response> = self.manager.client().chat(&token, &body).await;
             let resp = match resp {

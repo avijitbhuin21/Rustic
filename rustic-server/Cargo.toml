@@ -21,7 +21,6 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors", "limit", "set-header"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net", "signal"] }
 tokio-util = { version = "0.7", features = ["io"] }
-hyper = "1"
 # Embedded VM browser (web build only): a WebSocket client used both to drive
 # Chromium's CDP for one-shot commands and to reverse-proxy the DevTools socket.
 # 0.24 matches the version already resolved transitively, so no lock churn.

@@ -37,12 +37,17 @@ function loadRect() {
   return { ...DEFAULT_RECT };
 }
 
+let saveRectTimer = null;
+
 function saveRect(rect) {
-  try {
-    localStorage.setItem(WINDOW_RECT_KEY, JSON.stringify(rect));
-  } catch {
-    /* ignore storage errors (private mode) */
-  }
+  clearTimeout(saveRectTimer);
+  saveRectTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(WINDOW_RECT_KEY, JSON.stringify(rect));
+    } catch {
+      /* ignore storage errors (private mode) */
+    }
+  }, 250);
 }
 
 // Pick the active tab after a list refresh: keep the current one if it survived,

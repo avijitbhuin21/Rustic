@@ -24,8 +24,8 @@ impl OpenAiProvider {
 
     async fn chat_via_responses(
         &self,
-        messages: Vec<Message>,
-        tools: Vec<ToolDef>,
+        messages: &[Message],
+        tools: &[ToolDef],
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
@@ -153,8 +153,8 @@ pub(crate) fn tool_args_parse_error_message(e: &serde_json::Error, raw_len: usiz
 impl AiProvider for OpenAiProvider {
     async fn chat(
         &self,
-        messages: Vec<Message>,
-        tools: Vec<ToolDef>,
+        messages: &[Message],
+        tools: &[ToolDef],
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
@@ -178,7 +178,7 @@ impl AiProvider for OpenAiProvider {
             .trim_end_matches('/');
         let url = format!("{}/chat/completions", base);
 
-        let mut api_messages = convert_messages(&messages);
+        let mut api_messages = convert_messages(messages);
         if let Some(sys) = &config.system_prompt {
             let has_system = api_messages
                 .first()

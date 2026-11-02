@@ -17,9 +17,10 @@ pub struct EventMsg {
 }
 
 /// Clonable handle to the broadcast channel. Cheap to clone (`Arc` inside).
+/// Events are serialized once on publish and fanned out as shared JSON text.
 #[derive(Clone)]
 pub struct EventHub {
-    tx: broadcast::Sender<EventMsg>,
+    tx: broadcast::Sender<std::sync::Arc<str>>,
 }
 
 impl EventHub {
@@ -34,14 +35,20 @@ impl EventHub {
     /// Publish an event. Returns silently if there are no subscribers (the
     /// desktop's `app.emit` is likewise best-effort when no window listens).
     pub fn publish(&self, event: &str, payload: serde_json::Value) {
-        let _ = self.tx.send(EventMsg {
+        if self.tx.receiver_count() == 0 {
+            return;
+        }
+        let msg = EventMsg {
             event: event.to_string(),
             payload,
-        });
+        };
+        if let Ok(text) = serde_json::to_string(&msg) {
+            let _ = self.tx.send(std::sync::Arc::from(text));
+        }
     }
 
     /// Subscribe a new `/ws` connection.
-    pub fn subscribe(&self) -> broadcast::Receiver<EventMsg> {
+    pub fn subscribe(&self) -> broadcast::Receiver<std::sync::Arc<str>> {
         self.tx.subscribe()
     }
 }

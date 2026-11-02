@@ -143,6 +143,7 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         // rejected before any handler runs. Requests without an Origin header
         // (same-origin GETs, curl, webhooks) pass through untouched.
         .layer(from_fn(cors_middleware))
+        .layer(from_fn_with_state(shared.clone(), host_proxy_middleware))
         .with_state(shared)
         .merge(peer_routes)
 }
@@ -442,9 +443,6 @@ async fn logout(State(shared): State<Arc<Shared>>, req: Request<Body>) -> Respon
 /// Match a preview-subdomain Host (`<port>.<preview-domain>`) to its port.
 /// Only a single numeric leading label is accepted; the `:port` suffix on the
 /// Host header (if any) is ignored.
-// Kept for the planned subdomain-preview proxy mode (see proxy.rs docs) —
-// currently unwired, so allow dead_code until the router mounts it.
-#[allow(dead_code)]
 fn match_preview_host(host: &str, preview_domain: &str) -> Option<u16> {
     let host = host.split(':').next()?;
     let label = host.strip_suffix(&format!(".{preview_domain}"))?;
@@ -457,20 +455,25 @@ fn match_preview_host(host: &str, preview_domain: &str) -> Option<u16> {
 /// Outermost layer: in subdomain mode, a request whose Host is
 /// `<port>.<preview-domain>` is authed and forwarded to that loopback port
 /// (covering every path on that host). All other hosts pass through untouched.
-#[allow(dead_code)]
 async fn host_proxy_middleware(
     State(shared): State<Arc<Shared>>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(preview_domain) = shared.config.preview_domain.as_deref() else {
+    let preview_domain = shared
+        .ctx
+        .tunnel
+        .read()
+        .ok()
+        .and_then(|g| g.active_preview_domain());
+    let Some(preview_domain) = preview_domain else {
         return next.run(req).await;
     };
     let port = req
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| match_preview_host(h, preview_domain));
+        .and_then(|h| match_preview_host(h, &preview_domain));
     let Some(port) = port else {
         return next.run(req).await;
     };
@@ -984,16 +987,56 @@ async fn upload_stream_handler(
     Json(json!({ "path": target.to_string_lossy(), "size": offset + written })).into_response()
 }
 
+/// Refuse HTTP reads of Rustic's internal state (secrets, DB, peer tokens, sync archives) under the data dir.
+fn deny_internal_data(path: &std::path::Path, data_dir: &std::path::Path) -> Result<(), String> {
+    const INTERNAL: &[&str] = &[
+        "secrets.json",
+        "mcp.json",
+        "mcp_consent.json",
+        "file-history",
+        "external-agents",
+        "lan",
+        "lan-sync-sessions",
+        "bin",
+        "browser-profile",
+        "logs",
+    ];
+    let canon = match path.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+    let data = match data_dir.canonicalize() {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+    let lc = |p: &std::path::Path| p.to_string_lossy().to_lowercase();
+    let (canon_s, data_s) = (lc(&canon), lc(&data));
+    if canon_s == data_s {
+        return Err("Refusing to read Rustic's data directory".to_string());
+    }
+    let rest = match canon_s.strip_prefix(&data_s) {
+        Some(r) if r.starts_with(['/', '\\']) => r.trim_start_matches(['/', '\\']),
+        _ => return Ok(()),
+    };
+    let first = rest.split(['/', '\\']).next().unwrap_or("");
+    if INTERNAL.contains(&first) || first.starts_with("rustic.db") || first.starts_with("sync-") {
+        return Err("Refusing to read Rustic's internal data".to_string());
+    }
+    Ok(())
+}
+
 /// `GET /api/download?path=…` — stream a single file as a raw attachment, or a
 /// directory as a generated zip. Path-scope guarded like every other read.
 async fn download_handler(
-    State(_shared): State<Arc<Shared>>,
+    State(shared): State<Arc<Shared>>,
     axum::extract::Query(q): axum::extract::Query<DownloadQuery>,
 ) -> Response {
     use rustic_app::path_scope::validate_readable_path;
 
     let path = std::path::PathBuf::from(&q.path);
-    if let Err(e) = validate_readable_path(&path) {
+    if let Err(e) = validate_readable_path(&path)
+        .and_then(|_| deny_internal_data(&path, &shared.config.data_dir))
+    {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response();
     }
     let meta = match std::fs::metadata(&path) {
@@ -1095,7 +1138,7 @@ async fn download_handler(
 /// large binary previews (video/audio/PDF) can play without a base64
 /// round-trip through `read_file_base64`. Path-scope guarded like every read.
 async fn asset_handler(
-    State(_shared): State<Arc<Shared>>,
+    State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<DownloadQuery>,
 ) -> Response {
@@ -1103,7 +1146,9 @@ async fn asset_handler(
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     let path = std::path::PathBuf::from(&q.path);
-    if let Err(e) = validate_readable_path(&path) {
+    if let Err(e) = validate_readable_path(&path)
+        .and_then(|_| deny_internal_data(&path, &shared.config.data_dir))
+    {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response();
     }
     let meta = match tokio::fs::metadata(&path).await {

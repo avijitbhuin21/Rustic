@@ -30,9 +30,6 @@ pub struct AgentTask {
     /// Shared permissions — the executor reads from this Arc in real-time.
     /// When the user changes permissions mid-conversation, we update this and the executor sees it.
     pub shared_permissions: Option<SharedPermissions>,
-    /// Accumulated token cost for this task (updated after each turn).
-    #[allow(dead_code)]
-    pub cost: TaskCost,
     /// Live /goal slot shared with the executor (ToolContext.goal_state).
     /// `Some(GoalState)` while a goal is active; hosts write it on
     /// set/clear commands and hydrate it from tasks.goal on load.
@@ -96,6 +93,10 @@ pub struct AppState {
     /// guard, then await. Enforced by `clippy::await_holding_lock = "deny"`
     /// (workspace lint in the root Cargo.toml).
     pub db: Arc<Mutex<Database>>,
+    /// Read-only WAL connections for hot read paths so reads never queue behind
+    /// the writer lock. `None` for in-memory databases (tests). Cleared by
+    /// cloud-sync import before the DB file is swapped.
+    pub db_read: Option<Arc<rustic_db::ReadPool>>,
     pub git_token: Mutex<Option<String>>,
     /// Latest TaskCost per task_id. Updated by the executor thread via Arc clone.
     pub task_costs: TaskCostMap,
@@ -180,6 +181,8 @@ pub struct FileHistoryHandle {
 impl AppState {
     pub fn new(db: Database) -> Self {
         let agent = Arc::new(Mutex::new(AgentState::new()));
+        let db_read = (db.path() != std::path::Path::new(":memory:"))
+            .then(|| Arc::new(rustic_db::ReadPool::new(db.path(), 4)));
         Self {
             workspace: Mutex::new(Workspace::new()),
             buffers: Mutex::new(HashMap::new()),
@@ -187,6 +190,7 @@ impl AppState {
             terminal_manager: Mutex::new(TerminalManager::new()),
             agent,
             db: Arc::new(Mutex::new(db)),
+            db_read,
             git_token: Mutex::new(None),
             task_costs: Arc::new(Mutex::new(HashMap::new())),
             file_lock: FileLockRegistry::new(),
@@ -204,5 +208,16 @@ impl AppState {
                     .expect("failed to build shared agent runtime"),
             )),
         }
+    }
+
+    /// Run a read-only DB closure on a pooled reader, falling back to the writer lock when no pool is available.
+    pub fn read_db<R>(&self, f: impl FnOnce(&Database) -> R) -> R {
+        if let Some(pool) = &self.db_read {
+            if let Ok(reader) = pool.checkout() {
+                return f(&reader);
+            }
+        }
+        let db = crate::sync_ext::MutexExt::lock_safe(&*self.db);
+        f(&db)
     }
 }

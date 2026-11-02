@@ -12,8 +12,8 @@ pub struct ThemeInfo {
 }
 
 /// Get the full user settings from SQLite.
-#[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> Result<UserSettings, String> {
+#[tauri::command(async)]
+pub fn  get_settings(state: State<'_, AppState>) -> Result<UserSettings, String> {
     let db = state.db.lock_safe();
     let json = db.get_setting("user_settings").map_err(|e| e.to_string())?;
     match json {
@@ -23,8 +23,8 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<UserSettings, String> 
 }
 
 /// Update user settings (full replace).
-#[tauri::command]
-pub fn update_settings(state: State<'_, AppState>, settings: UserSettings) -> Result<(), String> {
+#[tauri::command(async)]
+pub fn  update_settings(state: State<'_, AppState>, settings: UserSettings) -> Result<(), String> {
     let db = state.db.lock_safe();
     let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
     db.set_setting("user_settings", &json)
@@ -32,8 +32,8 @@ pub fn update_settings(state: State<'_, AppState>, settings: UserSettings) -> Re
 }
 
 /// Get the active theme (resolved from settings).
-#[tauri::command]
-pub fn get_active_theme(state: State<'_, AppState>) -> Result<Theme, String> {
+#[tauri::command(async)]
+pub fn  get_active_theme(state: State<'_, AppState>) -> Result<Theme, String> {
     let db = state.db.lock_safe();
     let settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
         Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
@@ -52,8 +52,8 @@ pub fn get_active_theme(state: State<'_, AppState>) -> Result<Theme, String> {
 }
 
 /// List all available themes (built-in + custom).
-#[tauri::command]
-pub fn list_themes(state: State<'_, AppState>) -> Result<Vec<ThemeInfo>, String> {
+#[tauri::command(async)]
+pub fn  list_themes(state: State<'_, AppState>) -> Result<Vec<ThemeInfo>, String> {
     let db = state.db.lock_safe();
     let mut themes: Vec<ThemeInfo> = Theme::builtin_names()
         .into_iter()
@@ -84,8 +84,8 @@ pub fn list_themes(state: State<'_, AppState>) -> Result<Vec<ThemeInfo>, String>
 }
 
 /// Import a theme from a file path (TOML or JSON).
-#[tauri::command]
-pub fn import_theme(state: State<'_, AppState>, path: String) -> Result<Theme, String> {
+#[tauri::command(async)]
+pub fn  import_theme(state: State<'_, AppState>, path: String) -> Result<Theme, String> {
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("Failed to read theme file: {}", e))?;
 
@@ -116,8 +116,8 @@ pub fn import_theme(state: State<'_, AppState>, path: String) -> Result<Theme, S
 }
 
 /// Import a theme directly from a JSON string (paste in UI).
-#[tauri::command]
-pub fn import_theme_json(state: State<'_, AppState>, json: String) -> Result<Theme, String> {
+#[tauri::command(async)]
+pub fn  import_theme_json(state: State<'_, AppState>, json: String) -> Result<Theme, String> {
     let theme = Theme::from_json(&json)?;
     let db = state.db.lock_safe();
     let key = format!("theme:{}", theme.name);
@@ -139,8 +139,8 @@ pub fn import_theme_json(state: State<'_, AppState>, json: String) -> Result<The
 }
 
 /// Get a single theme by name (built-in or custom).
-#[tauri::command]
-pub fn get_theme(state: State<'_, AppState>, name: String) -> Result<Theme, String> {
+#[tauri::command(async)]
+pub fn  get_theme(state: State<'_, AppState>, name: String) -> Result<Theme, String> {
     if let Some(theme) = Theme::builtin(&name) {
         return Ok(theme);
     }
@@ -153,8 +153,8 @@ pub fn get_theme(state: State<'_, AppState>, name: String) -> Result<Theme, Stri
 }
 
 /// Delete a custom theme by name.
-#[tauri::command]
-pub fn delete_theme(state: State<'_, AppState>, name: String) -> Result<(), String> {
+#[tauri::command(async)]
+pub fn  delete_theme(state: State<'_, AppState>, name: String) -> Result<(), String> {
     let db = state.db.lock_safe();
     db.delete_setting(&format!("theme:{}", name))
         .map_err(|e| e.to_string())?;
@@ -173,8 +173,8 @@ pub fn delete_theme(state: State<'_, AppState>, name: String) -> Result<(), Stri
 }
 
 /// Import keybindings from a VS Code-compatible JSON file.
-#[tauri::command]
-pub fn import_keybindings(
+#[tauri::command(async)]
+pub fn  import_keybindings(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<Vec<rustic_core::config::Keybinding>, String> {
@@ -213,8 +213,8 @@ pub struct VsCodeDetection {
     pub detected_without_overrides: Vec<String>,
 }
 
-#[tauri::command]
-pub fn detect_vscode_keybindings() -> Result<VsCodeDetection, String> {
+#[tauri::command(async)]
+pub fn  detect_vscode_keybindings() -> Result<VsCodeDetection, String> {
     const VARIANTS: &[(&str, &str)] = &[
         ("Visual Studio Code", "Code"),
         ("VS Code Insiders", "Code - Insiders"),

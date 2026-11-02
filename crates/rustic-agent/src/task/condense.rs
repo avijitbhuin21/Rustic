@@ -602,7 +602,7 @@ pub async fn condense_context(
     }];
 
     let (response, used_model) = match provider
-        .chat(condense_input.clone(), vec![], &condense_config, None)
+        .chat(&condense_input, &[], &condense_config, None)
         .await
     {
         Ok(r) => {
@@ -622,7 +622,7 @@ pub async fn condense_context(
                 model_registry::max_output_tokens(&config.model, config.max_tokens);
             retry_config.allowed_providers = config.allowed_providers.clone();
             let r = provider
-                .chat(condense_input, vec![], &retry_config, None)
+                .chat(&condense_input, &[], &retry_config, None)
                 .await?;
             (r, retry_config.model)
         }

@@ -22,7 +22,6 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "process", "tim
 rustic-core = { workspace = true }
 rustic-db = { workspace = true }
 rustic-agent = { workspace = true }
-rustic-git = { workspace = true }
 rustic-terminal = { workspace = true }
 
 base64 = { workspace = true }
@@ -33,7 +32,6 @@ uuid = { workspace = true }
 zstd = { workspace = true, features = ["zstdmt"] }
 notify = { workspace = true, features = ["macos_fsevent"] }
 reqwest = { workspace = true }
-ignore = { workspace = true }
 # Shared `/api/sync/v2/*` chunked-transfer routes (rustic-server + LAN listener).
 axum = "0.7"
 # Peer sync (`peer`): TLS listener pinned to per-device self-signed certs,

@@ -63,8 +63,8 @@ fn budget_to_effort(budget: u32) -> &'static str {
 impl AiProvider for ClaudeProvider {
     async fn chat(
         &self,
-        messages: Vec<Message>,
-        tools: Vec<ToolDef>,
+        messages: &[Message],
+        tools: &[ToolDef],
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
@@ -76,7 +76,7 @@ impl AiProvider for ClaudeProvider {
             .as_deref()
             .unwrap_or("https://api.anthropic.com/v1/messages");
 
-        let (msg_system, api_messages) = convert_messages(&messages);
+        let (msg_system, api_messages) = convert_messages(messages);
         let system_msg = config.system_prompt.as_deref().or(msg_system.as_deref());
 
         // When thinking is enabled the API requires max_tokens > budget_tokens.
@@ -183,7 +183,7 @@ impl AiProvider for ClaudeProvider {
         let mut claude_tools: Vec<serde_json::Value> = Vec::new();
         let mut saw_web_search = false;
         let mut saw_web_fetch = false;
-        for t in &tools {
+        for t in tools {
             match t.name.as_str() {
                 "web_search" => {
                     saw_web_search = true;

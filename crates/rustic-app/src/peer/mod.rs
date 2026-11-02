@@ -376,19 +376,64 @@ pub fn load_or_create_identity_named(
     })
 }
 
+const TOKEN_HASH_PREFIX: &str = "sha256:";
+
+/// Hash a peer token for storage (idempotent on already-hashed values).
+pub fn hash_peer_token(token: &str) -> String {
+    if token.is_empty() || token.starts_with(TOKEN_HASH_PREFIX) {
+        return token.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{TOKEN_HASH_PREFIX}{hex}")
+}
+
+/// Constant-time check of a presented bearer token against a stored `token_in`.
+pub fn peer_token_matches(stored: &str, presented: &str) -> bool {
+    if stored.is_empty() || presented.is_empty() {
+        return false;
+    }
+    let a = hash_peer_token(stored);
+    let b = hash_peer_token(presented);
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Paired devices from `<data_dir>/lan/peers.json`.
 pub fn load_peers(data_dir: &Path) -> Vec<Peer> {
-    std::fs::read_to_string(lan_dir(data_dir).join("peers.json"))
+    let mut peers: Vec<Peer> = std::fs::read_to_string(lan_dir(data_dir).join("peers.json"))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let needs_migration = peers
+        .iter()
+        .any(|p| !p.token_in.is_empty() && !p.token_in.starts_with(TOKEN_HASH_PREFIX));
+    if needs_migration {
+        for p in peers.iter_mut() {
+            p.token_in = hash_peer_token(&p.token_in);
+        }
+        let _ = save_peers(data_dir, &peers);
+    }
+    peers
 }
 
 /// Persist paired devices.
 pub fn save_peers(data_dir: &Path, peers: &[Peer]) -> Result<(), String> {
     let dir = lan_dir(data_dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let text = serde_json::to_string_pretty(peers).map_err(|e| e.to_string())?;
+    let hashed: Vec<Peer> = peers
+        .iter()
+        .cloned()
+        .map(|mut p| {
+            p.token_in = hash_peer_token(&p.token_in);
+            p
+        })
+        .collect();
+    let text = serde_json::to_string_pretty(&hashed).map_err(|e| e.to_string())?;
     rustic_agent::io_util::atomic_write(&dir.join("peers.json"), text.as_bytes())
         .map_err(|e| e.to_string())
 }
@@ -823,6 +868,17 @@ mod tests {
         let peers = load_peers(&dir);
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name, "Laptop 2");
+        assert!(peers[0].token_in.starts_with(TOKEN_HASH_PREFIX));
+        assert!(peer_token_matches(&peers[0].token_in, "i"));
+        assert!(!peer_token_matches(&peers[0].token_in, "x"));
+        assert!(!peer_token_matches(&peers[0].token_in, ""));
+        let raw = r#"[{"device_id":"d2","name":"Old","fingerprint":"f","token_out":"o","token_in":"plain"}]"#;
+        std::fs::write(lan_dir(&dir).join("peers.json"), raw).unwrap();
+        let migrated = load_peers(&dir);
+        assert!(migrated[0].token_in.starts_with(TOKEN_HASH_PREFIX));
+        assert!(peer_token_matches(&migrated[0].token_in, "plain"));
+        let on_disk = std::fs::read_to_string(lan_dir(&dir).join("peers.json")).unwrap();
+        assert!(!on_disk.contains("\"plain\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

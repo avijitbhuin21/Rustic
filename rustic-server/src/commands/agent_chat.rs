@@ -124,7 +124,7 @@ pub struct TurnUsage {
 /// `content` holds display stubs (see `rustic_agent::history_dto`), not raw
 /// `ContentBlock`s: oversized text is truncated and image payloads are dropped,
 /// each carrying a marker the UI uses to fetch the full block on demand.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct MessageDto {
     pub role: String,
     pub content: Vec<serde_json::Value>,
@@ -703,10 +703,6 @@ fn build_mcp_system_section(tools: &[rustic_agent::ToolDef]) -> String {
 #[serde(rename_all = "camelCase")]
 struct CreateTaskArg {
     project_id: String,
-    #[allow(dead_code)]
-    project_name: String,
-    #[allow(dead_code)]
-    project_root: String,
     title: String,
 }
 
@@ -787,7 +783,6 @@ async fn create_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
                 sensitive_files_allowed: false,
                 is_plan_mode: false,
                 shared_permissions: None,
-                cost: Default::default(),
                 goal: rustic_agent::task::goal::new_goal_slot(),
                 last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
@@ -2614,21 +2609,22 @@ fn list_tasks(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
             .find(|p| p.id.to_string() == *pid)
             .map(|p| p.root_path.to_string_lossy().to_string())
     });
-    let db = state.db.lock_safe();
     let rows = if let Some(ref pid) = a.project_id {
-        let mut rows = db.list_tasks_for_project(pid).map_err(|e| e.to_string())?;
-        // See desktop list_tasks: include rows persisted under the DB project
-        // that owns this root path when its id differs (issue #1).
-        if let Some(root) = pid_root {
-            if let Ok(Some(alias)) = db.get_project_by_path(&root) {
-                if alias.id != *pid {
-                    if let Ok(extra) = db.list_tasks_for_project(&alias.id) {
-                        rows.extend(extra);
+        state.read_db(|db| -> Result<_, String> {
+            let mut rows = db.list_tasks_for_project(pid).map_err(|e| e.to_string())?;
+            // See desktop list_tasks: include rows persisted under the DB project
+            // that owns this root path when its id differs (issue #1).
+            if let Some(root) = pid_root {
+                if let Ok(Some(alias)) = db.get_project_by_path(&root) {
+                    if alias.id != *pid {
+                        if let Ok(extra) = db.list_tasks_for_project(&alias.id) {
+                            rows.extend(extra);
+                        }
                     }
                 }
             }
-        }
-        rows
+            Ok(rows)
+        })?
     } else {
         let agent = state.agent.lock_safe();
         return ok(agent
@@ -2637,15 +2633,15 @@ fn list_tasks(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
             .map(|t| t.info.clone())
             .collect::<Vec<_>>());
     };
-    drop(db);
 
-    let db2 = state.db.lock_safe();
-    for row in &rows {
-        if row.status == "Running" || row.status == "Waiting" {
-            let _ = db2.update_task_status(&row.id, "Completed");
+    if rows.iter().any(|r| r.status == "Running" || r.status == "Waiting") {
+        let db2 = state.db.lock_safe();
+        for row in &rows {
+            if row.status == "Running" || row.status == "Waiting" {
+                let _ = db2.update_task_status(&row.id, "Completed");
+            }
         }
     }
-    drop(db2);
 
     let mut agent = state.agent.lock_safe();
     for row in &rows {
@@ -2744,7 +2740,6 @@ fn list_tasks(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
                     sensitive_files_allowed: false,
                     is_plan_mode: false,
                     shared_permissions: None,
-                    cost,
                     goal: std::sync::Arc::new(std::sync::Mutex::new(row.goal.clone().map(
                         |condition| rustic_agent::task::goal::GoalState {
                             condition,
@@ -2814,11 +2809,9 @@ fn get_message_block(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         }
     }
 
-    let db = state.db.lock_safe();
-    let json = db
-        .get_message_content(&a.task_id, a.sort_order)
+    let json = state
+        .read_db(|db| db.get_message_content(&a.task_id, a.sort_order))
         .map_err(|e| ApiError::from(e.to_string()))?;
-    drop(db);
     let json =
         json.ok_or_else(|| ApiError::from(format!("no message at sort_order {}", a.sort_order)))?;
     let content: Vec<ContentBlock> =
@@ -2832,23 +2825,26 @@ fn get_task_messages(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
     let task_id = a.task_id;
     let state = ctx.state();
 
+    let times: std::collections::HashMap<i64, String> = state
+        .read_db(|db| db.get_message_times(&task_id).unwrap_or_default())
+        .into_iter()
+        .collect();
     let mem_dtos: Option<Vec<MessageDto>> = {
-        // Timestamps live only in the DB; pull them up front so the in-memory
-        // fast path can still hand the frontend real per-message times.
-        let times: std::collections::HashMap<i64, String> = {
-            let db = state.db.lock_safe();
-            db.get_message_times(&task_id)
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        };
         let agent = state.agent.lock_safe();
         agent
             .tasks
             .get(&task_id)
             .filter(|task| !task.messages.is_empty())
             .map(|task| {
-                task.messages
+                let fingerprint = rustic_agent::history_dto::history_fingerprint(&task.messages);
+                let mut cache = message_dto_cache().lock_safe();
+                if let Some((cached_fp, cached)) = cache.get(&task_id) {
+                    if *cached_fp == fingerprint {
+                        return cached.clone();
+                    }
+                }
+                let built: Vec<MessageDto> = task
+                    .messages
                     .iter()
                     .enumerate()
                     .filter_map(|(i, m)| {
@@ -2862,24 +2858,28 @@ fn get_task_messages(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
                             content: rustic_agent::history_dto::slim_content(&clean),
                             turn_usage: None,
                             sort_order: Some(i as i64),
-                            created_at: times.get(&(i as i64)).cloned(),
+                            created_at: None,
                         })
                     })
-                    .collect()
+                    .collect();
+                if cache.len() >= MESSAGE_DTO_CACHE_CAP {
+                    cache.clear();
+                }
+                cache.insert(task_id.clone(), (fingerprint, built.clone()));
+                built
             })
     };
-    if let Some(dtos) = mem_dtos {
-        let db = state.db.lock_safe();
-        let archived = archived_history_dtos(&db, &task_id);
-        drop(db);
+    if let Some(mut dtos) = mem_dtos {
+        for dto in dtos.iter_mut() {
+            dto.created_at = dto.sort_order.and_then(|i| times.get(&i).cloned());
+        }
+        let archived = state.read_db(|db| archived_history_dtos(db, &task_id));
         return ok(merge_archived_history(archived, dtos));
     }
 
-    let db = state.db.lock_safe();
-    let rows = db
-        .get_messages_for_task(&task_id)
+    let rows = state
+        .read_db(|db| db.get_messages_for_task(&task_id))
         .map_err(|e| e.to_string())?;
-    drop(db);
 
     let mut dtos = Vec::new();
     let mut messages_for_cache = Vec::new();
@@ -2920,17 +2920,27 @@ fn get_task_messages(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         }
     }
 
-    let db = state.db.lock_safe();
-    let archived = archived_history_dtos(&db, &task_id);
-    drop(db);
+    let archived = state.read_db(|db| archived_history_dtos(db, &task_id));
     ok(merge_archived_history(archived, dtos))
+}
+
+const MESSAGE_DTO_CACHE_CAP: usize = 32;
+
+/// Per-task cache of slimmed in-memory transcripts, keyed by an exact history fingerprint.
+fn message_dto_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<MessageDto>)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<MessageDto>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
 fn get_task_todos(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: TaskIdArg = crate::api::parse(args)?;
-    let db = ctx.state().db.lock_safe();
-    let json = db.get_task_todos(&a.task_id).map_err(|e| e.to_string())?;
-    drop(db);
+    let json = ctx
+        .state()
+        .read_db(|db| db.get_task_todos(&a.task_id))
+        .map_err(|e| e.to_string())?;
     let Some(json) = json else {
         return ok(Vec::<TodoItem>::new());
     };
@@ -3416,8 +3426,6 @@ fn abort_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RespondPermissionArg {
-    #[allow(dead_code)]
-    task_id: String,
     request_id: String,
     approved: Option<bool>,
     decision: Option<String>,

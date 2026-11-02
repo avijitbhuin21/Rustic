@@ -32,7 +32,7 @@ pub use tracker::{
     CaptureOutcome, FileChangeStats, FileDiff, FileHistory, FileHistoryError, RestoreOutcome,
     RevertPlanEntry, TaskNetChange,
 };
-pub use watcher::{FileWatcher, FileWatcherError};
+pub use watcher::{FileWatcher, FileWatcherError, FileWatcherFeed};
 // record_final_state and list_task_net_changes_final are methods on FileHistory,
 // not free functions, so no extra re-exports are needed here.
 pub use walk::{changed_since, join_rel, normalize_rel, walk_for_sweep, WalkedFile};

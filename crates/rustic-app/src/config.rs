@@ -133,29 +133,15 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("rustic-data")
 }
 
-/// 32 bytes of process-unique entropy for the session secret fallback. Uses the
-/// PID, current time, and address-space layout so it differs per process
-/// without pulling in a crypto-RNG dependency at this layer (the server crate
-/// owns `rand` and can override via `RUSTIC_SESSION_SECRET`).
+/// 32 bytes from the OS CSPRNG for the session-secret fallback.
 fn random_secret() -> Vec<u8> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let mut out = Vec::with_capacity(32);
-    let seed_box = Box::new(0u8);
-    let addr = &*seed_box as *const u8 as usize;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    for i in 0..4u64 {
-        let mut h = DefaultHasher::new();
-        std::process::id().hash(&mut h);
-        nanos.hash(&mut h);
-        addr.hash(&mut h);
-        i.hash(&mut h);
-        out.extend_from_slice(&h.finish().to_le_bytes());
+    let mut out = vec![0u8; 32];
+    if rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut out)
+        .is_err()
+    {
+        panic!("OS secure random unavailable; set RUSTIC_SESSION_SECRET");
     }
     out
 }

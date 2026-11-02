@@ -39,8 +39,6 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 /// HTTP per the 2025-03-26 spec, with automatic fallback to the legacy
 /// HTTP+SSE transport from the 2024-11-05 spec).
 pub struct McpClient {
-    #[allow(dead_code)]
-    config: McpServerConfig,
     transport: ClientTransport,
     /// Set when a request timed out or the transport stream died/desynced.
     /// A broken client must not be reused — the owner (McpManager) drops it
@@ -165,7 +163,6 @@ impl McpClient {
                 });
 
                 let mut client = Self {
-                    config,
                     transport: ClientTransport::Stdio {
                         child: Some(child),
                         stdin,
@@ -187,7 +184,6 @@ impl McpClient {
                 // `RemoteTransport::connect`.
                 let transport = RemoteTransport::connect(url.clone(), headers.clone())?;
                 Ok(Self {
-                    config,
                     transport: ClientTransport::Remote(transport),
                     broken: false,
                 })

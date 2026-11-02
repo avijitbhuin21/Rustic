@@ -1,6 +1,7 @@
 pub mod connection;
 pub mod error;
 pub mod models;
+pub mod read_pool;
 
 mod archive_repo;
 mod external_agent_repo;
@@ -14,3 +15,4 @@ mod todo_repo;
 pub use connection::Database;
 pub use error::{DbError, Result};
 pub use models::*;
+pub use read_pool::{PooledDb, ReadPool};

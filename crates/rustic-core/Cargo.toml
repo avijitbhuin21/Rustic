@@ -20,7 +20,6 @@ streaming-iterator = { workspace = true }
 grep-searcher = "0.1"
 grep-matcher = "0.1"
 grep-regex = "0.1"
-tracing = { workspace = true }
 
 [dependencies.tree-sitter-rust]
 version = "0.23"

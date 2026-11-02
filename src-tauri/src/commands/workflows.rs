@@ -69,14 +69,14 @@ fn summarize(body: &str) -> String {
     }
 }
 
-#[tauri::command]
-pub fn list_workflows() -> Result<Vec<WorkflowInfo>, String> {
+#[tauri::command(async)]
+pub fn  list_workflows() -> Result<Vec<WorkflowInfo>, String> {
     let workflows = discover_global_workflows();
     Ok(workflows.iter().map(to_workflow_info).collect())
 }
 
-#[tauri::command]
-pub fn get_workflow_body(name: String) -> Result<String, String> {
+#[tauri::command(async)]
+pub fn  get_workflow_body(name: String) -> Result<String, String> {
     validate_simple_name(&name)?;
     let workflows = discover_global_workflows();
     let workflow = workflows
@@ -87,8 +87,8 @@ pub fn get_workflow_body(name: String) -> Result<String, String> {
     Ok(workflow_body(&content).to_string())
 }
 
-#[tauri::command]
-pub fn create_workflow(name: String, body: String) -> Result<WorkflowInfo, String> {
+#[tauri::command(async)]
+pub fn  create_workflow(name: String, body: String) -> Result<WorkflowInfo, String> {
     let root = workflows_root()?;
     let safe_name = sanitize_name(&name);
     if safe_name.is_empty() {
@@ -115,8 +115,8 @@ pub fn create_workflow(name: String, body: String) -> Result<WorkflowInfo, Strin
 }
 
 /// Update an existing workflow. Renames the `.md` file if the name changes.
-#[tauri::command]
-pub fn update_workflow(
+#[tauri::command(async)]
+pub fn  update_workflow(
     original_name: String,
     name: String,
     body: String,
@@ -159,8 +159,8 @@ pub fn update_workflow(
     })
 }
 
-#[tauri::command]
-pub fn delete_workflow(name: String) -> Result<(), String> {
+#[tauri::command(async)]
+pub fn  delete_workflow(name: String) -> Result<(), String> {
     validate_simple_name(&name)?;
     let root = workflows_root()?;
     let path = root.join(format!("{}.md", name));

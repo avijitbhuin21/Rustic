@@ -33,10 +33,7 @@ impl EventEmitter for TauriEmitter {
 
 /// OS-keychain-backed secret store (Windows Credential Manager, macOS Keychain,
 /// Linux libsecret). Delegates to the existing `crate::secrets` free functions
-/// so behavior is byte-for-byte what the desktop app shipped. Constructed once
-/// the desktop setup is migrated onto the shared `bootstrap()`; kept here now so
-/// the `SecretStore` seam is symmetric across both transports.
-#[allow(dead_code)]
+/// so behavior is byte-for-byte what the desktop app shipped.
 pub struct KeychainSecretStore;
 
 impl SecretStore for KeychainSecretStore {

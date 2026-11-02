@@ -16,12 +16,13 @@
 //! reports errors, we set `DirtyPathAccumulator::mark_lost` so the next
 //! sweep falls back to a full walk — the correctness backstop.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
+use notify::{EventHandler, EventKind, RecursiveMode};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, RecommendedCache};
 
 use super::accumulator::DirtyPathAccumulator;
 use super::walk::HARD_DENY_DIRS;
@@ -31,50 +32,139 @@ use super::walk::HARD_DENY_DIRS;
 /// stays responsive.
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(100);
 
-/// Owning handle for one project's watcher. Drop to stop watching.
-pub struct FileWatcher {
-    /// Held to keep the OS-level watch alive. Field is unread directly but
-    /// dropping it stops watching, which is the entire mechanism here.
-    _debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
+thread_local! {
+    static HANDOFF: RefCell<Option<Box<dyn EventHandler>>> = const { RefCell::new(None) };
+}
+
+/// No-op `notify::Watcher`: the host owns the single OS watch per project and
+/// pushes raw events in, so the debouncer's input handler is captured here
+/// (it is constructed synchronously on the calling thread) instead of being
+/// wired to a second OS-level watcher.
+struct ExternalWatcher;
+
+impl notify::Watcher for ExternalWatcher {
+    fn new<F: EventHandler>(event_handler: F, _config: notify::Config) -> notify::Result<Self> {
+        HANDOFF.with(|h| *h.borrow_mut() = Some(Box::new(event_handler)));
+        Ok(Self)
+    }
+
+    fn watch(&mut self, _path: &Path, _recursive_mode: RecursiveMode) -> notify::Result<()> {
+        Ok(())
+    }
+
+    fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+        Ok(())
+    }
+
+    fn kind() -> notify::WatcherKind {
+        notify::WatcherKind::NullWatcher
+    }
+}
+
+struct FeedInner {
+    input: Mutex<Box<dyn EventHandler>>,
     project_root: PathBuf,
 }
 
+/// Owning handle for one project's file-history event pipeline. Drop to stop.
+pub struct FileWatcher {
+    _debouncer: Debouncer<ExternalWatcher, RecommendedCache>,
+    _feed: Arc<FeedInner>,
+    project_root: PathBuf,
+}
+
+/// Weak sender of raw OS events into a [`FileWatcher`]'s debouncer.
+#[derive(Clone)]
+pub struct FileWatcherFeed {
+    inner: Weak<FeedInner>,
+}
+
 impl FileWatcher {
-    /// Spawn a watcher rooted at `project_root` and feed events into
-    /// `accumulator`. Recursive — all subdirectories except the
-    /// [`HARD_DENY_DIRS`] list are watched.
-    ///
-    /// Returns Err only if the initial `watch()` registration fails (e.g.
-    /// Linux's `fs.inotify.max_user_watches` exceeded for a huge monorepo,
-    /// or trying to watch a path that doesn't exist). On platforms where
-    /// notify falls back to PollWatcher under the hood (network drives,
-    /// WSL paths), construction still succeeds — at higher CPU cost.
-    pub fn spawn(
+    /// Build the debounced pipeline for `project_root` without an OS watch; raw events arrive through the returned feed.
+    pub fn attach(
         project_root: PathBuf,
         accumulator: Arc<DirtyPathAccumulator>,
-    ) -> Result<Self, FileWatcherError> {
+    ) -> Result<(Self, FileWatcherFeed), FileWatcherError> {
         let acc_for_cb = Arc::clone(&accumulator);
-        let mut debouncer = new_debouncer(
+        HANDOFF.with(|h| h.borrow_mut().take());
+        let mut debouncer = new_debouncer_opt::<_, ExternalWatcher, RecommendedCache>(
             DEFAULT_DEBOUNCE,
             None,
             move |result: DebounceEventResult| {
                 handle_events(&acc_for_cb, result);
             },
+            RecommendedCache::new(),
+            notify::Config::default(),
         )
         .map_err(FileWatcherError::Notify)?;
+        let input = HANDOFF
+            .with(|h| h.borrow_mut().take())
+            .ok_or_else(|| FileWatcherError::Notify(notify::Error::generic("debouncer handler not captured")))?;
 
+        // Registers the root with the file-id cache (rename pairing); the
+        // watcher half is a no-op.
         debouncer
             .watch(&project_root, RecursiveMode::Recursive)
             .map_err(FileWatcherError::Notify)?;
 
-        Ok(Self {
-            _debouncer: debouncer,
-            project_root,
-        })
+        let feed = Arc::new(FeedInner {
+            input: Mutex::new(input),
+            project_root: project_root.clone(),
+        });
+        let handle = FileWatcherFeed {
+            inner: Arc::downgrade(&feed),
+        };
+        Ok((
+            Self {
+                _debouncer: debouncer,
+                _feed: feed,
+                project_root,
+            },
+            handle,
+        ))
     }
 
     pub fn project_root(&self) -> &Path {
         &self.project_root
+    }
+}
+
+impl FileWatcherFeed {
+    /// True while the owning `FileWatcher` is still alive.
+    pub fn is_alive(&self) -> bool {
+        self.inner.strong_count() > 0
+    }
+    /// Forward one raw event observed by a watch on `watch_root`; returns false once the owning `FileWatcher` is dropped.
+    pub fn feed(&self, watch_root: &Path, event: &notify::Result<notify::Event>) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        let forwarded = match event {
+            Ok(ev) => {
+                let mut ev = ev.clone();
+                for p in ev.paths.iter_mut() {
+                    *p = rebase(p, watch_root, &inner.project_root);
+                }
+                Ok(ev)
+            }
+            Err(e) => Err(notify::Error::generic(&e.to_string()).set_paths(e.paths.clone())),
+        };
+        if let Ok(mut input) = inner.input.lock() {
+            input.handle_event(forwarded);
+        }
+        true
+    }
+}
+
+/// Re-root `p` from the host watch path onto the accumulator's project root (they differ by canonicalization, e.g. `\\?\`).
+fn rebase(p: &Path, watch_root: &Path, project_root: &Path) -> PathBuf {
+    if p.starts_with(project_root) {
+        return p.to_path_buf();
+    }
+    match p.strip_prefix(watch_root) {
+        Ok(rel) if rel.as_os_str().is_empty() => project_root.to_path_buf(),
+        Ok(rel) => project_root.join(rel),
+        Err(_) => p.to_path_buf(),
     }
 }
 

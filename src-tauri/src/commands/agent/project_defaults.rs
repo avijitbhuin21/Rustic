@@ -14,7 +14,7 @@ pub struct ProjectDefaults {
     pub thinking_effort: Option<String>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_project_defaults(
     state: State<'_, AppState>,
     project_id: String,
@@ -30,7 +30,7 @@ pub fn get_project_defaults(
     Ok(ProjectDefaults::default())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_project_defaults(
     state: State<'_, AppState>,
     project_id: String,

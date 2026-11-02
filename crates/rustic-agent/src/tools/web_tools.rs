@@ -591,7 +591,7 @@ async fn summarize_page(
     }];
 
     let resp = provider
-        .chat(messages, Vec::new(), &sum_config, None)
+        .chat(&messages, &[], &sum_config, None)
         .await
         .ok()?;
 

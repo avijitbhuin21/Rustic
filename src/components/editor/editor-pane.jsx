@@ -6,7 +6,7 @@ import { useEditor, TOGGLEABLE_PREVIEW_KINDS } from '@/state/editor';
 import { useSettings } from '@/state/settings';
 import { COMMAND_BY_ID, effectiveKey, displayKey } from '@/lib/commands';
 import { Skeleton } from '@/components/ui/skeleton';
-import { TerminalPane } from '@/components/terminal/terminal-pane';
+import { TerminalPane } from '@/components/terminal/lazy-terminal-pane';
 import { Logo } from '@/components/logo';
 import { cn } from '@/lib/utils';
 

@@ -164,6 +164,7 @@ function ResourceMonitor() {
   useEffect(() => {
     let active = true;
     const poll = () => {
+      if (document.hidden) return;
       invoke('get_resource_usage')
         .then((u) => { if (active) setUsage(u); })
         .catch(() => {});
@@ -172,7 +173,12 @@ function ResourceMonitor() {
     // 2s cadence — the backend reads cgroup memory + filesystem usage (both
     // O(1)), so this is cheap and feels live as Chromium/dev-servers spin up.
     const id = setInterval(poll, 2000);
-    return () => { active = false; clearInterval(id); };
+    document.addEventListener('visibilitychange', poll);
+    return () => {
+      active = false;
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', poll);
+    };
   }, []);
 
   if (!usage) return null;

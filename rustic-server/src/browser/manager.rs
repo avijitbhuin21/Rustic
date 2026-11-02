@@ -278,9 +278,11 @@ fn spawn_chromium(
     let mut cmd = Command::new(bin);
     cmd.arg("--headless=new")
         .arg(format!("--remote-debugging-port={port}"))
-        .arg("--remote-debugging-address=127.0.0.1")
-        .arg("--no-sandbox")
-        .arg("--disable-dev-shm-usage")
+        .arg("--remote-debugging-address=127.0.0.1");
+    if std::env::var("RUSTIC_CHROMIUM_SANDBOX").ok().as_deref() != Some("1") {
+        cmd.arg("--no-sandbox");
+    }
+    cmd.arg("--disable-dev-shm-usage")
         .arg("--disable-gpu")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")

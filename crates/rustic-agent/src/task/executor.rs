@@ -456,7 +456,7 @@ impl TaskExecutor {
             content: vec![ContentBlock::Text { text: prompt }],
         }];
 
-        match self.provider.chat(messages, Vec::new(), &cfg, None).await {
+        match self.provider.chat(&messages, &[], &cfg, None).await {
             Ok(resp) => {
                 let text = resp
                     .content
@@ -1702,25 +1702,11 @@ impl TaskExecutor {
                 attempt_config.cancel_token = Some(Arc::clone(&per_attempt_cancel));
                 attempt_config.request_overrides = learned_overrides.clone();
 
-                // 5.13: `chat()` takes the conversation by value (changing
-                // the provider trait to borrow would ripple through every
-                // provider), so a copy must stay behind whenever a retry can
-                // still follow this attempt. On the FINAL attempt no retry is
-                // possible — move the Vec instead of cloning it. The only
-                // post-loop reader is the env-gated debug dump, so keep the
-                // clone there when dumping is enabled.
-                let api_messages_for_attempt = if stream_attempt >= MAX_STREAM_ATTEMPTS
-                    && std::env::var("RUSTIC_DUMP_PROMPTS").is_err()
-                {
-                    std::mem::take(&mut api_messages)
-                } else {
-                    api_messages.clone()
-                };
                 let attempt_result = self
                     .provider
                     .chat(
-                        api_messages_for_attempt,
-                        tool_defs.clone(),
+                        &api_messages,
+                        &tool_defs,
                         &attempt_config,
                         Some(stream_cb_attempt),
                     )
@@ -2640,15 +2626,17 @@ impl TaskExecutor {
             };
 
             // Snapshot the parent's history into ToolContext so `spawn_subagent`
-            // can inherit it into the child's initial messages (the user asked
-            // for sub-agents to skip re-reading files the parent already
-            // loaded). Done once per turn, before tool dispatch — tools don't
-            // mutate `messages` themselves, so a snapshot taken here stays
-            // consistent for every tool call in this turn. The clone is O(n),
-            // but n is bounded by turn-aware compaction and a single clone
-            // per turn is well within the noise.
-            if let Ok(mut snap) = context.parent_message_snapshot.lock() {
-                *snap = messages.clone();
+            // can inherit it into the child's initial messages. Only taken on
+            // turns that actually spawn a sub-agent — the O(n) clone is wasted
+            // otherwise. Tools don't mutate `messages`, so a snapshot taken
+            // here stays consistent for every tool call in this turn.
+            if tool_uses
+                .iter()
+                .any(|(_, name, _)| name == "spawn_subagent")
+            {
+                if let Ok(mut snap) = context.parent_message_snapshot.lock() {
+                    *snap = messages.clone();
+                }
             }
 
             // Smart concurrency: read-only tools run in parallel, write tools run sequentially after.

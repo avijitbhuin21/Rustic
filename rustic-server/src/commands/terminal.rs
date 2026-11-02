@@ -688,7 +688,6 @@ fn detect_shells_blocking() -> Result<Vec<ShellInfo>, String> {
 }
 
 /// Search PATH for an executable.
-#[allow(dead_code)]
 fn find_in_path(exe: &str) -> Option<String> {
     if let Ok(path_var) = std::env::var("PATH") {
         let separator = if cfg!(windows) { ';' } else { ':' };

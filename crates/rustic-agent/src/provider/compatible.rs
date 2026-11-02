@@ -24,8 +24,8 @@ impl CompatibleProvider {
 impl AiProvider for CompatibleProvider {
     async fn chat(
         &self,
-        messages: Vec<Message>,
-        tools: Vec<ToolDef>,
+        messages: &[Message],
+        tools: &[ToolDef],
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {

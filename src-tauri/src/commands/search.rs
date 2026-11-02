@@ -47,7 +47,7 @@ pub fn cancel_search(state: State<'_, AppState>) {
     search_ops::cancel_search(&state);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn replace_in_file(
     path: String,
     pattern: String,
@@ -66,7 +66,7 @@ pub fn replace_in_file(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn replace_all_in_files(
     plans: Vec<FileReplacePlan>,
     pattern: String,

@@ -151,6 +151,24 @@ impl Database {
         Ok(db)
     }
 
+    /// Open a read-only connection to an existing database (no migrations); used by `ReadPool`.
+    pub fn open_reader(path: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        conn.execute_batch("PRAGMA cache_size=-8192;")?;
+        conn.execute_batch("PRAGMA mmap_size=268435456;")?;
+        conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
+        conn.set_prepared_statement_cache_capacity(64);
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;

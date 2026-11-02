@@ -36,8 +36,8 @@ impl GeminiProvider {
 impl AiProvider for GeminiProvider {
     async fn chat(
         &self,
-        messages: Vec<Message>,
-        tools: Vec<ToolDef>,
+        messages: &[Message],
+        tools: &[ToolDef],
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
@@ -67,7 +67,7 @@ impl AiProvider for GeminiProvider {
         let mut function_decls: Vec<Value> = Vec::new();
         let mut saw_web_search = false;
         let mut saw_web_fetch = false;
-        for t in &tools {
+        for t in tools {
             match t.name.as_str() {
                 "web_search" => saw_web_search = true,
                 "web_fetch" => saw_web_fetch = true,
@@ -98,7 +98,7 @@ impl AiProvider for GeminiProvider {
             tool_groups.push(json!({ "url_context": {} }));
         }
 
-        let contents = convert_messages(&messages);
+        let contents = convert_messages(messages);
 
         let mut generation_config = json!({
             "maxOutputTokens": config.max_tokens,

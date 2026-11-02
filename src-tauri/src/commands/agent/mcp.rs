@@ -87,7 +87,7 @@ fn resolve_scope_path(
 
 /// Return the current JSON text for a scope. If the file does not exist yet,
 /// returns a blank template so the user has something to edit.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_mcp_json(
     app: AppHandle,
     state: State<'_, AppState>,

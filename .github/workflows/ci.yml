@@ -12,6 +12,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -21,10 +24,10 @@ jobs:
     name: Rust (cargo check + test)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           # Keep in sync with rust-toolchain.toml at the repo root. dtolnay's
           # @stable sets RUSTUP_TOOLCHAIN, which would override the toolchain
@@ -33,7 +36,7 @@ jobs:
           components: clippy
 
       - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: ". -> target"
 
@@ -60,15 +63,15 @@ jobs:
     name: Rust (rustic-server, Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.91.0"
 
       - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: ". -> target"
 
@@ -80,10 +83,10 @@ jobs:
     name: Rust (cargo fmt)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.91.0"
           components: rustfmt
@@ -95,10 +98,10 @@ jobs:
     name: Rust (cargo audit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.91.0"
 
@@ -106,29 +109,20 @@ jobs:
         run: cargo install cargo-audit --locked
 
       # Scan Cargo.lock for RustSec advisories (vulns + unmaintained/yanked).
-      # Ignored advisories are transitive deps that need a MAJOR version bump
-      # of a direct dependency — revisit when upgrading:
-      #   RUSTSEC-2026-0187  lopdf 0.38 → ≥0.42 (breaking API; PDF preview)
-      #   RUSTSEC-2026-0194  quick-xml < 0.41 (pinned by calamine/docx-rs)
-      #   RUSTSEC-2026-0195  quick-xml < 0.41 (same parents)
       - name: cargo audit
-        run: >-
-          cargo audit
-          --ignore RUSTSEC-2026-0187
-          --ignore RUSTSEC-2026-0194
-          --ignore RUSTSEC-2026-0195
+        run: cargo audit
 
   licenses:
     name: Rust (cargo deny — licences)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Fails the build on a copyleft (GPL / AGPL / LGPL-only) dependency:
       # Rustic ships binaries with no LICENSE file, so one cannot be linked in.
       # Policy lives in deny.toml; advisories stay with the cargo audit job.
       - name: cargo deny (licences + sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check licenses sources
 
@@ -136,10 +130,10 @@ jobs:
     name: Frontend (bun build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: bun install
         run: bun install --frozen-lockfile

@@ -15,3 +15,9 @@ SERVER_IMPLEMENTATION_PLAN.md
 audit-report/
 app-audit/
 *.bak
+.updater-signing.key
+.updater-signing.key.pub
+PLAN.md
+references/
+issues/
+.codex/

@@ -13,10 +13,13 @@ if (IS_WEB) {
     .then((m) => { wsTerminalSend = m.sendTerminalInput; })
     .catch(() => {});
 }
-import {
-  disposeTerminalInstance,
-  reconcileTerminalInstances,
-} from '@/components/terminal/terminal-instance';
+/** Run `fn` against the terminal-instance module only if a pane already loaded it (no instances exist otherwise). */
+function withInstances(fn) {
+  if (!globalThis.__rusticTerminalInstances) return;
+  import('@/components/terminal/terminal-instance').then(fn).catch(() => {});
+}
+const disposeTerminalInstance = (id) => withInstances((m) => m.disposeTerminalInstance(id));
+const reconcileTerminalInstances = (ids) => withInstances((m) => m.reconcileTerminalInstances(ids));
 
 let listenersWired = false;
 const outputSubscribers = new Map();
