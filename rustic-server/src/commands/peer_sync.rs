@@ -93,6 +93,74 @@ struct NameArg {
     name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FsPathArg {
+    device_id: String,
+    project_id: String,
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemsArg {
+    device_id: String,
+    items: Vec<peer::consent::RequestedFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalConflictsArg {
+    dest_dir: String,
+    items: Vec<peer::consent::RequestedFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteConflictsArg {
+    device_id: String,
+    project_id: String,
+    #[serde(default)]
+    dir: String,
+    names: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullFilesArg {
+    device_id: String,
+    items: Vec<peer::consent::RequestedFile>,
+    dest_dir: String,
+    #[serde(default)]
+    opts: ops::FileTransferOpts,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PushFilesArg {
+    device_id: String,
+    local_paths: Vec<String>,
+    project_id: String,
+    #[serde(default)]
+    dir: String,
+    #[serde(default)]
+    opts: ops::FileTransferOpts,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetaViewArg {
+    device_id: String,
+    allowed: bool,
+}
+
+#[derive(Deserialize)]
+struct TransferIdArg {
+    #[serde(default)]
+    id: Option<String>,
+}
+
 /// Switch pairing on/off for the server (persisted). Identity only.
 async fn set_enabled(ctx: &ServerContext, enabled: bool) -> Result<(), String> {
     let host = ServerPeerHost::arc(ctx);
@@ -122,11 +190,15 @@ async fn run(ctx: &ServerContext, command: &str, args: &Value) -> Result<Value, 
         }
         "lan_pair_code" => {
             let a: DeviceArg = parse(args)?;
-            ok(ops::pair_code(lan, &a.device_id)?)
+            ok(ops::pair_code_for(&host, lan, &a.device_id)?)
         }
         "lan_pair" => {
             let a: DeviceArg = parse(args)?;
             ok(ops::pair(&host, lan, &a.device_id).await?)
+        }
+        "lan_cancel_outgoing" => {
+            let a: DeviceArg = parse(args)?;
+            ok(ops::cancel_outgoing(lan, &a.device_id)?)
         }
         "lan_respond_pair" => {
             let a: RespondArg = parse(args)?;
@@ -134,8 +206,75 @@ async fn run(ctx: &ServerContext, command: &str, args: &Value) -> Result<Value, 
         }
         "lan_forget" => {
             let a: DeviceArg = parse(args)?;
-            ok(ops::forget(&host, &a.device_id)?)
+            ok(ops::forget(&host, lan, &a.device_id).await?)
         }
+        "lan_list_files" => {
+            let a: FsPathArg = parse(args)?;
+            ok(ops::list_files(&host, lan, &a.device_id, &a.project_id, &a.path).await?)
+        }
+        "lan_preview_file" => {
+            let a: FsPathArg = parse(args)?;
+            ok(ops::preview_file(&host, lan, &a.device_id, &a.project_id, &a.path).await?)
+        }
+        "lan_remote_size" => {
+            let a: ItemsArg = parse(args)?;
+            ok(ops::remote_size(&host, lan, &a.device_id, &a.items).await?)
+        }
+        "lan_local_conflicts" => {
+            let a: LocalConflictsArg = parse(args)?;
+            ok(ops::local_conflicts(&a.dest_dir, &a.items))
+        }
+        "lan_remote_conflicts" => {
+            let a: RemoteConflictsArg = parse(args)?;
+            ok(ops::remote_conflicts(&host, lan, &a.device_id, &a.project_id, &a.dir, a.names).await?)
+        }
+        "lan_pull_files" => {
+            let a: PullFilesArg = parse(args)?;
+            ok(ops::pull_files(&host, lan, &a.device_id, a.items, a.dest_dir, a.opts).await?)
+        }
+        "lan_push_files" => {
+            let a: PushFilesArg = parse(args)?;
+            ok(ops::push_files(&host, lan, &a.device_id, a.local_paths, a.project_id, a.dir, a.opts).await?)
+        }
+        "lan_request_meta_access" => {
+            let a: DeviceArg = parse(args)?;
+            ok(ops::request_meta_access(&host, lan, &a.device_id).await?)
+        }
+        "lan_meta_browse" => {
+            let a: DeviceArg = parse(args)?;
+            ok(ops::meta_browse(&host, lan, &a.device_id).await?)
+        }
+        "lan_set_meta_view" => {
+            let a: MetaViewArg = parse(args)?;
+            ok(ops::set_meta_view(&host, &a.device_id, a.allowed)?)
+        }
+        "lan_get_meta_view" => {
+            let a: DeviceArg = parse(args)?;
+            ok(ops::paired(&host, &a.device_id)?.meta_view)
+        }
+        "lan_announce" => {
+            ops::announce(&host, lan).await;
+            ok(())
+        }
+        "lan_transfers" => ok(rustic_app::transfers::list()),
+        "lan_transfer_cancel" => {
+            let a: TransferIdArg = parse(args)?;
+            ok(rustic_app::transfers::cancel(a.id.as_deref().unwrap_or_default())?)
+        }
+        "lan_transfer_pause" => {
+            let a: TransferIdArg = parse(args)?;
+            ok(rustic_app::transfers::pause(a.id.as_deref().unwrap_or_default())?)
+        }
+        "lan_transfer_resume" => {
+            let a: TransferIdArg = parse(args)?;
+            ok(rustic_app::transfers::resume(a.id.as_deref().unwrap_or_default())?)
+        }
+        "lan_transfer_clear" => {
+            let a: TransferIdArg = parse(args)?;
+            rustic_app::transfers::clear(a.id.as_deref());
+            ok(())
+        }
+        "lan_version" => ok(peer::app_version()),
         "lan_rename" => {
             let a: RenameArg = parse(args)?;
             ok(ops::rename(&host, &a.device_id, &a.nickname)?)

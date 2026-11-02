@@ -2,6 +2,7 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
+@import "./recipes.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -114,6 +115,20 @@
   --topbar-height: 36px;
   --statusbar-height: 24px;
   --activitybar-width: 48px;
+  /* Semantic theme tokens (light defaults; `.dark` + the theme bridge override).
+     `ink` = the color overlays/glass tints are mixed from (black on light,
+     white on dark) — use `bg-ink/10` etc. instead of hardcoded white/black.
+     `scrim` = always-dark backdrops and shadows. Status colors come from the
+     active theme's bright_* slots. */
+  --ink: oklch(0.145 0 0);
+  --scrim: oklch(0 0 0);
+  --success: #1f7a45;
+  --warning: #9a6b00;
+  --danger: #c4373a;
+  --info: #2f5fd0;
+  --special: #6b4fc4;
+  --highlight: #b45a1c;
+  --on-status: oklch(1 0 0);
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -303,6 +318,15 @@ body {
   --color-chart-2: var(--chart-2);
   --color-chart-1: var(--chart-1);
   --color-ring: var(--ring);
+  --color-ink: var(--ink);
+  --color-scrim: var(--scrim);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+  --color-special: var(--special);
+  --color-highlight: var(--highlight);
+  --color-on-status: var(--on-status);
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
@@ -330,6 +354,14 @@ body {
 }
 
 .dark {
+  --ink: oklch(1 0 0);
+  --success: #86efac;
+  --warning: #fcd34d;
+  --danger: #f87171;
+  --info: #7dd3fc;
+  --special: #c4b5fd;
+  --highlight: #fdba74;
+  --on-status: oklch(0.145 0 0);
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
@@ -814,4 +846,49 @@ body {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+@keyframes transfer-indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+
+/* Security-critical prompts (theme trust, permission, pairing / transfer
+   approvals) carry `data-rustic-protected`. Theme CSS is scoped to stop at this
+   boundary, and these fixed tokens override whatever palette the active theme
+   set, so a theme can't hide, recolor or imitate them. */
+[data-rustic-protected] {
+  --background: #16181c;
+  --foreground: #f2f3f5;
+  --card: #1d2025;
+  --card-foreground: #f2f3f5;
+  --popover: #1d2025;
+  --popover-foreground: #f2f3f5;
+  --primary: #e8eaee;
+  --primary-foreground: #16181c;
+  --secondary: #2a2e35;
+  --secondary-foreground: #f2f3f5;
+  --muted: #2a2e35;
+  --muted-foreground: #b4b9c2;
+  --accent: #2a2e35;
+  --accent-foreground: #f2f3f5;
+  --destructive: #f87171;
+  --border: #3a3f48;
+  --input: #3a3f48;
+  --ring: #8ab4ff;
+  --ink: #ffffff;
+  --success: #86efac;
+  --warning: #fcd34d;
+  --danger: #f87171;
+  --info: #7dd3fc;
+  --special: #c4b5fd;
+  --highlight: #fdba74;
+  --on-status: #16181c;
+  --radius: 0.625rem;
+  color-scheme: dark;
+  color: var(--foreground);
+  font-family: 'Victor Mono', ui-monospace, monospace !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  isolation: isolate;
 }

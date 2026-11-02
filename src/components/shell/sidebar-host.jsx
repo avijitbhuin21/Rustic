@@ -5,6 +5,7 @@ import { Explorer } from '@/components/explorer/explorer';
 import { SearchPanel } from '@/components/search/search-panel';
 import ScmPanel from '@/components/scm/scm-panel';
 import { AgentTaskTree } from '@/components/agent/agent-task-tree';
+import { SyncOverlay as SyncPanel } from '@/components/sync/sync-overlay';
 import { cn } from '@/lib/utils';
 
 function openFileInEditor(path, opts) {
@@ -18,6 +19,7 @@ const PANEL_IDS = [
   SIDEBAR_PANELS.SEARCH,
   SIDEBAR_PANELS.SCM,
   SIDEBAR_PANELS.AGENT,
+  SIDEBAR_PANELS.SYNC,
 ];
 
 function panelComponent(id) {
@@ -26,6 +28,7 @@ function panelComponent(id) {
     case SIDEBAR_PANELS.SEARCH:    return <SearchPanel onOpenFile={openFileInEditor} />;
     case SIDEBAR_PANELS.SCM:       return <ScmPanel />;
     case SIDEBAR_PANELS.AGENT:     return <AgentTaskTree />;
+    case SIDEBAR_PANELS.SYNC:      return <SyncPanel />;
     default: return null;
   }
 }

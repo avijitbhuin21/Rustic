@@ -4,6 +4,7 @@ import React, { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
+import { formatBytes } from '@/lib/transfer-format';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
@@ -29,11 +30,29 @@ export function LanPairPrompt() {
           const p = e.payload || {};
           if (p.request_id) setTransfers((q) => [...q, p]);
         }));
+        add(await listen('lan-pair-cancelled', (e) => {
+          const id = e.payload?.request_id;
+          if (!id) return;
+          setQueue((q) => {
+            if (q.some((x) => x.request_id === id)) toast.info('The pairing request was cancelled');
+            return q.filter((x) => x.request_id !== id);
+          });
+        }));
+        add(await listen('lan-transfer-cancelled', (e) => {
+          const id = e.payload?.request_id;
+          if (id) setTransfers((q) => q.filter((x) => x.request_id !== id));
+        }));
+        add(await listen('lan-peer-unpaired', (e) => {
+          const p = e.payload || {};
+          toast.info(`${p.name || 'A device'} unpaired from this machine`);
+        }));
         add(await listen('lan-sync-received', (e) => {
           const p = e.payload || {};
           if (p.metadata) {
             toast.success(`${p.from} synced metadata (providers, rules, skills, MCP) into this machine`);
             window.dispatchEvent(new CustomEvent('rustic:extensions-changed'));
+          } else if (p.files != null) {
+            toast.success(`${p.from} sent ${p.files} file${p.files === 1 ? '' : 's'}${p.dir ? ` to ${p.dir}` : ''}`);
           } else if (p.scoped) {
             toast.success(`${p.from} pushed a project to this machine`);
           } else {
@@ -73,25 +92,49 @@ export function LanPairPrompt() {
   };
 
   const isPush = transfer?.kind === 'push';
+  const isMetaAccess = transfer?.kind === 'meta_access';
   const tProjects = transfer?.projects || [];
   const tMeta = transfer?.meta || [];
+  const tFiles = transfer?.files || [];
   const replacing = tProjects.filter((p) => p.exists);
 
   return (
     <>
     <Dialog open={!!transfer} onOpenChange={(open) => !open && respondTransfer(false)}>
-      <DialogContent className="max-w-md">
+      <DialogContent className="max-w-md" data-rustic-protected="">
         <DialogHeader>
           <DialogTitle>
-            {isPush ? `${transfer?.from} wants to push to this machine` : `${transfer?.from} wants to pull from this machine`}
+            {isMetaAccess
+              ? `${transfer?.from} wants to browse this machine's metadata`
+              : isPush ? `${transfer?.from} wants to send to this machine` : `${transfer?.from} wants to pull from this machine`}
           </DialogTitle>
           <DialogDescription>
-            {isPush
-              ? 'These items will be written into your workspace. Projects you already have are replaced with the incoming copy; selected metadata overwrites same-name items.'
-              : 'These items will be sent to the other machine. Nothing leaves this machine unless you approve.'}
+            {isMetaAccess
+              ? 'They will be able to view all your metadata (providers, rules, skills, MCP, settings — including saved API keys) until you revoke it. Copying any item still needs your approval each time.'
+              : isPush
+                ? 'These items will be written into your workspace. Name clashes are handled the way the sender chose (rename, auto-rename or replace).'
+                : 'These items will be sent to the other machine. Nothing leaves this machine unless you approve.'}
+            {transfer?.total_bytes ? ` Total: ${formatBytes(transfer.total_bytes)}.` : ''}
           </DialogDescription>
         </DialogHeader>
+        {!isMetaAccess && (
         <div className="max-h-72 space-y-3 overflow-y-auto rounded-md border border-border/50 p-2 text-[12px]">
+          {tFiles.length > 0 && (
+            <div className="space-y-1">
+              <div className="text-[10.5px] uppercase tracking-wider text-muted-foreground/70">{isPush ? 'Incoming files' : 'Files & folders'}</div>
+              {tFiles.map((f, i) => (
+                <div key={`${f.project_id}/${f.path}/${i}`} className="space-y-0.5">
+                  <div className="flex items-center gap-2">
+                    <span className="w-24 shrink-0 truncate text-[10.5px] text-muted-foreground">{f.project_name || 'project'}</span>
+                    <span className="truncate font-mono">{isPush ? `→ /${f.path || ''}` : (f.path || '/ (whole project)')}</span>
+                  </div>
+                  {isPush && (f.names || []).map((n) => (
+                    <div key={n} className="truncate pl-[6.5rem] font-mono text-muted-foreground">{n}</div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
           {tProjects.length > 0 && (
             <div className="space-y-1">
               <div className="text-[10.5px] uppercase tracking-wider text-muted-foreground/70">Projects</div>
@@ -99,7 +142,7 @@ export function LanPairPrompt() {
                 <div key={p.id} className="flex items-center gap-2">
                   <span className="truncate">{p.name || p.id}</span>
                   {isPush && (
-                    <span className={p.exists ? 'ml-auto text-[10.5px] text-amber-500' : 'ml-auto text-[10.5px] text-emerald-500'}>
+                    <span className={p.exists ? 'ml-auto text-[10.5px] text-warning' : 'ml-auto text-[10.5px] text-success'}>
                       {p.exists ? 'replaces yours' : 'new'}
                     </span>
                   )}
@@ -119,21 +162,22 @@ export function LanPairPrompt() {
             </div>
           )}
         </div>
+        )}
         {isPush && replacing.length > 0 && (
-          <p className="text-[11.5px] text-amber-500">
+          <p className="text-[11.5px] text-warning">
             {replacing.length} project{replacing.length === 1 ? '' : 's'} on this machine will be wiped and replaced.
           </p>
         )}
         <DialogFooter>
           <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => respondTransfer(false)}>Deny</Button>
           <Button size="sm" variant={isPush && replacing.length ? 'destructive' : 'default'} className="h-7 text-xs" onClick={() => respondTransfer(true)}>
-            {isPush ? 'Accept push' : 'Approve pull'}
+            {isMetaAccess ? 'Allow browsing' : isPush ? 'Accept' : 'Approve'}
           </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
     <Dialog open={!!current} onOpenChange={(open) => !open && respond(false)}>
-      <DialogContent className="max-w-sm">
+      <DialogContent className="max-w-sm" data-rustic-protected="">
         <DialogHeader>
           <DialogTitle>Pair with {current?.name}?</DialogTitle>
           <DialogDescription>

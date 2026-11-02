@@ -168,10 +168,10 @@ export function RulesPanel() {
             })}
           </ul>
         </ScrollArea>
-        <div className="flex w-1/2 flex-col">
+        <div className="flex min-h-0 w-1/2 flex-col">
           {activeName ? (
             <>
-              <div className="border-b border-border p-1.5">
+              <div className="shrink-0 border-b border-border p-1.5">
                 <Input
                   value={editName}
                   onChange={(e) => setEditName(e.target.value)}
@@ -182,10 +182,10 @@ export function RulesPanel() {
               <Textarea
                 value={body}
                 onChange={(e) => setBody(e.target.value)}
-                className="flex-1 resize-none rounded-none border-0 font-mono text-[11px]"
+                className="min-h-0 flex-1 resize-none overflow-y-auto rounded-none border-0 font-mono text-[11px] [field-sizing:fixed]"
                 placeholder="Rule body..."
               />
-              <div className="border-t border-border p-1.5">
+              <div className="shrink-0 border-t border-border p-1.5">
                 <Button size="sm" className="h-7 w-full text-xs" onClick={save}>
                   <Save className="mr-1 size-3" /> Save
                 </Button>

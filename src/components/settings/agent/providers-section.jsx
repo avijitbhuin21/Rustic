@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import { InfoTip } from '@/components/ui/info-tip';
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
@@ -206,7 +207,10 @@ export function EditProviderDialog({ open, onClose, onSaved, providerType, provi
             </div>
           )}
           <div>
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">API Key</div>
+            <div className="mb-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted-foreground/70">
+              API Key
+              <InfoTip>Existing key stays in your OS keychain. Type a new one only if you want to replace it.</InfoTip>
+            </div>
             <div className="relative">
               <Input
                 type={showKey ? 'text' : 'password'}
@@ -223,9 +227,6 @@ export function EditProviderDialog({ open, onClose, onSaved, providerType, provi
                 {showKey ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
               </button>
             </div>
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Existing key stays in your OS keychain. Type a new one only if you want to replace it.
-            </p>
           </div>
           {error && (
             <div className="text-[11px] text-destructive break-all">{error}</div>
@@ -254,7 +255,7 @@ export function ConnectCard({ provider, configured, onSaved }) {
     return (
       <>
         <div className="flex items-center gap-2 px-3 py-2.5">
-          <span className="size-2 rounded-sm bg-emerald-500" />
+          <span className="size-2 rounded-sm bg-success" />
           <span className="text-[13px] font-medium flex-1">{provider.label}</span>
           <Badge variant="outline" className="h-5 text-[10px]">connected</Badge>
           <Button
@@ -451,7 +452,7 @@ export function CompatibleEntryCard({ entry, onChanged }) {
   return (
     <>
       <div className="flex items-center gap-2 px-3 py-2.5">
-        <span className="size-2 rounded-sm bg-emerald-500" />
+        <span className="size-2 rounded-sm bg-success" />
         <span className="text-[13px] font-medium">
           OpenAI-Compatible {entry.name ? <span className="text-muted-foreground">— {entry.name}</span> : null}
         </span>
@@ -582,7 +583,7 @@ export function FreeBuffCard({ configured, onSaved }) {
     <>
       <div className="px-3 py-2.5">
         <div className="flex items-center gap-2">
-          <span className={cn('size-2 rounded-sm', isOn ? 'bg-emerald-500' : 'bg-muted-foreground/40')} />
+          <span className={cn('size-2 rounded-sm', isOn ? 'bg-success' : 'bg-muted-foreground/40')} />
           <span className="text-[13px] font-medium flex-1">FreeBuff</span>
           {isOn && (
             <Button
@@ -663,13 +664,15 @@ export function FreeBuffKeysDialog({ open, onClose }) {
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent aria-describedby={undefined} className="w-[480px] sm:max-w-[480px] p-0 gap-0">
         <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">FreeBuff account keys</DialogTitle>
+          <DialogTitle className="flex items-center gap-1.5 text-[14px]">
+            FreeBuff account keys
+            <InfoTip side="bottom">
+              Paste one or more FreeBuff auth keys (comma or newline separated) to pool multiple
+              accounts. When one hits its daily limit, FreeBuff automatically fails over to the next.
+            </InfoTip>
+          </DialogTitle>
         </DialogHeader>
         <div className="px-5 py-4 space-y-3">
-          <p className="text-[12px] italic leading-snug text-muted-foreground">
-            Paste one or more FreeBuff auth keys (comma or newline separated) to pool multiple
-            accounts. When one hits its daily limit, FreeBuff automatically fails over to the next.
-          </p>
           <textarea
             value={rawKeys}
             onChange={(e) => setRawKeys(e.target.value)}
@@ -698,7 +701,7 @@ export function FreeBuffKeysDialog({ open, onClose }) {
               {tokens.map((t) => (
                 <li key={t.id} className="flex items-center gap-2 text-[12px]">
                   <span
-                    className={cn('size-1.5 shrink-0 rounded-full', t.valid ? 'bg-emerald-500' : 'bg-destructive')}
+                    className={cn('size-1.5 shrink-0 rounded-full', t.valid ? 'bg-success' : 'bg-destructive')}
                     title={t.valid ? 'Valid' : 'Revoked / invalid'}
                   />
                   <span className="flex-1 truncate">{t.email || t.id}</span>

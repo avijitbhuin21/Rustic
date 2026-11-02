@@ -128,6 +128,14 @@ impl Default for EditorSettings {
 pub struct ThemeSettings {
     pub active_theme: String,
     pub custom_themes: Vec<String>,
+    /// `"dark"`, `"light"` or `"system"` — picks the variant of themes that
+    /// ship both.
+    #[serde(default = "default_theme_mode")]
+    pub mode: String,
+}
+
+fn default_theme_mode() -> String {
+    "dark".to_string()
 }
 
 impl Default for ThemeSettings {
@@ -135,6 +143,7 @@ impl Default for ThemeSettings {
         Self {
             active_theme: "Obsidian".to_string(),
             custom_themes: Vec::new(),
+            mode: default_theme_mode(),
         }
     }
 }

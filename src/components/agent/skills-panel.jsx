@@ -185,6 +185,9 @@ export function SkillsPanel() {
                         >
                           {name}
                         </button>
+                        {r.scope === 'builtin' ? (
+                          <span className="shrink-0 text-[10px] text-muted-foreground">built-in</span>
+                        ) : (
                         <Button
                           size="icon"
                           variant="ghost"
@@ -193,6 +196,7 @@ export function SkillsPanel() {
                         >
                           <Trash2 className="size-3" />
                         </Button>
+                        )}
                       </li>
                     );
                   })}

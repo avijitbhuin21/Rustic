@@ -1,14 +1,15 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, X, Trash2, Check, FolderOpen, Pencil, Copy, Zap } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, Check, FolderOpen, Zap } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+  Dialog, DialogContent, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { open as openFilePicker } from '@tauri-apps/plugin-dialog';
 import { readFile } from '@tauri-apps/plugin-fs';
 import { useSettings } from '@/state/settings';
+import { ThemesSection } from './themes-section';
 import { cn } from '@/lib/utils';
 
 // ─── Font target definitions ──────────────────────────────────────────────────
@@ -185,7 +186,7 @@ function FontApplicationDialog({ font, open, onClose }) {
                     <span className={cn(
                       'text-[10px] px-1.5 py-0.5 rounded border',
                       monoMismatch
-                        ? 'text-amber-500 border-amber-500/40 bg-amber-500/10'
+                        ? 'text-warning border-warning/40 bg-warning/10'
                         : 'text-muted-foreground/70 border-border/60'
                     )}>
                       monospace
@@ -410,300 +411,13 @@ function FontsSection() {
   );
 }
 
-// ─── Theme Card & Color Palette (unchanged) ────────────────────────────────────
-
-// Only show swatches for fields the theme bridge actually paints into the
-// chrome. Other fields (bright_green/yellow/blue/purple/aqua/orange, token_*,
-// extra bg/fg shades) are stored on the Theme struct but nothing in the
-// current UI reads them, so showing them was misleading — users were seeing
-// lavender / aqua swatches that never appear anywhere in the app.
-const SWATCH_KEYS = ['bg', 'bg1', 'bg2', 'fg', 'fg2', 'accent', 'border', 'bright_red'];
-
-function ThemeCard({ info, fullTheme, isActive, onActivate, onDelete, onEdit }) {
-  const swatches = fullTheme ? SWATCH_KEYS.map((k) => fullTheme[k]).filter(Boolean) : [];
-
-  return (
-    <div className={cn(
-      'rounded-xl border p-3 transition-colors',
-      isActive ? 'border-primary/50 bg-primary/5' : 'border-border/50 bg-muted/20 hover:border-border',
-    )}>
-      <div className="flex items-center gap-2 mb-2.5">
-        <span className="flex-1 text-[13px] font-medium">{info.name}</span>
-        <Badge variant="outline" className="h-5 px-1.5 text-[10px] text-muted-foreground border-border/60">
-          {info.is_builtin ? 'Built-in' : 'Custom'}
-        </Badge>
-        <Button variant="ghost" size="icon-sm" onClick={() => onEdit?.(info)}
-          className="size-6 cursor-pointer text-muted-foreground hover:text-foreground"
-          title="Edit / copy JSON">
-          <Pencil className="size-3" />
-        </Button>
-        {!info.is_builtin && onDelete && (
-          <Button variant="ghost" size="icon-sm" onClick={() => onDelete(info.name)}
-            className="size-6 cursor-pointer text-muted-foreground hover:text-destructive">
-            <Trash2 className="size-3" />
-          </Button>
-        )}
-      </div>
-      <div className="flex flex-wrap gap-1 mb-3">
-        {swatches.length > 0
-          ? swatches.map((color, i) => (
-              <span key={i} className="inline-block size-5 rounded-sm border border-black/10"
-                style={{ backgroundColor: color }} title={color} />
-            ))
-          : <span className="text-[11px] text-muted-foreground">Loading colors…</span>
-        }
-      </div>
-      <div className="flex items-center gap-2">
-        <Button size="sm" variant={isActive ? 'default' : 'secondary'}
-          className="h-6 px-3 text-[11px] cursor-pointer"
-          onClick={() => !isActive && onActivate(info.name)} disabled={isActive}>
-          {isActive ? <><Check className="size-3 mr-1" />Active</> : 'Activate'}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-// ─── Edit Theme Dialog ────────────────────────────────────────────────────────
-
-function EditThemeDialog({ open, theme, isBuiltin, onClose, onSaved }) {
-  const importThemeJson = useSettings((s) => s.importThemeJson);
-  const [json, setJson]       = useState('');
-  const [error, setError]     = useState('');
-  const [saving, setSaving]   = useState(false);
-  const [copied, setCopied]   = useState(false);
-
-  useEffect(() => {
-    if (!open || !theme) return;
-    // Built-in names are reserved (getTheme prefers builtin), so editing a
-    // built-in must save under a different name or the new version is
-    // invisible. Pre-suffix " Copy" — user can rename further if they want.
-    const seed = isBuiltin ? { ...theme, name: `${theme.name} Copy` } : theme;
-    setJson(JSON.stringify(seed, null, 2));
-    setError('');
-    setCopied(false);
-  }, [open, theme?.name, isBuiltin]);
-
-  async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(json);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch (e) {
-      setError(`Copy failed: ${e}`);
-    }
-  }
-
-  async function handleSave() {
-    setSaving(true);
-    setError('');
-    try {
-      await importThemeJson(json);
-      onSaved?.();
-      onClose();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent aria-describedby={undefined} className="w-[560px] sm:max-w-[560px] gap-0 p-0 overflow-hidden">
-        <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">
-            {isBuiltin ? `Edit "${theme?.name}" (copy)` : `Edit "${theme?.name}"`}
-          </DialogTitle>
-          <p className="text-[12px] text-muted-foreground mt-1">
-            {isBuiltin
-              ? 'Built-in themes can’t be modified in place — saving creates a new custom theme. Rename freely.'
-              : 'Edit the JSON below and Save to update this theme.'}
-          </p>
-        </DialogHeader>
-        <div className="px-5 py-4 space-y-2">
-          <textarea
-            value={json}
-            onChange={(e) => setJson(e.target.value)}
-            className={cn(
-              'w-full h-80 resize-none rounded-lg border border-border/50 bg-muted/30',
-              'px-3 py-2.5 text-[12px] font-mono text-foreground',
-              'focus:outline-none focus:ring-1 focus:ring-ring',
-            )}
-            spellCheck={false}
-          />
-          {error && <p className="text-[12px] text-destructive">{error}</p>}
-        </div>
-        <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60 flex-row justify-between sm:justify-between gap-2">
-          <Button variant="ghost" size="sm" className="gap-1.5 text-xs cursor-pointer" onClick={handleCopy}>
-            {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-            {copied ? 'Copied' : 'Copy JSON'}
-          </Button>
-          <div className="flex gap-2">
-            <Button variant="outline" size="sm" className="text-xs cursor-pointer" onClick={onClose}>Cancel</Button>
-            <Button size="sm" className="text-xs cursor-pointer" onClick={handleSave} disabled={saving || !json.trim()}>
-              {saving ? 'Saving…' : 'Save'}
-            </Button>
-          </div>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function AddThemeModal({ open, onClose, onImported }) {
-  const importTheme     = useSettings((s) => s.importTheme);
-  const importThemeJson = useSettings((s) => s.importThemeJson);
-
-  const [json, setJson]           = useState('');
-  const [importing, setImporting] = useState(false);
-  const [error, setError]         = useState('');
-
-  async function handleImportJson() {
-    if (!json.trim()) return;
-    setImporting(true);
-    setError('');
-    try {
-      await importThemeJson(json.trim());
-      setJson('');
-      onClose();
-      onImported?.();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setImporting(false);
-    }
-  }
-
-  async function handleBrowseFile() {
-    setError('');
-    try {
-      const path = await openFilePicker({
-        title: 'Select a theme file',
-        filters: [{ name: 'Theme files', extensions: ['json', 'toml'] }],
-      });
-      if (!path) return;
-      setImporting(true);
-      await importTheme(path);
-      onClose();
-      onImported?.();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setImporting(false);
-    }
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent aria-describedby={undefined} className="w-[520px] sm:max-w-[520px] gap-0 p-0 overflow-hidden">
-        <DialogHeader className="px-5 pt-5 pb-4 border-b border-border/60">
-          <DialogTitle className="text-[14px]">Add Color Palette</DialogTitle>
-          <p className="text-[12px] text-muted-foreground mt-1">
-            Paste a theme JSON below, or browse for a <code className="text-[11px]">.json</code> / <code className="text-[11px]">.toml</code> file.
-          </p>
-        </DialogHeader>
-        <div className="px-5 py-4 space-y-3">
-          <textarea
-            value={json}
-            onChange={(e) => setJson(e.target.value)}
-            placeholder={'{\n  "name": "My Theme",\n  "kind": "dark",\n  "bg": "#1a1a2e",\n  ...\n}'}
-            className={cn(
-              'w-full h-48 resize-none rounded-lg border border-border/50 bg-muted/30',
-              'px-3 py-2.5 text-[12px] font-mono text-foreground placeholder:text-muted-foreground/50',
-              'focus:outline-none focus:ring-1 focus:ring-ring',
-            )}
-            spellCheck={false}
-          />
-          {error && <p className="text-[12px] text-destructive">{error}</p>}
-        </div>
-        <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60 flex-row justify-between sm:justify-between gap-2">
-          <Button variant="ghost" size="sm" className="gap-1.5 text-xs cursor-pointer"
-            onClick={handleBrowseFile} disabled={importing}>
-            <FolderOpen className="size-3.5" />
-            Browse file
-          </Button>
-          <div className="flex gap-2">
-            <Button variant="outline" size="sm" className="text-xs cursor-pointer" onClick={onClose}>Cancel</Button>
-            <Button size="sm" className="text-xs cursor-pointer"
-              onClick={handleImportJson} disabled={importing || !json.trim()}>
-              {importing ? 'Importing…' : 'Import'}
-            </Button>
-          </div>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function ColorPaletteSection() {
-  const themes         = useSettings((s) => s.themes);
-  const activeTheme    = useSettings((s) => s.activeTheme);
-  const setActiveTheme = useSettings((s) => s.setActiveTheme);
-  const deleteTheme    = useSettings((s) => s.deleteTheme);
-  const getTheme       = useSettings((s) => s.getTheme);
-
-  const [fullThemes, setFullThemes] = useState({});
-  const [addOpen, setAddOpen]       = useState(false);
-  const [editTarget, setEditTarget] = useState(null); // { info, theme } or null
-
-  async function fetchFullThemes(list) {
-    const results = {};
-    await Promise.all(list.map(async (info) => {
-      try { results[info.name] = await getTheme(info.name); } catch { /* skip */ }
-    }));
-    setFullThemes(results);
-  }
-
-  useEffect(() => { if (themes.length > 0) fetchFullThemes(themes); }, [themes]);
-
-  function handleEdit(info) {
-    const t = fullThemes[info.name];
-    if (!t) return;
-    setEditTarget({ info, theme: t });
-  }
-
-  return (
-    <section data-settings-anchor="color-palette" className="mb-6">
-      <div className="flex items-center justify-between mb-2 px-1">
-        <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/70">
-          Color Palette
-        </h3>
-        <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px] gap-1 cursor-pointer"
-          onClick={() => setAddOpen(true)}>
-          <Plus className="size-3" />Import
-        </Button>
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        {themes.map((info) => (
-          <ThemeCard key={info.name} info={info} fullTheme={fullThemes[info.name]}
-            isActive={activeTheme?.name === info.name}
-            onActivate={setActiveTheme}
-            onDelete={deleteTheme}
-            onEdit={handleEdit}
-          />
-        ))}
-      </div>
-      <AddThemeModal open={addOpen} onClose={() => setAddOpen(false)}
-        onImported={() => fetchFullThemes(themes)} />
-      <EditThemeDialog
-        open={!!editTarget}
-        theme={editTarget?.theme}
-        isBuiltin={!!editTarget?.info?.is_builtin}
-        onClose={() => setEditTarget(null)}
-        onSaved={() => fetchFullThemes(themes)}
-      />
-    </section>
-  );
-}
-
 // ─── Root export ───────────────────────────────────────────────────────────────
 
 export function AppearanceSettings() {
   return (
     <>
       <FontsSection />
-      <ColorPaletteSection />
+      <ThemesSection />
     </>
   );
 }

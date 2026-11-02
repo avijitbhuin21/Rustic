@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Loader2, ShieldAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
@@ -112,9 +113,9 @@ export function statusBadge(status, enabled = true) {
   const st = status || { state: 'unknown' };
   if (st.state === 'connected') {
     const n = st.tool_count ?? 0;
-    return { label: `Connected · ${n} tool${n === 1 ? '' : 's'}`, tone: 'border-emerald-500/40 text-emerald-500' };
+    return { label: `Connected · ${n} tool${n === 1 ? '' : 's'}`, tone: 'border-success/40 text-success' };
   }
-  if (st.state === 'failed') return { label: 'Failed', tone: 'border-rose-500/40 text-rose-500' };
+  if (st.state === 'failed') return { label: 'Failed', tone: 'border-danger/40 text-danger' };
   return { label: 'Idle', tone: 'border-border/60 text-muted-foreground' };
 }
 
@@ -225,9 +226,9 @@ export function McpAddServerDialog({ open, onClose }) {
               <Button size="sm" variant="outline" className="h-7 text-xs" onClick={runTest} disabled={testing}>
                 {testing ? <><Loader2 className="mr-1 size-3 animate-spin" /> Testing…</> : 'Test'}
               </Button>
-              <span className="text-[10.5px] text-muted-foreground">Paste a standard <code>{'{"mcpServers": {...}}'}</code> block — several servers are added at once.</span>
+              <InfoTip>Paste a standard <code>{'{"mcpServers": {...}}'}</code> block — several servers are added at once.</InfoTip>
             </div>
-            {error && <p className="break-all text-[11px] text-rose-500">{error}</p>}
+            {error && <p className="break-all text-[11px] text-danger">{error}</p>}
           </div>
           <div className="flex w-[440px] shrink-0 flex-col gap-3 overflow-hidden p-4">
             <PaneSwitch
@@ -250,12 +251,12 @@ export function McpAddServerDialog({ open, onClose }) {
                   <div key={t.name} className="space-y-1.5">
                     {tested.length > 1 && <div className="font-mono text-[11.5px] font-medium">{t.name}</div>}
                     {t.error ? (
-                      <div className="break-all text-[11.5px] text-rose-500">Failed: {t.error}</div>
+                      <div className="break-all text-[11.5px] text-danger">Failed: {t.error}</div>
                     ) : t.tools.length === 0 ? (
                       <div className="text-[11.5px] text-muted-foreground">Connected · no tools advertised.</div>
                     ) : (
                       <>
-                        <div className="text-[11px] text-emerald-500">Connected · {t.tools.length} tool{t.tools.length === 1 ? '' : 's'}</div>
+                        <div className="text-[11px] text-success">Connected · {t.tools.length} tool{t.tools.length === 1 ? '' : 's'}</div>
                         {t.tools.map((tool) => (
                           <div key={tool.name} className="rounded-md px-1 py-0.5 hover:bg-muted/40" title={tool.description || undefined}>
                             <div className="truncate font-mono text-[12px] text-foreground/90">{tool.name}</div>
@@ -451,7 +452,7 @@ export function McpConfigureDialog({ server, open, onClose }) {
                   <div className="truncate text-[12px] font-medium">{selected.projectName}</div>
                   <div className="truncate font-mono text-[10.5px] text-muted-foreground">{selected.rootPath}</div>
                 </div>
-                {selected.error && <p className="break-all text-[11px] text-rose-500">{selected.error}</p>}
+                {selected.error && <p className="break-all text-[11px] text-danger">{selected.error}</p>}
                 <JsonArea value={json} onChange={setJson} disabled={!enabled} className="h-auto min-h-[200px] flex-1" />
                 <div className="flex items-center gap-2">
                   <Button size="sm" className="h-7 text-xs" onClick={save} disabled={!enabled || saving}>
@@ -468,8 +469,8 @@ export function McpConfigureDialog({ server, open, onClose }) {
                     className={cn(
                       'rounded-md border px-3 py-2 text-[11.5px]',
                       !result.enabled ? 'border-border/60 text-muted-foreground'
-                        : result.connected ? 'border-emerald-500/40 text-emerald-500'
-                          : 'border-rose-500/40 text-rose-500',
+                        : result.connected ? 'border-success/40 text-success'
+                          : 'border-danger/40 text-danger',
                     )}
                   >
                     {!result.enabled
@@ -480,8 +481,8 @@ export function McpConfigureDialog({ server, open, onClose }) {
                   </div>
                 )}
                 {result?.consentRequired && (
-                  <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-[11.5px]">
-                    <div className="flex items-center gap-2 text-amber-500">
+                  <div className="space-y-2 rounded-md border border-warning/40 bg-warning/5 px-3 py-2 text-[11.5px]">
+                    <div className="flex items-center gap-2 text-warning">
                       <ShieldAlert className="size-3.5 shrink-0" />
                       This project's .mcp.json has changes made outside Rustic that you haven't approved yet.
                     </div>
@@ -495,7 +496,7 @@ export function McpConfigureDialog({ server, open, onClose }) {
                     )}
                   </div>
                 )}
-                {error && <p className="break-all text-[11px] text-rose-500">{error}</p>}
+                {error && <p className="break-all text-[11px] text-danger">{error}</p>}
               </>
             ) : (
               <div className="text-[12px] text-muted-foreground">

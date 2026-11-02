@@ -216,8 +216,8 @@ function DiffHeader({
       <span className="min-w-0 flex-1 truncate text-xs">{path}</span>
       {(additions > 0 || deletions > 0) && (
         <span className="flex shrink-0 items-center gap-1 font-mono text-[10px]">
-          <span className="text-emerald-500">+{additions}</span>
-          <span className="text-red-500">−{deletions}</span>
+<span className="text-success">+{additions}</span>
+            <span className="text-danger">−{deletions}</span>
         </span>
       )}
       {hunkCount > 0 && onPrevHunk && onNextHunk && (

@@ -12,16 +12,17 @@ import {
   Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
+import { InfoTip } from '@/components/ui/info-tip';
 
 // Visual treatment per github_issues.status (see migration 017 for the
 // lifecycle). Keys are the raw DB values.
 const STATUS_META = {
   queued: { label: 'Queued', icon: CircleDashed, className: 'text-muted-foreground' },
-  working: { label: 'Working', icon: Loader2, className: 'text-blue-500', spin: true },
-  waiting_reply: { label: 'Waiting for reply', icon: MessageCircleQuestion, className: 'text-amber-500' },
-  done: { label: 'Done', icon: CheckCircle2, className: 'text-emerald-500' },
+  working: { label: 'Working', icon: Loader2, className: 'text-info', spin: true },
+  waiting_reply: { label: 'Waiting for reply', icon: MessageCircleQuestion, className: 'text-warning' },
+  done: { label: 'Done', icon: CheckCircle2, className: 'text-success' },
   failed: { label: 'Failed', icon: OctagonX, className: 'text-destructive' },
-  manual: { label: 'Manual', icon: UserRound, className: 'text-purple-500' },
+  manual: { label: 'Manual', icon: UserRound, className: 'text-special' },
 };
 
 /// Auto-resolve queue: every tracked GitHub issue with its live status.
@@ -65,8 +66,11 @@ export function IssueQueueDialog({ open, onClose }) {
     <Dialog open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
       <DialogContent className="max-w-lg">
         <DialogHeader>
-          <DialogTitle>GitHub issue queue</DialogTitle>
-          <DialogDescription>
+          <DialogTitle className="flex items-center gap-1.5">
+            GitHub issue queue
+            <InfoTip>Issues auto-tracked from connected repos. Click one to open its chat.</InfoTip>
+          </DialogTitle>
+          <DialogDescription className="sr-only">
             Issues auto-tracked from connected repos. Click one to open its chat.
           </DialogDescription>
         </DialogHeader>

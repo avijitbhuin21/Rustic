@@ -164,7 +164,7 @@ const MatchRow = React.memo(function MatchRow({ file, match, ordinal, onOpenFile
         <span data-search-match className={cn('truncate font-mono', excluded && 'line-through opacity-50')}>
           {before}
           <mark className={cn('search-match-highlight px-0.5 text-foreground', preview != null && 'line-through opacity-60')}>{hit}</mark>
-          {preview != null && <span className="rounded bg-green-500/20 px-0.5 text-foreground">{preview}</span>}
+          {preview != null && <span className="rounded bg-success/20 px-0.5 text-foreground">{preview}</span>}
           {after}
         </span>
       </button>

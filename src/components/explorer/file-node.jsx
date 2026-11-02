@@ -53,12 +53,12 @@ import { useLongPress } from '@/lib/use-long-press';
 import { openRowMenu } from '@/lib/open-row-menu';
 
 const GIT_TINT = {
-  M: 'text-yellow-500',
-  A: 'text-emerald-500',
-  D: 'text-red-500',
-  R: 'text-blue-500',
-  U: 'text-orange-500',
-  '?': 'text-emerald-400',
+    M: 'text-warning',
+    A: 'text-success',
+    D: 'text-danger',
+    R: 'text-info',
+    U: 'text-highlight',
+    '?': 'text-success',
 };
 
 const GIT_LABEL = {
@@ -597,7 +597,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
           )}
           {!node.isEditing && isFolder && gitStatus && (
             <span
-              className="ml-auto mr-1.5 size-1.5 shrink-0 rounded-full bg-yellow-500/60"
+              className="ml-auto mr-1.5 size-1.5 shrink-0 rounded-full bg-warning/60"
               title="Contains changes"
             />
           )}

@@ -16,6 +16,7 @@ import {
   ContextMenuItem, ContextMenuSeparator,
 } from '@/components/ui/context-menu';
 import { toast } from 'sonner';
+import { TransfersTray } from '@/components/transfers/transfers-tray';
 
 function trimPath(raw) {
   if (!raw || raw.length <= 55) return raw;
@@ -117,7 +118,7 @@ function Tab({
                   <X className="size-3.5" />
                 ) : (
                   <>
-                    <span className="size-2 rounded-full bg-yellow-400 group-hover/tab:hidden" />
+                    <span className="size-2 rounded-full bg-warning group-hover/tab:hidden" />
                     <X className="size-3 hidden group-hover/tab:block" />
                   </>
                 )
@@ -353,6 +354,7 @@ export function TabBar({ groupId }) {
           the chat header takes over that responsibility, so we drop the
           offset here. */}
       <div className="flex shrink-0 items-center gap-px px-1" style={{ paddingRight: needsWindowControlsOffset ? WINDOW_CONTROLS_OFFSET : 4 }}>
+        {isRightmost && <TransfersTray />}
         {/* Split this group */}
         <Tooltip>
           <TooltipTrigger asChild>

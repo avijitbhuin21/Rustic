@@ -1,0 +1,105 @@
+/* ─────────────────────────── Obsidian (IDE default theme) + Victor Mono overlay ───────────────────────────
+   Loaded after cred.css: keeps NeoPOP shapes, swaps in the Obsidian greyscale palette
+   (crates/rustic-core/src/config/theme.rs) and the editor's Victor Mono type. */
+@font-face { font-family: "Victor Mono"; src: url("/VictorMono-Regular.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "Victor Mono"; src: url("/VictorMono-Medium.woff2") format("woff2"); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: "Victor Mono"; src: url("/VictorMono-SemiBold.woff2") format("woff2"); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: "Victor Mono"; src: url("/VictorMono-Bold.woff2") format("woff2"); font-weight: 700 900; font-style: normal; font-display: swap; }
+@font-face { font-family: "Victor Mono"; src: url("/VictorMono-Italic.woff2") format("woff2"); font-weight: 400 500; font-style: italic; font-display: swap; }
+@font-face { font-family: "Victor Mono"; src: url("/VictorMono-BoldItalic.woff2") format("woff2"); font-weight: 600 900; font-style: italic; font-display: swap; }
+
+:root {
+  --bg: oklch(0.145 0 0);
+  --bg-2: oklch(0.175 0 0);
+  --bg-3: oklch(0.205 0 0);
+  --fg: oklch(0.985 0 0);
+  --fg-2: oklch(0.78 0 0);
+  --fg-3: oklch(0.556 0 0);
+  --line: oklch(1 0 0 / 10%);
+  --line-2: oklch(0.335 0 0);
+  --accent: oklch(0.922 0 0);
+  --accent-2: oklch(0.922 0 0);
+  --accent-soft: oklch(1 0 0 / 8%);
+  --ext: oklch(0.269 0 0);
+  --ok: #86efac;
+  --green: #86efac; --yellow: #fcd34d; --blue: #7dd3fc; --purple: #c4b5fd; --orange: #fdba74;
+  --sans: "Victor Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --serif: "Victor Mono", ui-monospace, monospace;
+  --mono: "Victor Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+/* ── type: everything italic (Victor Mono's cursive), headings upright ── */
+body { font-family: var(--sans); font-style: italic; font-feature-settings: normal; }
+h1, h2, h3, h4, h5, .display, .display-sm, .h2, .step-title, .server-kicker, .stat-n, .dl-os, .brand, .intro-word, .footer-giant { font-style: normal; }
+.display, .display-sm, .h2 { font-weight: 700; letter-spacing: -0.04em; }
+.display { font-size: clamp(2.3rem, 6.6vw, 6.4rem); line-height: 1.02; max-width: 16ch; }
+.display-sm { font-size: clamp(2.2rem, 6vw, 5.4rem); }
+.h2 { font-size: clamp(1.8rem, 3.9vw, 3.3rem); line-height: 1.1; max-width: 24ch; }
+.card h3, .benefit h4, .step-title, .server-kicker, .dl-os { font-weight: 700; letter-spacing: -0.03em; }
+.serif { font-family: var(--serif); font-style: italic; font-weight: 700; font-size: 1em; letter-spacing: -0.03em; color: oklch(0.708 0 0); }
+.stat-n { font-weight: 700; letter-spacing: -0.06em; }
+.lede, .sub { line-height: 1.7; }
+code, .chips li, .term-body, .big-link { font-style: normal; }
+/* product mockups stay upright so they read like the real app */
+.mock, .phone, .term { font-style: normal; }
+.code .c { font-style: italic; }
+
+/* ── greyscale accents ── */
+::selection { background: var(--fg); color: oklch(0.145 0 0); }
+.serif { color: oklch(0.708 0 0); }
+.eyebrow { color: oklch(0.708 0 0); }
+.pulse { background: var(--green); box-shadow: 0 0 0 0 rgba(134, 239, 172, 0.6); }
+@keyframes pulse { 70% { box-shadow: 0 0 0 10px rgba(134, 239, 172, 0); } 100% { box-shadow: 0 0 0 0 rgba(134, 239, 172, 0); } }
+.progress span { background: var(--fg); }
+.orb-a { background: radial-gradient(circle at 30% 30%, rgba(255, 255, 255, 0.12), transparent 65%); }
+.orb-b { background: radial-gradient(circle at 60% 40%, rgba(196, 181, 253, 0.1), transparent 65%); }
+.swap::after { background: var(--fg); }
+.nav.scrolled { background: oklch(0.145 0 0 / 0.85); }
+
+.btn-primary { background: oklch(0.985 0 0); color: oklch(0.145 0 0); border-color: oklch(0.985 0 0); --edge-r: oklch(0.708 0 0); --edge-b: oklch(0.556 0 0); }
+.btn-primary:hover { background: oklch(0.922 0 0); color: oklch(0.145 0 0); border-color: oklch(0.922 0 0); --edge-r: oklch(0.708 0 0); --edge-b: oklch(0.556 0 0); }
+.btn-ghost { background: var(--bg); color: var(--fg); border-color: oklch(0.708 0 0); --edge-r: oklch(0.4 0 0); --edge-b: oklch(0.269 0 0); }
+.btn-ghost:hover { background: var(--bg-2); color: var(--fg); border-color: var(--fg); --edge-r: oklch(0.556 0 0); --edge-b: oklch(0.335 0 0); }
+
+.card, .stat, .dl, .benefit { --ext: oklch(0.269 0 0); background: var(--bg-2); }
+.card:hover, .stat:hover, .dl:hover, .benefit:hover { --ext: oklch(0.708 0 0); border-color: oklch(0.708 0 0); background: var(--bg-3); }
+.card::before, .dl::before, .benefit::before, .step::before { background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 50%), rgba(255, 255, 255, 0.05), transparent 45%); }
+.card-icon, .card:hover .card-icon { background: var(--bg-3); color: var(--fg); border: 1px solid var(--line-2); }
+.chips li:hover { background: var(--fg); border-color: var(--fg); color: oklch(0.145 0 0); }
+.stat-n { color: var(--fg); }
+.stat:nth-child(1) .stat-n { color: var(--green); }
+.stat:nth-child(2) .stat-n { color: var(--fg); }
+.stat:nth-child(3) .stat-n { color: var(--orange); }
+.stat:nth-child(4) .stat-n { color: var(--purple); }
+.benefit svg { stroke: var(--fg); }
+.benefit:nth-child(1) svg { stroke: var(--blue); }
+.benefit:nth-child(2) svg { stroke: var(--purple); }
+.benefit:nth-child(3) svg { stroke: var(--green); }
+.benefit:nth-child(4) svg { stroke: var(--yellow); }
+.benefit:nth-child(5) svg { stroke: var(--orange); }
+.dl.recommended { --ext: oklch(0.708 0 0); border-color: oklch(0.708 0 0); }
+.dl.recommended::after { background: var(--fg); color: oklch(0.145 0 0); }
+.dl:hover .dl-arrow { color: var(--fg); }
+
+.marquee { background: oklch(0.922 0 0); }
+.marquee-track { color: oklch(0.145 0 0); font-style: normal; }
+.marquee-track i { color: oklch(0.556 0 0); }
+
+.ticks li::before { border-color: var(--fg); background: linear-gradient(var(--fg), var(--fg)) center / 6px 6px no-repeat; }
+.step-num { color: oklch(0.708 0 0); font-style: normal; }
+.step:hover .step-num { color: var(--fg); }
+.big-link::before { background: var(--fg); }
+.roll span::before { font-style: italic; }
+.roll span::after { color: var(--fg); }
+.section-dark { background: oklch(0.1 0 0); }
+
+.mock, .term {
+  box-shadow: 1px 1px 0 var(--ext), 2px 2px 0 var(--ext), 3px 3px 0 var(--ext), 4px 4px 0 var(--ext), 5px 5px 0 var(--ext), 6px 6px 0 var(--ext), 7px 7px 0 var(--ext), 8px 8px 0 var(--ext), 0 40px 120px -40px rgba(0, 0, 0, 0.9);
+}
+.term-body .p { color: var(--green); }
+.caret { background: var(--fg); }
+.phone { box-shadow: 0 50px 120px -40px rgba(0, 0, 0, 0.95), 0 30px 90px -50px rgba(255, 255, 255, 0.12), inset 0 0 0 2px rgba(0, 0, 0, 0.6); }
+
+.footer { background: oklch(0.1 0 0); }
+.footer-cols h5 { color: oklch(0.708 0 0); font-style: normal; }
+.footer-giant span { background: linear-gradient(180deg, rgba(255, 255, 255, 0.2) 10%, rgba(255, 255, 255, 0.02) 95%); -webkit-background-clip: text; background-clip: text; }

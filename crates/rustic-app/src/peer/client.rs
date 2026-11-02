@@ -196,7 +196,23 @@ where
             rep.tick("uploading", &format_transfer(done, total), done, total);
         }
     });
-    let sent = tc::upload(&ep, kind, Arc::clone(&grow), progress).await;
+    let transfer = reporter.transfer();
+    let upload = tc::upload(&ep, kind, Arc::clone(&grow), progress);
+    let sent = match &transfer {
+        Some(t) => tokio::select! {
+            r = upload => r,
+            _ = t.cancelled() => {
+                grow.fail("cancelled");
+                let archive = archive.clone();
+                tokio::spawn(async move {
+                    let _ = packer.await;
+                    let _ = tokio::fs::remove_file(&archive).await;
+                });
+                return Err("Cancelled".into());
+            }
+        },
+        None => upload.await,
+    };
     let packed = packer.await.map_err(|e| e.to_string()).and_then(|r| r);
     let result = match (packed, sent) {
         (Err(e), _) => Err(e),
@@ -247,7 +263,20 @@ where
         rep.tick("downloading", &format_transfer(done, total), done, total);
     });
     reporter.stage("packing", "the other side is building the archive", 0, 0);
-    let got = tc::download(&ep, request.clone(), Arc::clone(&asm), progress).await;
+    let transfer = reporter.transfer();
+    let download = tc::download(&ep, request.clone(), Arc::clone(&asm), progress);
+    let got = match &transfer {
+        Some(t) => tokio::select! {
+            r = download => r,
+            _ = t.cancelled() => {
+                asm.fail("cancelled");
+                let _ = extractor.await;
+                let _ = tokio::fs::remove_file(&archive).await;
+                return Err("Cancelled".into());
+            }
+        },
+        None => download.await,
+    };
     let result = match got {
         Ok(()) => extractor.await.map_err(|e| e.to_string()).and_then(|r| r),
         Err(tc::TransferError::Unsupported) => {

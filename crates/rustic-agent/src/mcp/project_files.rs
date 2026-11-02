@@ -40,7 +40,9 @@ pub fn validate_entry(name: &str, entry: &Value) -> Result<()> {
         .as_object()
         .ok_or_else(|| anyhow!("Server \"{}\" must be a JSON object", name))?;
     let has_command = obj.get("command").and_then(|v| v.as_str()).is_some();
-    let has_url = obj.get("url").and_then(|v| v.as_str()).is_some();
+    let has_url = ["url", "serverUrl", "httpUrl"]
+        .iter()
+        .any(|k| obj.get(*k).and_then(|v| v.as_str()).is_some());
     if !has_command && !has_url {
         return Err(anyhow!(
             "Server \"{}\" needs either a \"command\" (stdio) or a \"url\" (http/sse)",

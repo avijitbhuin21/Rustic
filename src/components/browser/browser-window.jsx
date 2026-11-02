@@ -192,7 +192,7 @@ export function BrowserWindow() {
   const minimizedPill = (
     <button
       onClick={() => useBrowser.getState().restore()}
-      className="fixed bottom-8 right-4 z-[80] flex items-center gap-2 rounded-lg border border-white/10 bg-background/90 px-3 py-2 text-xs text-foreground shadow-xl backdrop-blur-xl"
+      className="fixed bottom-8 right-4 z-[80] flex items-center gap-2 rounded-lg border border-ink/10 bg-background/90 px-3 py-2 text-xs text-foreground shadow-xl backdrop-blur-xl"
     >
       <Globe className="size-4 text-primary/80" />
       Browser
@@ -227,7 +227,7 @@ export function BrowserWindow() {
         exit={{ opacity: 0, scale: 0.98 }}
         transition={{ type: 'spring', stiffness: 420, damping: 32, mass: 0.7 }}
         className={cn(
-          'fixed z-[80] flex flex-col overflow-hidden border border-white/10 bg-[#1b1d21] shadow-[0_16px_64px_rgba(0,0,0,0.6)]',
+          'fixed z-[80] flex flex-col overflow-hidden border border-ink/10 bg-popover shadow-[0_16px_64px_color-mix(in_oklab,var(--scrim)_60%,transparent)]',
           maximized ? 'rounded-none' : 'rounded-xl',
         )}
         style={geo}
@@ -237,7 +237,7 @@ export function BrowserWindow() {
           onPointerDown={onTitlePointerDown}
           onDoubleClick={() => useBrowser.getState().toggleMaximize()}
           className={cn(
-            'flex h-9 shrink-0 items-center justify-between gap-2 border-b border-white/[0.06] bg-[#16181c] px-2',
+            'flex h-9 shrink-0 items-center justify-between gap-2 border-b border-ink/[0.06] bg-card px-2',
             !maximized && 'cursor-grab active:cursor-grabbing',
           )}
         >
@@ -266,7 +266,7 @@ export function BrowserWindow() {
         </div>
 
         {/* Tab strip */}
-        <div className="flex h-8 shrink-0 items-center gap-1 overflow-x-auto border-b border-white/[0.06] bg-[#16181c] px-1.5">
+        <div className="flex h-8 shrink-0 items-center gap-1 overflow-x-auto border-b border-ink/[0.06] bg-card px-1.5">
           {tabs.map((tab) => (
             <div
               key={tab.id}
@@ -274,8 +274,8 @@ export function BrowserWindow() {
               className={cn(
                 'group flex h-6 max-w-[180px] cursor-pointer items-center gap-1.5 rounded-md px-2 text-xs',
                 tab.id === activeTabId
-                  ? 'bg-white/10 text-foreground'
-                  : 'text-muted-foreground hover:bg-white/5',
+                  ? 'bg-ink/10 text-foreground'
+                  : 'text-muted-foreground hover:bg-ink/5',
               )}
             >
               {tab.favicon ? (
@@ -292,7 +292,7 @@ export function BrowserWindow() {
                     e.stopPropagation();
                     useBrowser.getState().openExternal(tab);
                   }}
-                  className="ml-0.5 hidden rounded p-0.5 hover:bg-white/10 group-hover:block"
+                  className="ml-0.5 hidden rounded p-0.5 hover:bg-ink/10 group-hover:block"
                 >
                   <ExternalLink className="size-3" />
                 </button>
@@ -303,7 +303,7 @@ export function BrowserWindow() {
                   e.stopPropagation();
                   useBrowser.getState().closeTab(tab.id);
                 }}
-                className="ml-0.5 hidden rounded p-0.5 hover:bg-white/10 group-hover:block"
+                className="ml-0.5 hidden rounded p-0.5 hover:bg-ink/10 group-hover:block"
               >
                 <X className="size-3" />
               </button>
@@ -313,14 +313,14 @@ export function BrowserWindow() {
             data-window-control
             title="New tab"
             onClick={() => useBrowser.getState().newTab()}
-            className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-white/10 hover:text-foreground"
+            className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-ink/10 hover:text-foreground"
           >
             <Plus className="size-3.5" />
           </button>
         </div>
 
         {/* Address bar */}
-        <div className="flex h-9 shrink-0 items-center gap-1 border-b border-white/[0.06] bg-[#16181c] px-2">
+        <div className="flex h-9 shrink-0 items-center gap-1 border-b border-ink/[0.06] bg-card px-2">
           <NavBtn
             title="Back"
             disabled={!activeTabId}
@@ -348,7 +348,7 @@ export function BrowserWindow() {
               onChange={(e) => setAddress(e.target.value)}
               placeholder="Enter URL (e.g. localhost:3000)"
               spellCheck={false}
-              className="h-6 w-full rounded-md border border-white/10 bg-[#0e1013] px-2.5 text-xs text-foreground outline-none focus:border-primary/50"
+              className="h-6 w-full rounded-md border border-ink/10 bg-background px-2.5 text-xs text-foreground outline-none focus:border-primary/50"
             />
           </form>
           <NavBtn
@@ -364,11 +364,11 @@ export function BrowserWindow() {
         {/* Device-emulation sub-bar (like Chrome's device toolbar). Drives the
             live page in the main viewport, not a separate preview. */}
         {device && (
-          <div className="flex h-8 shrink-0 items-center gap-2 border-b border-white/[0.06] bg-[#101317] px-2 text-xs text-muted-foreground">
+          <div className="flex h-8 shrink-0 items-center gap-2 border-b border-ink/[0.06] bg-muted px-2 text-xs text-muted-foreground">
             <select
               value={DEVICE_PRESETS.some((p) => p.name === device.name) ? device.name : 'Custom'}
               onChange={(e) => selectPreset(e.target.value)}
-              className="h-6 rounded-md border border-white/10 bg-[#0e1013] px-1.5 text-xs text-foreground outline-none focus:border-primary/50"
+              className="h-6 rounded-md border border-ink/10 bg-background px-1.5 text-xs text-foreground outline-none focus:border-primary/50"
             >
               {device.name === 'Custom' && <option value="Custom">Custom</option>}
               {DEVICE_PRESETS.map((p) => (
@@ -382,14 +382,14 @@ export function BrowserWindow() {
                 type="number"
                 value={device.width}
                 onChange={(e) => setDeviceDim('width', e.target.value)}
-                className="h-6 w-16 rounded-md border border-white/10 bg-[#0e1013] px-1.5 text-center text-xs text-foreground outline-none focus:border-primary/50"
+                className="h-6 w-16 rounded-md border border-ink/10 bg-background px-1.5 text-center text-xs text-foreground outline-none focus:border-primary/50"
               />
               <span className="opacity-60">×</span>
               <input
                 type="number"
                 value={device.height}
                 onChange={(e) => setDeviceDim('height', e.target.value)}
-                className="h-6 w-16 rounded-md border border-white/10 bg-[#0e1013] px-1.5 text-center text-xs text-foreground outline-none focus:border-primary/50"
+                className="h-6 w-16 rounded-md border border-ink/10 bg-background px-1.5 text-center text-xs text-foreground outline-none focus:border-primary/50"
               />
             </div>
             <NavBtn title="Rotate" onClick={rotateDevice}>
@@ -443,8 +443,8 @@ function WindowBtn({ children, title, onClick, active, danger }) {
       onClick={onClick}
       className={cn(
         'flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors',
-        active && 'bg-white/10 text-foreground',
-        danger ? 'hover:bg-red-500/80 hover:text-white' : 'hover:bg-white/10 hover:text-foreground',
+        active && 'bg-ink/10 text-foreground',
+        danger ? 'hover:bg-danger/80 hover:text-on-status' : 'hover:bg-ink/10 hover:text-foreground',
       )}
     >
       {children}
@@ -460,7 +460,7 @@ function NavBtn({ children, title, onClick, disabled, active }) {
       onClick={onClick}
       disabled={disabled}
       className={cn(
-        'flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground disabled:opacity-40',
+        'flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-ink/10 hover:text-foreground disabled:opacity-40',
         active && 'bg-primary/20 text-primary',
       )}
     >

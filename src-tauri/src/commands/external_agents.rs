@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use rustic_app::external_agents::service::{self, SpawnTarget};
 use rustic_app::external_agents::{
-    annotate_updates, detect_agents, AgentKind, AgentPermissionMode, DetectedAgent, ShellKind,
+    annotate_updates, detect_agents, missing_agents, AgentKind, AgentPermissionMode, DetectedAgent,
+    MissingAgent, ShellKind,
 };
 use rustic_app::{AppState, MutexExt};
 use rustic_db::ExternalAgentSessionRow;
@@ -44,6 +45,14 @@ pub async fn detect_external_agents() -> Result<Vec<DetectedAgent>, String> {
         .map_err(|e| format!("detect_external_agents task panicked: {e}"))?;
     annotate_updates(&mut agents).await;
     Ok(agents)
+}
+
+/// Supported CLI agents that aren't installed, with their install commands.
+#[tauri::command]
+pub async fn list_missing_external_agents() -> Result<Vec<MissingAgent>, String> {
+    tauri::async_runtime::spawn_blocking(missing_agents)
+        .await
+        .map_err(|e| format!("list_missing_external_agents task panicked: {e}"))
 }
 
 #[tauri::command]

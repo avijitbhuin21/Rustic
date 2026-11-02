@@ -33,8 +33,84 @@ pub async fn dispatch(
         "detect_vscode_keybindings" => detect_vscode_keybindings(),
         "get_tunnel_config" => get_tunnel_config(ctx),
         "set_tunnel_config" => set_tunnel_config(ctx, args),
+        c if c.starts_with("theme_") => theme_command(ctx, c, args),
         _ => return None,
     })
+}
+
+#[derive(Deserialize)]
+struct ThemeIdArg {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct ThemeTextArg {
+    #[serde(default)]
+    id: Option<String>,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct ThemeTrustArg {
+    id: String,
+    hash: String,
+}
+
+#[derive(Deserialize)]
+struct ThemeModeArg {
+    mode: String,
+}
+
+/// Theme packs (format 2) — same commands as the desktop, against the
+/// server's data dir. Import / export go through text (browser uploads and
+/// downloads) or a server-side path.
+fn theme_command(ctx: &ServerContext, command: &str, args: &Value) -> Result<Value, ApiError> {
+    use rustic_app::themes as t;
+    let (state, dir) = (ctx.state(), ctx.data_dir.as_path());
+    match command {
+        "theme_list" => ok(t::list(state, dir)),
+        "theme_get" => {
+            let a: ThemeIdArg = parse(args)?;
+            ok(t::get(state, dir, &a.id)?)
+        }
+        "theme_import_file" => {
+            let a: PathArg = parse(args)?;
+            ok(t::import_path(state, dir, &a.path)?)
+        }
+        "theme_import_text" => {
+            let a: ThemeTextArg = parse(args)?;
+            ok(t::import_text(state, dir, &a.text)?)
+        }
+        "theme_write" => {
+            let a: ThemeTextArg = parse(args)?;
+            let id = a.id.ok_or_else(|| ApiError::from("id is required".to_string()))?;
+            ok(t::write(state, dir, &id, &a.text)?)
+        }
+        "theme_delete" => {
+            let a: ThemeIdArg = parse(args)?;
+            ok(t::delete(state, dir, &a.id)?)
+        }
+        "theme_trust" => {
+            let a: ThemeTrustArg = parse(args)?;
+            ok(t::trust(state, dir, &a.id, &a.hash)?)
+        }
+        "theme_apply" => {
+            let a: ThemeIdArg = parse(args)?;
+            ok(t::apply(state, dir, &a.id)?)
+        }
+        "theme_set_mode" => {
+            let a: ThemeModeArg = parse(args)?;
+            ok(t::set_mode(state, &a.mode)?)
+        }
+        "theme_active" => ok(t::active(state, dir)),
+        "theme_template" => ok(t::template()),
+        "theme_folder" => {
+            let d = t::dir(dir);
+            std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            ok(d.to_string_lossy().into_owned())
+        }
+        other => Err(ApiError::from(format!("{other} isn't available on the server"))),
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

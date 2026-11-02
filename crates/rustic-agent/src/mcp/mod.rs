@@ -1197,7 +1197,7 @@ fn parse_mcp_json(text: &str) -> Result<Vec<(String, McpTransport)>> {
 
     let mut out = Vec::new();
     for (name, def) in servers_map {
-        let transport = if let Some(url) = def.get("url").and_then(|v| v.as_str()) {
+        let transport = if let Some(url) = entry_remote_url(def) {
             let headers = def
                 .get("headers")
                 .and_then(|v| v.as_object())
@@ -1247,9 +1247,16 @@ fn parse_mcp_json(text: &str) -> Result<Vec<(String, McpTransport)>> {
     Ok(out)
 }
 
+/// Remote URL of an entry, accepting the `serverUrl` / `httpUrl` spellings
+/// used by Google (Stitch) and Gemini CLI docs alongside the standard `url`.
+fn entry_remote_url(def: &Value) -> Option<&str> {
+    ["url", "serverUrl", "httpUrl"]
+        .iter()
+        .find_map(|k| def.get(*k).and_then(|v| v.as_str()))
+}
+
 fn is_server_entry(v: &Value) -> bool {
-    v.get("command").and_then(|c| c.as_str()).is_some()
-        || v.get("url").and_then(|u| u.as_str()).is_some()
+    v.get("command").and_then(|c| c.as_str()).is_some() || entry_remote_url(v).is_some()
 }
 
 /// Normalize MCP config input into validated `(name, entry)` pairs.
@@ -1305,11 +1312,21 @@ pub fn normalize_server_input(input: &Value, name: Option<&str>) -> Result<Vec<(
             }
         }
     }
-    for (n, entry) in &pairs {
+    for (n, entry) in pairs.iter_mut() {
         if !entry.is_object() {
             return Err(anyhow!("Server \"{}\" must be a JSON object", n));
         }
-        parse_mcp_json(&json!({ "mcpServers": { n.as_str(): entry } }).to_string())?;
+        if let Some(obj) = entry.as_object_mut() {
+            if !obj.contains_key("url") {
+                for alias in ["serverUrl", "httpUrl"] {
+                    if let Some(u) = obj.remove(alias) {
+                        obj.insert("url".into(), u);
+                        break;
+                    }
+                }
+            }
+        }
+        parse_mcp_json(&json!({ "mcpServers": { n.as_str(): &*entry } }).to_string())?;
     }
     Ok(pairs)
 }
@@ -1525,5 +1542,24 @@ mod project_scope_tests {
             vec!["user-a".to_string(), "user-b".to_string()]
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod url_alias_tests {
+    use super::*;
+
+    #[test]
+    fn server_url_and_http_url_canonicalize_to_url() {
+        for key in ["serverUrl", "httpUrl"] {
+            let v = json!({ "mcpServers": { "stitch": { key: "https://stitch.googleapis.com/mcp", "headers": { "X-Goog-Api-Key": "k" } } } });
+            let pairs = normalize_server_input(&v, None).unwrap();
+            assert_eq!(pairs[0].1["url"], "https://stitch.googleapis.com/mcp");
+            assert!(pairs[0].1.get(key).is_none());
+            match entry_transport("stitch", &pairs[0].1).unwrap() {
+                McpTransport::Sse { headers, .. } => assert_eq!(headers["X-Goog-Api-Key"], "k"),
+                _ => panic!("expected remote transport"),
+            }
+        }
     }
 }

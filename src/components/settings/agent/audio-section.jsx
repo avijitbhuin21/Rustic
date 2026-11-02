@@ -115,14 +115,18 @@ export function AudioInputSection() {
   };
 
   return (
-    <Section title="Audio Input">
-      <p className="mb-3 text-[12px] italic leading-snug text-muted-foreground">
-        Pick a speech-to-text model and a mic button appears in the chat composer: click it (when the box is empty) to
-        record, and your speech is transcribed straight into the prompt. Works with OpenAI &amp; OpenAI-compatible
-        Whisper models (<code className="text-[11px]">gpt-4o-transcribe</code>, <code className="text-[11px]">whisper-1</code>),
-        Gemini, and any audio-capable OpenRouter model — pick any model from those providers. Transcript quality and
-        whether it streams word-by-word depend on the model. Leave unset to hide the mic.
-      </p>
+    <Section
+      title="Audio Input"
+      info={(
+        <>
+          Pick a speech-to-text model and a mic button appears in the chat composer: click it (when the box is empty) to
+          record, and your speech is transcribed straight into the prompt. Works with OpenAI &amp; OpenAI-compatible
+          Whisper models (<code className="text-[11px]">gpt-4o-transcribe</code>, <code className="text-[11px]">whisper-1</code>),
+          Gemini, and any audio-capable OpenRouter model — pick any model from those providers. Transcript quality and
+          whether it streams word-by-word depend on the model. Leave unset to hide the mic.
+        </>
+      )}
+    >
       <div className="flex items-center gap-2">
         <Select value={providerKey} onValueChange={(v) => { setProviderKey(v); setModel(''); }}>
           <SelectTrigger className="h-8 w-40 text-xs">

@@ -197,7 +197,7 @@ function ThinkingRow({ text, done, durationSecs, block }) {
             {done ? (
               <Brain className="size-4 text-muted-foreground" />
             ) : (
-              <Loader2 className="size-4 animate-spin text-blue-500" />
+              <Loader2 className="size-4 animate-spin text-info" />
             )}
           </span>
         </span>
@@ -701,10 +701,10 @@ function EscalationCard({ agentId, question, taskId }) {
   );
   const name = sub?.name || agentId;
   return (
-    <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 backdrop-blur-sm">
+    <div className="rounded-md border border-warning/40 bg-warning/5 px-3 py-2 backdrop-blur-sm">
       <div className="mb-1.5 flex items-center gap-2">
-        <HelpCircle className="size-3.5 shrink-0 text-amber-500" />
-        <span className="text-[11px] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
+        <HelpCircle className="size-3.5 shrink-0 text-warning" />
+        <span className="text-[11px] font-medium uppercase tracking-wide text-warning">
           Sub-agent question
         </span>
         <button

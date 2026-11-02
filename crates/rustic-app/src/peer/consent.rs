@@ -36,15 +36,40 @@ pub struct RequestedMeta {
     pub name: String,
 }
 
+/// One file or folder inside a project named in a transfer request
+/// (`path` is project-relative, `/`-separated; empty = the project root).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RequestedFile {
+    pub project_id: String,
+    #[serde(default)]
+    pub project_name: String,
+    pub path: String,
+    #[serde(default)]
+    pub is_dir: bool,
+    /// Upload only: top-level names arriving in the destination folder `path`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+}
+
 /// Body of `POST /lan/request`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransferRequest {
-    /// `"push"` (caller sends to us) or `"pull"` (caller takes from us).
+    /// `"push"` (caller sends to us), `"pull"` (caller takes from us) or
+    /// `"meta_access"` (caller wants to browse our metadata).
     pub kind: String,
     #[serde(default)]
     pub projects: Vec<RequestedProject>,
     #[serde(default)]
     pub meta: Vec<RequestedMeta>,
+    /// Individual files / folders (batch pull or upload).
+    #[serde(default)]
+    pub files: Vec<RequestedFile>,
+    /// Set for `kind == "meta_access"`.
+    #[serde(default)]
+    pub meta_access: bool,
+    /// Total bytes the caller expects to move (shown in the prompt).
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
 }
 
 /// What an approved transfer may move, for one device.
@@ -54,7 +79,14 @@ pub struct Ticket {
     pub kind: String,
     pub projects: HashSet<String>,
     pub meta: HashSet<String>,
+    /// `project_id/path` of approved files and folders.
+    pub files: HashSet<String>,
     pub expires: Instant,
+}
+
+/// Ticket key for a file item.
+pub fn file_key(project_id: &str, path: &str) -> String {
+    format!("{project_id}/{}", path.trim_matches('/'))
 }
 
 impl Ticket {
@@ -65,8 +97,19 @@ impl Ticket {
             kind: req.kind.clone(),
             projects: req.projects.iter().map(|p| p.id.clone()).collect(),
             meta: req.meta.iter().map(|m| m.key.clone()).collect(),
+            files: req.files.iter().map(|f| file_key(&f.project_id, &f.path)).collect(),
             expires: Instant::now() + TICKET_TTL,
         }
+    }
+
+    /// Whether `project_id/path` is covered: approved itself, inside an
+    /// approved folder, or inside a whole approved project.
+    pub fn covers_file(&self, project_id: &str, path: &str) -> bool {
+        if self.projects.contains(project_id) {
+            return true;
+        }
+        let key = file_key(project_id, path);
+        self.files.iter().any(|f| key == *f || key.starts_with(&format!("{f}/")) || f == &format!("{project_id}/"))
     }
 
     /// Whether this ticket lets `device_id` do a `kind` transfer right now.
@@ -88,6 +131,12 @@ pub fn unshared_items(req: &TransferRequest, share: &super::Share) -> Vec<String
             .iter()
             .filter(|m| !share.has_meta(&m.key))
             .map(|m| m.key.clone()),
+    );
+    out.extend(
+        req.files
+            .iter()
+            .filter(|f| !share.has_project(&f.project_id))
+            .map(|f| format!("{}/{}", if f.project_name.is_empty() { &f.project_id } else { &f.project_name }, f.path)),
     );
     out
 }
@@ -129,11 +178,17 @@ pub fn is_summary(bundle: &crate::meta_sync::MetaBundle) -> bool {
 
 /// Validate a request's shape before prompting the user.
 pub fn validate(req: &TransferRequest) -> Result<(), String> {
-    if req.kind != "push" && req.kind != "pull" {
-        return Err("kind must be \"push\" or \"pull\"".into());
+    if req.kind == "meta_access" {
+        return Ok(());
     }
-    if req.projects.is_empty() && req.meta.is_empty() {
+    if req.kind != "push" && req.kind != "pull" {
+        return Err("kind must be \"push\", \"pull\" or \"meta_access\"".into());
+    }
+    if req.projects.is_empty() && req.meta.is_empty() && req.files.is_empty() {
         return Err("nothing selected to transfer".into());
+    }
+    for f in &req.files {
+        crate::peer::files::safe_rel(&f.path)?;
     }
     Ok(())
 }
@@ -148,6 +203,7 @@ mod tests {
             kind: kind.into(),
             projects: vec![RequestedProject { id: "p1".into(), name: "Alpha".into(), exists: false }],
             meta: vec![RequestedMeta { key: "skill/x".into(), category: "skill".into(), name: "x".into() }],
+            ..Default::default()
         }
     }
 
@@ -187,7 +243,27 @@ mod tests {
     fn validate_rejects_bad_requests() {
         assert!(validate(&req("pull")).is_ok());
         assert!(validate(&req("steal")).is_err());
-        let empty = TransferRequest { kind: "push".into(), projects: vec![], meta: vec![] };
+        let empty = TransferRequest { kind: "push".into(), ..Default::default() };
         assert!(validate(&empty).is_err());
+        let escape = TransferRequest {
+            kind: "pull".into(),
+            files: vec![RequestedFile { project_id: "p".into(), project_name: String::new(), path: "../etc".into(), is_dir: false, names: vec![] }],
+            ..Default::default()
+        };
+        assert!(validate(&escape).is_err());
+    }
+
+    #[test]
+    fn ticket_covers_files_inside_approved_folders() {
+        let r = TransferRequest {
+            kind: "pull".into(),
+            files: vec![RequestedFile { project_id: "p".into(), project_name: String::new(), path: "src/lib".into(), is_dir: true, names: vec![] }],
+            ..Default::default()
+        };
+        let t = Ticket::for_request("d", &r);
+        assert!(t.covers_file("p", "src/lib"));
+        assert!(t.covers_file("p", "src/lib/a.rs"));
+        assert!(!t.covers_file("p", "src/library.rs"));
+        assert!(!t.covers_file("q", "src/lib/a.rs"));
     }
 }

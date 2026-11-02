@@ -55,9 +55,41 @@ fn stub_text(error: &str) -> String {
     )
 }
 
+/// Pixel cap named by a dimension-limit error, e.g. Anthropic's "image
+/// dimensions exceed max allowed size for many-image requests: 3000 pixels".
+/// `Some(REQUEST_IMAGE_SIDE)` when the error is about dimensions but names no number.
+fn dimension_limit(error: &str) -> Option<u32> {
+    let e = error.to_lowercase();
+    if !(e.contains("image") && (e.contains("dimension") || e.contains("many-image"))) {
+        return None;
+    }
+    let num = e
+        .find("pixels")
+        .and_then(|end| {
+            let head = e[..end].trim_end();
+            let digits: String = head.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+            digits.chars().rev().collect::<String>().parse::<u32>().ok()
+        });
+    Some(num.unwrap_or(crate::media_store::REQUEST_IMAGE_SIDE))
+}
+
 /// Repairs a task history that a provider deterministically rejects (4xx): stubs the
 /// offending block when the error names it, otherwise stubs all image blocks.
+/// Pixel-limit errors apply to every image in the request, so those downscale
+/// all images under the named limit instead (keeping them visible to the model).
 pub fn repair_history_for_provider_error(messages: &mut [Message], error: &str) -> RepairReport {
+    if let Some(limit) = dimension_limit(error) {
+        // A little under the stated limit so rounding never lands us on it.
+        let cap = limit.saturating_sub(16).clamp(256, crate::media_store::REQUEST_IMAGE_SIDE);
+        let shrunk: usize = messages
+            .iter_mut()
+            .flat_map(|m| m.content.iter_mut())
+            .map(|b| usize::from(crate::media_store::shrink_block(b, cap)))
+            .sum();
+        if shrunk > 0 {
+            return RepairReport { stubbed: shrunk, targeted: false };
+        }
+    }
     // Targeted pass: the Anthropic error path indexes the API request's
     // messages array, which usually lines up 1:1 with our history — but not
     // always: the wire drops ModelSwitch markers, skips messages emptied by
@@ -122,6 +154,48 @@ pub fn repair_history_for_provider_error(messages: &mut [Message], error: &str) 
 mod tests {
     use super::*;
     use crate::provider::Role;
+
+    /// A real `w`×`h` PNG as base64.
+    fn png_b64(w: u32, h: u32) -> String {
+        use base64::Engine as _;
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([200, 30, 30]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+    }
+
+    #[test]
+    fn parses_many_image_pixel_limit() {
+        let err = r#"Claude API error 400 Bad Request: {"message":"messages.92.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 3000 pixels"}"#;
+        assert_eq!(dimension_limit(err), Some(3000));
+        assert_eq!(dimension_limit("image dimensions too big"), Some(crate::media_store::REQUEST_IMAGE_SIDE));
+        assert_eq!(dimension_limit("messages.1.content.0.image.source: invalid base64"), None);
+    }
+
+    #[test]
+    fn pixel_limit_error_downscales_every_oversized_image_instead_of_stubbing() {
+        let big = || ContentBlock::Image { media_type: "image/png".into(), data: png_b64(3200, 900), path: None };
+        let small = ContentBlock::Image { media_type: "image/png".into(), data: png_b64(400, 300), path: None };
+        let mut messages = vec![
+            msg(Role::User, vec![text("first"), big()]),
+            msg(Role::Assistant, vec![text("ok")]),
+            msg(Role::User, vec![text("second"), big(), small]),
+        ];
+        let err = "Claude API error 400: messages.92.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 3000 pixels";
+        let report = repair_history_for_provider_error(&mut messages, err);
+        assert_eq!(report.stubbed, 2, "both oversized images resized, the small one untouched");
+        for m in &messages {
+            for b in &m.content {
+                if let ContentBlock::Image { data, .. } = b {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(data).unwrap();
+                    let (w, h) = crate::media_store::image_dimensions(&bytes).unwrap();
+                    assert!(w <= 2000 && h <= 2000, "still {w}x{h}");
+                }
+            }
+        }
+        assert!(messages.iter().flat_map(|m| &m.content).filter(|b| matches!(b, ContentBlock::Image { .. })).count() == 3);
+    }
 
     fn img() -> ContentBlock {
         ContentBlock::Image {
@@ -341,5 +415,145 @@ mod tests {
             messages[0].content[0],
             ContentBlock::Thinking { .. }
         ));
+    }
+}
+
+/// Parses one `<parameter=…>` value, keeping numbers/bools/objects typed and
+/// everything else as a string.
+fn text_tool_param_value(raw: &str) -> serde_json::Value {
+    let v = raw.strip_prefix('\n').unwrap_or(raw);
+    let v = v.strip_suffix('\n').unwrap_or(v);
+    let t = v.trim();
+    if t.starts_with('{') || t.starts_with('[') || t == "true" || t == "false" || t == "null" {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(t) {
+            return parsed;
+        }
+    }
+    if !t.is_empty() && t.parse::<f64>().is_ok() && !t.starts_with('+') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(t) {
+            return parsed;
+        }
+    }
+    serde_json::Value::String(v.to_string())
+}
+
+/// Splits text containing Qwen/MiMo-style `<function=name><parameter=k>v</parameter></function>`
+/// calls into the leading prose and the parsed `(name, input)` calls.
+pub(crate) fn parse_text_tool_calls(text: &str) -> Option<(String, Vec<(String, serde_json::Value)>)> {
+    let first = text.find("<function=")?;
+    let mut prose = text[..first].to_string();
+    if let Some(stripped) = prose.trim_end().strip_suffix("<tool_call>") {
+        prose = stripped.to_string();
+    }
+    let mut calls = Vec::new();
+    for chunk in text[first..].split("<function=").skip(1) {
+        let chunk = chunk.split("</function>").next().unwrap_or(chunk);
+        let name_end = chunk.find('>').unwrap_or(chunk.len());
+        let name = chunk[..name_end].trim().to_string();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        {
+            continue;
+        }
+        let mut input = serde_json::Map::new();
+        let body = chunk.get(name_end + 1..).unwrap_or("");
+        for p in body.split("<parameter=").skip(1) {
+            let Some(key_end) = p.find('>') else { continue };
+            let key = p[..key_end].trim().to_string();
+            let rest = &p[key_end + 1..];
+            let mut end = rest.len();
+            for stop in ["</parameter>", "</tool_call>"] {
+                if let Some(i) = rest.find(stop) {
+                    end = end.min(i);
+                }
+            }
+            if !key.is_empty() {
+                input.insert(key, text_tool_param_value(&rest[..end]));
+            }
+        }
+        calls.push((name, serde_json::Value::Object(input)));
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    Some((prose.trim_end().to_string(), calls))
+}
+
+/// Converts tool calls a model wrote as plain text into real ToolUse blocks
+/// when the response carries no structured tool calls; returns true if any were recovered.
+pub(crate) fn recover_text_tool_calls(content: &mut Vec<ContentBlock>) -> bool {
+    if content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })) {
+        return false;
+    }
+    let mut recovered = false;
+    let mut out = Vec::with_capacity(content.len());
+    for block in content.drain(..) {
+        match block {
+            ContentBlock::Text { text } if !recovered => match parse_text_tool_calls(&text) {
+                Some((prose, calls)) => {
+                    recovered = true;
+                    if !prose.trim().is_empty() {
+                        out.push(ContentBlock::Text { text: prose });
+                    }
+                    for (name, input) in calls {
+                        out.push(ContentBlock::ToolUse {
+                            id: format!("call_txt_{}", uuid::Uuid::new_v4().simple()),
+                            name,
+                            input,
+                            thought_signature: None,
+                        });
+                    }
+                }
+                None => out.push(ContentBlock::Text { text }),
+            },
+            other => out.push(other),
+        }
+    }
+    *content = out;
+    recovered
+}
+
+#[cfg(test)]
+mod text_tool_call_tests {
+    use super::*;
+
+    #[test]
+    fn parses_mimo_style_calls_without_closing_tags() {
+        let t = "Checking what's installed now.<function=list_extensions><parameter=description>Verify installed skills";
+        let (prose, calls) = parse_text_tool_calls(t).unwrap();
+        assert_eq!(prose, "Checking what's installed now.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "list_extensions");
+        assert_eq!(calls[0].1["description"], "Verify installed skills");
+    }
+
+    #[test]
+    fn parses_multiple_closed_calls_with_typed_values() {
+        let t = "<tool_call>\n<function=install_extension>\n<parameter=url>\nhttps://x/SKILL.md\n</parameter>\n<parameter=overwrite>true</parameter>\n</function>\n</tool_call><function=read_file><parameter=path>a.rs</parameter><parameter=limit>20</parameter></function>";
+        let (prose, calls) = parse_text_tool_calls(t).unwrap();
+        assert!(prose.is_empty());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1["url"], "https://x/SKILL.md");
+        assert_eq!(calls[0].1["overwrite"], true);
+        assert_eq!(calls[1].1["limit"], 20);
+    }
+
+    #[test]
+    fn recover_skips_when_structured_calls_exist() {
+        let mut c = vec![
+            ContentBlock::Text { text: "<function=a><parameter=b>c".into() },
+            ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            },
+        ];
+        assert!(!recover_text_tool_calls(&mut c));
+        let mut c = vec![ContentBlock::Text { text: "hi <function=a><parameter=b>c".into() }];
+        assert!(recover_text_tool_calls(&mut c));
+        assert_eq!(c.len(), 2);
     }
 }

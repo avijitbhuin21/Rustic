@@ -1,5 +1,6 @@
 import React, { createContext, useContext } from 'react';
 import { Label } from '@/components/ui/label';
+import { InfoTip } from '@/components/ui/info-tip';
 
 // Shared filter context — settings-panel.jsx provides the current query; rows
 // and sections read it and hide themselves when their text doesn't match.
@@ -23,14 +24,12 @@ export function SettingRow({ label, description, children, htmlFor }) {
   const query = useContext(SettingsFilterContext);
   if (!matchesQuery(query, label, description)) return null;
   return (
-    <div data-setting-row className="flex items-start justify-between gap-4 py-3">
-      <div className="flex min-w-0 flex-col">
+    <div data-setting-row className="flex items-center justify-between gap-4 py-3">
+      <div className="flex min-w-0 items-center gap-1.5">
         <Label htmlFor={htmlFor} className="text-[13px] font-normal">
           {label}
         </Label>
-        {description && (
-          <span className="mt-0.5 text-[12px] italic leading-snug text-muted-foreground">{description}</span>
-        )}
+        <InfoTip>{description}</InfoTip>
       </div>
       <div className="flex shrink-0 items-center">{children}</div>
     </div>

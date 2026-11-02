@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import { InfoTip } from '@/components/ui/info-tip';
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
@@ -123,7 +124,7 @@ export function anchorSlug(title) {
   return String(title).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-export function Section({ title, defaultOpen = false, actions, badge, children }) {
+export function Section({ title, defaultOpen = false, actions, badge, info, children }) {
   const flat = useContext(FlatSectionsContext);
   const [open, setOpen] = useState(defaultOpen);
   if (flat) {
@@ -132,6 +133,7 @@ export function Section({ title, defaultOpen = false, actions, badge, children }
       <section data-settings-anchor={anchorSlug(title)} className="mb-6">
         <header className="mb-2 flex min-h-7 items-center gap-2 px-1">
           <h3 className={GROUP_TITLE}>{title}</h3>
+          <InfoTip>{info}</InfoTip>
           {badge && (
             <Badge variant="outline" className="h-4 px-1.5 text-[9.5px] uppercase border-border/70 text-muted-foreground">
               {badge}
@@ -163,6 +165,7 @@ export function Section({ title, defaultOpen = false, actions, badge, children }
           />
         )}
         <span className="text-[13px] font-semibold tracking-tight">{title}</span>
+        <InfoTip>{info}</InfoTip>
         {badge && (
           <Badge variant="outline" className="h-5 text-[10px] uppercase border-border/70 text-muted-foreground">
             {badge}

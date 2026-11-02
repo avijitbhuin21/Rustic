@@ -7,6 +7,7 @@ import {
   ClipboardEdit, X, Check, FileText, Copy, List, Loader2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
@@ -415,13 +416,15 @@ export function RuleProjectPickerDialog({ open, onClose, ruleName, initialSelect
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent aria-describedby={undefined} className="w-[520px] sm:max-w-[520px] p-0 gap-0">
         <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">Projects for "{ruleName}"</DialogTitle>
+          <DialogTitle className="flex items-center gap-1.5 text-[14px]">
+            Projects for "{ruleName}"
+            <InfoTip side="bottom">
+              Tick the projects where this rule should apply. Selecting more than one is fine. Saving with nothing
+              ticked deactivates the rule everywhere.
+            </InfoTip>
+          </DialogTitle>
         </DialogHeader>
         <div className="px-5 py-4 space-y-2">
-          <p className="text-[11px] italic text-muted-foreground leading-snug">
-            Tick the projects where this rule should apply. Selecting more than one is fine. Saving with nothing
-            ticked deactivates the rule everywhere.
-          </p>
           <div className="rounded-md border border-border/40 divide-y divide-border/40 max-h-72 overflow-y-auto">
             {projects.length === 0 ? (
               <div className="px-3 py-3 text-[11px] text-muted-foreground">No projects in your workspace yet.</div>
@@ -451,9 +454,9 @@ export function RuleProjectPickerDialog({ open, onClose, ruleName, initialSelect
             })}
             {orphans.map((k) => (
               <div key={k} className="flex items-center gap-2.5 px-3 py-2 bg-muted/10">
-                <div className="size-4 shrink-0 rounded-sm border border-rose-500/40 bg-rose-500/10" />
+                <div className="size-4 shrink-0 rounded-sm border border-danger/40 bg-danger/10" />
                 <div className="min-w-0 flex-1">
-                  <div className="text-[12px] text-rose-500/90 font-mono truncate">{k}</div>
+                  <div className="text-[12px] text-danger/90 font-mono truncate">{k}</div>
                   <div className="text-[10.5px] text-muted-foreground">Project no longer exists — will be cleared on save.</div>
                 </div>
                 <Button
@@ -554,7 +557,7 @@ export function RulesSection() {
                   <div className="flex items-center gap-1.5">
                     <span className="text-[13px] font-medium">{r.name}</span>
                     {r.state === 'global'  && <Badge variant="outline" className="h-5 text-[10px] uppercase border-primary/50 text-primary">Global</Badge>}
-                    {r.state === 'project' && <Badge variant="outline" className="h-5 text-[10px] uppercase border-amber-500/50 text-amber-500">Project</Badge>}
+                    {r.state === 'project' && <Badge variant="outline" className="h-5 text-[10px] uppercase border-warning/50 text-warning">Project</Badge>}
                   </div>
                   {r.description && (
                     <div className="mt-0.5 text-[11px] italic text-muted-foreground line-clamp-2">{r.description}</div>

@@ -97,8 +97,8 @@ function SortableTab({ session, active, onSelect, onClose }) {
           session.exited
             ? 'bg-muted-foreground/40'
             : session.running
-              ? 'animate-pulse bg-amber-500'
-              : 'bg-emerald-500',
+                  ? 'animate-pulse bg-warning'
+                  : 'bg-success',
         )}
       />
       {editing ? (

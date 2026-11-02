@@ -208,7 +208,7 @@ export function OpenRouterProviderSelect({ modelId }) {
           {summary}
         </span>
         {restricted && (
-          <span className="shrink-0 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-medium text-amber-500">
+          <span className="shrink-0 rounded-full bg-warning/15 px-1.5 py-0.5 text-[9px] font-medium text-warning">
             {selected.length}
           </span>
         )}
@@ -243,7 +243,7 @@ export function OpenRouterProviderSelect({ modelId }) {
                 onClick={() => toggle(p.provider_slug)}
                 className={cn(
                   'flex flex-col gap-1 rounded-md px-2 py-1.5 text-left transition-colors',
-                  checked ? 'bg-amber-500/10' : 'hover:bg-muted/60',
+                  checked ? 'bg-warning/10' : 'hover:bg-muted/60',
                 )}
               >
                 <div className="flex items-center gap-2">
@@ -251,7 +251,7 @@ export function OpenRouterProviderSelect({ modelId }) {
                     className={cn(
                       'flex size-4 shrink-0 items-center justify-center rounded border transition-colors',
                       checked
-                        ? 'border-amber-500 bg-amber-500 text-background'
+                        ? 'border-warning bg-warning text-background'
                         : 'border-muted-foreground/50 text-transparent',
                     )}
                   >
@@ -259,7 +259,7 @@ export function OpenRouterProviderSelect({ modelId }) {
                   </span>
                   {checked && (
                     <span
-                      className="flex size-4 shrink-0 items-center justify-center rounded-full bg-amber-500/80 text-[9px] font-bold text-background"
+                      className="flex size-4 shrink-0 items-center justify-center rounded-full bg-warning/80 text-[9px] font-bold text-background"
                       title={`Priority ${priorityOf.get(p.provider_slug)}`}
                     >
                       {priorityOf.get(p.provider_slug)}
@@ -294,11 +294,11 @@ export function OpenRouterProviderSelect({ modelId }) {
           {selected.map((p, idx) => (
             <div
               key={p.provider_slug}
-              className="flex flex-col gap-1 rounded-md bg-amber-500/10 px-2 py-1.5"
+              className="flex flex-col gap-1 rounded-md bg-warning/10 px-2 py-1.5"
             >
               <div className="flex items-center gap-2">
                 <span
-                  className="flex size-4 shrink-0 items-center justify-center rounded-full bg-amber-500/80 text-[9px] font-bold text-background"
+                  className="flex size-4 shrink-0 items-center justify-center rounded-full bg-warning/80 text-[9px] font-bold text-background"
                   title={`Priority ${idx + 1}`}
                 >
                   {idx + 1}

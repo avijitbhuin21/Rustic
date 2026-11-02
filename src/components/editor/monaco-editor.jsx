@@ -9,6 +9,7 @@ import { useSettings } from '@/state/settings';
 import { formatWithPrettier, isPrettierLanguage } from '@/lib/prettier-client';
 import { useFileChangeEffect } from '@/lib/use-file-change';
 import { resolveSaveConflict } from './save-conflict-dialog';
+import { watchMonacoTheme } from '@/lib/monaco-theme';
 import {
   setActiveEditor,
   clearActiveEditor,
@@ -112,37 +113,9 @@ function configureMonaco() {
       });
     }
     registerPipRequirementsLanguage(monaco);
-    // Custom theme: extends vs-dark with teal colours for the built-in
-    // Ctrl+F find widget so it's visually distinct from global-search
-    // decorations (which use a yellow inline class defined in globals.css).
-    monaco.editor.defineTheme('rustic-dark', {
-      base: 'vs-dark',
-      inherit: true,
-      // Italicize comments so Victor Mono renders them in its signature
-      // semi-connected cursive — the "two fonts in one" look from the font's
-      // showcase. The cursive glyphs ONLY appear on italic-styled tokens, so
-      // without these rules every token used the upright roman face and the
-      // editor looked single-font. We also italicize language constants
-      // (true/false/null) and `this`-like identifiers, which Victor Mono's
-      // demo styles cursively, while leaving control keywords upright.
-      // Foreground is repeated because a Monaco rule that sets only fontStyle
-      // can drop the inherited token color.
-      rules: [
-        { token: 'comment', foreground: '6A9955', fontStyle: 'italic' },
-        { token: 'comment.line', foreground: '6A9955', fontStyle: 'italic' },
-        { token: 'comment.block', foreground: '6A9955', fontStyle: 'italic' },
-        { token: 'comment.doc', foreground: '6A9955', fontStyle: 'italic' },
-        { token: 'constant.language', fontStyle: 'italic' },
-        { token: 'keyword.constant', fontStyle: 'italic' },
-        { token: 'variable.language', fontStyle: 'italic' },
-      ],
-      colors: {
-        'editor.findMatchBackground':          '#0d948840',
-        'editor.findMatchBorder':              '#0d9488',
-        'editor.findMatchHighlightBackground': '#0d948820',
-        'editor.findMatchHighlightBorder':     '#0d948860',
-      },
-    });
+    // `rustic-dark` follows the app theme (find-widget highlights use the
+    // theme accent so they stay distinct from global-search decorations).
+    watchMonacoTheme(monaco);
     // Route Monaco's link-click (Ctrl/Cmd+click on URLs in code, comments,
     // strings) through Tauri's shell.open so it lands in the user's default
     // browser instead of navigating the WebView itself. Without this, Monaco's
@@ -606,7 +579,7 @@ export default function MonacoEditor({ tab }) {
           loading={<Fallback />}
         />
         {loading && (
-          <div className="absolute inset-0 z-10 bg-[#1e1e1e]">
+          <div className="absolute inset-0 z-10 bg-background">
             <Fallback />
           </div>
         )}

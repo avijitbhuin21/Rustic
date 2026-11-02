@@ -97,9 +97,9 @@ export function StreamRetryBanner() {
       role="status"
       aria-live="polite"
     >
-      <div className="overflow-hidden rounded-md border border-amber-500/40 bg-amber-500/10 text-sm">
+      <div className="overflow-hidden rounded-md border border-warning/40 bg-warning/10 text-sm">
         <div className="flex items-start gap-3 px-3 py-2">
-          <div className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-400">
+          <div className="mt-0.5 shrink-0 text-warning">
             {isAttempting ? (
               <RefreshCw className="size-4 animate-spin" />
             ) : (
@@ -108,7 +108,7 @@ export function StreamRetryBanner() {
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex items-baseline justify-between gap-3">
-              <div className="font-medium text-amber-900 dark:text-amber-100">
+              <div className="font-medium text-foreground">
                 {isAttempting
                   ? `Retrying… (attempt ${retry.attempt} of ${retry.max_attempts})`
                   : `Retrying in ${secondsLeft}s (attempt ${retry.attempt} of ${retry.max_attempts})`}
@@ -119,10 +119,10 @@ export function StreamRetryBanner() {
                   onClick={handleRetryNow}
                   disabled={retryRequested}
                   className={cn(
-                    'shrink-0 rounded border border-amber-500/50 px-2 py-0.5 text-xs font-medium transition-colors',
+                    'shrink-0 rounded border border-warning/50 px-2 py-0.5 text-xs font-medium transition-colors',
                     retryRequested
-                      ? 'cursor-default text-amber-700/60 dark:text-amber-300/50'
-                      : 'text-amber-900 hover:bg-amber-500/20 dark:text-amber-100',
+                      ? 'cursor-default text-foreground/50'
+                      : 'text-foreground hover:bg-warning/20',
                   )}
                 >
                   {retryRequested ? 'Retrying…' : 'Retry now'}
@@ -130,7 +130,7 @@ export function StreamRetryBanner() {
               )}
             </div>
             {retry.error ? (
-              <div className="mt-0.5 break-words text-xs text-amber-800/90 dark:text-amber-200/80">
+              <div className="mt-0.5 break-words text-xs text-foreground/80">
                 {retry.error}
               </div>
             ) : null}
@@ -139,9 +139,9 @@ export function StreamRetryBanner() {
         {/* Slim progress bar at the bottom of the banner — fills as the
             backoff elapses so the user has a visual sense of how close
             we are to the next attempt. */}
-        <div className="h-0.5 w-full bg-amber-500/20">
+        <div className="h-0.5 w-full bg-warning/20">
           <div
-            className="h-full bg-amber-500 transition-[width] duration-200 ease-linear"
+            className="h-full bg-warning transition-[width] duration-200 ease-linear"
             style={{ width: `${percent}%` }}
           />
         </div>

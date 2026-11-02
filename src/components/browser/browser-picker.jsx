@@ -63,7 +63,7 @@ export function BrowserPicker({ onClose, fullscreen = false }) {
               <button
                 title="Open in my browser"
                 onClick={() => useBrowser.getState().openExternal(tab)}
-                className="shrink-0 rounded p-1 text-muted-foreground hover:bg-white/10 hover:text-foreground"
+                className="shrink-0 rounded p-1 text-muted-foreground hover:bg-ink/10 hover:text-foreground"
               >
                 <ExternalLink className="size-3.5" />
               </button>
@@ -94,7 +94,7 @@ function TunnelList() {
   const tunnels = useTunnels((s) => s.tunnels);
   if (!tunnels.length) return null;
   return (
-    <div className="mt-2 border-t border-white/[0.06] pt-2">
+    <div className="mt-2 border-t border-ink/[0.06] pt-2">
       <p className="mb-1 px-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
         Public tunnels
       </p>
@@ -118,14 +118,14 @@ function TunnelList() {
           <button
             title="Copy URL"
             onClick={() => navigator.clipboard?.writeText(t.url)}
-            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-white/10 hover:text-foreground"
+            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-ink/10 hover:text-foreground"
           >
             <Copy className="size-3.5" />
           </button>
           <button
             title="Stop tunnel"
             onClick={() => useTunnels.getState().close(t.port)}
-            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-white/10 hover:text-foreground"
+            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-ink/10 hover:text-foreground"
           >
             <X className="size-3.5" />
           </button>

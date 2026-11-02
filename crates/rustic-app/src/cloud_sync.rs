@@ -42,11 +42,29 @@ struct ReporterInner {
     emitter: Arc<dyn EventEmitter>,
     direction: String,
     last_tick: std::sync::Mutex<std::time::Instant>,
+    transfer: Option<Arc<crate::transfers::Handle>>,
 }
 
 impl SyncReporter {
     /// Reporter that emits `rustic:sync-progress` for `direction` ("push"/"pull").
     pub fn new(direction: &str, emitter: Arc<dyn EventEmitter>) -> Self {
+        Self::build(direction, emitter, None)
+    }
+
+    /// Same as [`Self::new`], also feeding the transfers tray entry `transfer`.
+    pub fn with_transfer(
+        direction: &str,
+        emitter: Arc<dyn EventEmitter>,
+        transfer: Arc<crate::transfers::Handle>,
+    ) -> Self {
+        Self::build(direction, emitter, Some(transfer))
+    }
+
+    fn build(
+        direction: &str,
+        emitter: Arc<dyn EventEmitter>,
+        transfer: Option<Arc<crate::transfers::Handle>>,
+    ) -> Self {
         Self {
             inner: Some(Arc::new(ReporterInner {
                 emitter,
@@ -54,8 +72,14 @@ impl SyncReporter {
                 last_tick: std::sync::Mutex::new(
                     std::time::Instant::now() - std::time::Duration::from_secs(1),
                 ),
+                transfer,
             })),
         }
+    }
+
+    /// The tray entry this run reports to, if any (carries the cancel signal).
+    pub fn transfer(&self) -> Option<Arc<crate::transfers::Handle>> {
+        self.inner.as_ref().and_then(|i| i.transfer.clone())
     }
 
     /// Reporter that discards everything (server-side syncs, tests).
@@ -78,6 +102,13 @@ impl SyncReporter {
         let Some(inner) = &self.inner else {
             return;
         };
+        if let Some(t) = &inner.transfer {
+            if phase == "uploading" || phase == "downloading" {
+                t.progress(phase, done, total);
+            } else if force {
+                t.stage("running", phase, detail);
+            }
+        }
         if !force {
             let mut last = inner.last_tick.lock().unwrap_or_else(|p| p.into_inner());
             if last.elapsed() < std::time::Duration::from_millis(120) {
@@ -202,23 +233,58 @@ pub struct PeerProjectState {
 pub type ProjectRootResolver<'a> =
     &'a (dyn Fn(&SyncProjectEntry, Option<&str>) -> PathBuf + Send + Sync);
 
-/// Refuse to sync while any agent task is mid-turn — a running executor holds
-/// live references (DB writes, file locks, terminals) that a swap would strand.
-fn ensure_no_running_tasks(state: &AppState) -> Result<(), String> {
+/// Refuse to sync while an agent task is mid-turn in one of `project_ids` (or
+/// in any project when `None`) — a running executor holds live references (DB
+/// writes, file locks, terminals) that rewriting its project would strand.
+fn ensure_no_running_tasks(
+    state: &AppState,
+    project_ids: Option<&std::collections::HashSet<String>>,
+) -> Result<(), String> {
     use rustic_agent::TaskStatus;
-    let agent = state.agent.lock_safe();
-    let busy = agent.tasks.values().any(|t| {
-        matches!(
-            t.info.status,
-            TaskStatus::Preparing | TaskStatus::Running | TaskStatus::WaitingOnSubagents
-        )
-    });
-    if busy {
-        return Err(
-            "An agent task is currently running. Wait for it to finish (or stop it) before syncing.".into(),
-        );
+    let busy_projects: std::collections::HashSet<String> = {
+        let agent = state.agent.lock_safe();
+        agent
+            .tasks
+            .values()
+            .filter(|t| {
+                matches!(
+                    t.info.status,
+                    TaskStatus::Preparing | TaskStatus::Running | TaskStatus::WaitingOnSubagents
+                )
+            })
+            .filter(|t| project_ids.map_or(true, |ids| ids.contains(&t.info.project_id)))
+            .map(|t| t.info.project_id.clone())
+            .collect()
+    };
+    if busy_projects.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let names: Vec<String> = {
+        let db = state.db.lock_safe();
+        busy_projects
+            .iter()
+            .map(|id| {
+                db.get_project(id)
+                    .ok()
+                    .flatten()
+                    .map(|p| p.name)
+                    .unwrap_or_else(|| id.clone())
+            })
+            .collect()
+    };
+    let scope = if project_ids.is_none() {
+        " A full sync replaces every project's chats, so all agents must be idle."
+    } else {
+        ""
+    };
+    Err(format!(
+        "An agent is currently running in {}. Wait for it to finish (or stop it) before syncing.{scope}",
+        names
+            .iter()
+            .map(|n| format!("\u{201c}{n}\u{201d}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn os_name() -> String {
@@ -487,7 +553,16 @@ pub fn build_sync_archive_into(
     skip_files: &std::collections::HashSet<String>,
     reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
-    ensure_no_running_tasks(state)?;
+    let sending: std::collections::HashSet<String> = state
+        .db
+        .lock_safe()
+        .list_projects()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|p| p.id)
+        .filter(|id| !skip_files.contains(id))
+        .collect();
+    ensure_no_running_tasks(state, Some(&sending))?;
 
     reporter.stage("preparing", "database snapshot", 0, 0);
 
@@ -670,7 +745,7 @@ pub fn build_project_archive_into(
     sink: Box<dyn Write + Send>,
     reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
-    ensure_no_running_tasks(state)?;
+    ensure_no_running_tasks(state, Some(&std::iter::once(project_id.to_string()).collect()))?;
     reporter.stage("preparing", "reading project", 0, 1);
 
     let project = {
@@ -1096,7 +1171,7 @@ pub fn apply_sync_archive_from(
     resolve_root: ProjectRootResolver<'_>,
     reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
-    ensure_no_running_tasks(state)?;
+    ensure_no_running_tasks(state, None)?;
 
     // 1. Extract to a staging dir under the data dir (same volume → cheap renames).
     reporter.stage("extracting", "unpacking archive", 0, 0);
@@ -1343,8 +1418,6 @@ pub fn apply_project_archive_from(
     resolve_root: ProjectRootResolver<'_>,
     reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
-    ensure_no_running_tasks(state)?;
-
     reporter.stage("extracting", "unpacking archive", 0, 1);
     let staging = data_dir.join(STAGING_DIR);
     force_remove_dir_all(&staging);
@@ -1376,6 +1449,7 @@ pub fn apply_project_archive_from(
             (true, Some(e)) if manifest.projects.len() == 1 => e.clone(),
             _ => return Err("archive is not a single-project sync".into()),
         };
+        ensure_no_running_tasks(state, Some(&std::iter::once(entry.id.clone()).collect()))?;
 
         let old_root = {
             let db = state.db.lock_safe();

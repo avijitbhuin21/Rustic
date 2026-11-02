@@ -14,7 +14,7 @@ use serde_json::Value;
 use rustic_app::context::{AppContext, EventEmitterExt};
 use rustic_app::external_agents::service::{self, SpawnTarget};
 use rustic_app::external_agents::{
-    annotate_updates, detect_agents, AgentKind, AgentPermissionMode, ShellKind,
+    annotate_updates, detect_agents, missing_agents, AgentKind, AgentPermissionMode, ShellKind,
 };
 use rustic_app::sync_ext::MutexExt;
 
@@ -41,6 +41,7 @@ pub async fn dispatch(
 ) -> Option<Result<Value, ApiError>> {
     Some(match command {
         "detect_external_agents" => detect_external_agents().await,
+        "list_missing_external_agents" => list_missing_external_agents().await,
         "spawn_external_agent" => spawn_external_agent(ctx, args).await,
         "resume_external_agent" => resume_external_agent(ctx, args).await,
         "list_external_agent_sessions" => list_external_agent_sessions(ctx, args),
@@ -55,6 +56,14 @@ async fn detect_external_agents() -> Result<Value, ApiError> {
         .map_err(|e| format!("detect_external_agents task panicked: {e}"))?;
     annotate_updates(&mut agents).await;
     ok(agents)
+}
+
+/// Supported CLI agents that aren't installed on the server, with install commands.
+async fn list_missing_external_agents() -> Result<Value, ApiError> {
+    let missing = tokio::task::spawn_blocking(missing_agents)
+        .await
+        .map_err(|e| format!("list_missing_external_agents task panicked: {e}"))?;
+    ok(missing)
 }
 
 async fn spawn_external_agent(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {

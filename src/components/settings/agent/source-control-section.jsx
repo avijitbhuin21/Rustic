@@ -103,12 +103,10 @@ export function SourceControlSection() {
   };
 
   return (
-    <Section title="Source Control">
-      <p className="mb-3 text-[12px] italic leading-snug text-muted-foreground">
-        Pick a model and a sparkle button appears in the Source Control commit box: click it to have the model read your
-        staged changes (or all changes when nothing is staged) and write a Conventional-Commits message for you. Any
-        connected chat provider works. Leave unset and the button will prompt you to configure one here.
-      </p>
+    <Section
+      title="Source Control"
+      info="Pick a model and a sparkle button appears in the Source Control commit box: click it to have the model read your staged changes (or all changes when nothing is staged) and write a Conventional-Commits message for you. Any connected chat provider works. Leave unset and the button will prompt you to configure one here."
+    >
       <div className="flex items-center gap-2">
         <Select value={providerKey} onValueChange={(v) => { setProviderKey(v); setModel(''); }}>
           <SelectTrigger className="h-8 w-40 text-xs">

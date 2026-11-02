@@ -67,5 +67,8 @@ plan.md
 
 .claude/
 
+# Agent config written by Rustic (may contain API keys)
+.mcp.json
+.gemini/
 # Per-project MCP config written for external CLI agents
 .codex/

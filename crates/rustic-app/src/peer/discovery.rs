@@ -16,6 +16,7 @@ pub fn start(lan: &LanState, id: &Identity, port: u16) -> Result<ServiceDaemon, 
     props.insert("name".into(), id.device_name.clone());
     props.insert("fp".into(), id.fingerprint.clone());
     props.insert("v".into(), "1".into());
+    props.insert("ver".into(), super::app_version().into());
     let info = ServiceInfo::new(SERVICE_TYPE, &id.device_id, &host, "", port, props)
         .map_err(|e| format!("mDNS service info: {e}"))?
         .enable_addr_auto();
@@ -50,6 +51,8 @@ pub fn start(lan: &LanState, id: &Identity, port: u16) -> Result<ServiceDaemon, 
                             .to_string(),
                         fingerprint: info.get_property_val_str("fp").unwrap_or("").to_string(),
                         addr: format!("{}:{}", ip, info.get_port()),
+                        // Builds before the version check didn't advertise one.
+                        version: Some(info.get_property_val_str("ver").unwrap_or("").to_string()),
                         fullname: info.get_fullname().to_string(),
                     };
                     lan.lock().discovered.insert(device_id, entry);

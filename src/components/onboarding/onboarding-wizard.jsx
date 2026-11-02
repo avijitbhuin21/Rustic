@@ -10,6 +10,7 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
+import { InfoTip } from '@/components/ui/info-tip';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
@@ -189,8 +190,9 @@ export function OnboardingWizard() {
               <DialogTitle className="flex items-center gap-2">
                 <FolderPlus className="size-4 text-primary" />
                 Add your first project
+                <InfoTip>Pick a folder to open. You can add more later from the Explorer.</InfoTip>
               </DialogTitle>
-              <DialogDescription>
+              <DialogDescription className="sr-only">
                 Pick a folder to open. You can add more later from the Explorer.
               </DialogDescription>
             </DialogHeader>
@@ -210,8 +212,9 @@ export function OnboardingWizard() {
               <DialogTitle className="flex items-center gap-2">
                 <KeyRound className="size-4 text-primary" />
                 Configure an AI provider
+                <InfoTip>Add a key so the AI agent can run. You can change this later in Settings → AI.</InfoTip>
               </DialogTitle>
-              <DialogDescription>
+              <DialogDescription className="sr-only">
                 Add a key so the AI agent can run. You can change this later in Settings → AI.
               </DialogDescription>
             </DialogHeader>
@@ -261,14 +264,15 @@ export function OnboardingWizard() {
               <DialogTitle className="flex items-center gap-2">
                 <GithubIcon className="size-4 text-primary" />
                 Connect GitHub
+                <InfoTip>Optional — sign in so push, pull, clone, and publish work without extra setup.</InfoTip>
               </DialogTitle>
-              <DialogDescription>
+              <DialogDescription className="sr-only">
                 Optional — sign in so push, pull, clone, and publish work without extra setup.
               </DialogDescription>
             </DialogHeader>
             {(ghUser || ghHasToken) && (
               <div className="flex items-center gap-1.5 pt-1 text-xs text-muted-foreground">
-                <Check className="size-3.5 text-emerald-500" />
+                <Check className="size-3.5 text-success" />
                 {ghUser?.login ? `Signed in as ${ghUser.login}` : 'GitHub connected'}
               </div>
             )}
@@ -292,7 +296,7 @@ export function OnboardingWizard() {
           <>
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
-                <Check className="size-4 text-emerald-500" />
+                <Check className="size-4 text-success" />
                 You're all set
               </DialogTitle>
               <DialogDescription>

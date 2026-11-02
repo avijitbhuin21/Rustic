@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import { InfoTip } from '@/components/ui/info-tip';
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
@@ -76,18 +77,17 @@ export function BudgetSection() {
   };
 
   return (
-    <Section title="Budget">
-      <p className="mb-3 text-[12px] italic leading-snug text-muted-foreground">
-        Cross-task limits. Stop runaway parallelism or spend before it bites.
-      </p>
+    <Section title="Budget" info="Cross-task limits. Stop runaway parallelism or spend before it bites.">
 
       <RowGroup inset>
         <div className="flex items-start justify-between gap-3 px-3 py-3">
           <div className="min-w-0">
-            <div className="text-[13px] font-medium">Cap concurrent provider streams</div>
-            <div className="text-[12px] text-muted-foreground mt-0.5">
-              Parallel API calls across every task and their sub-agents. Default 6. Raise only if your provider's rate
-              limit can handle it.
+            <div className="flex items-center gap-1.5 text-[13px] font-medium">
+              Cap concurrent provider streams
+              <InfoTip>
+                Parallel API calls across every task and their sub-agents. Default 6. Raise only if your provider's rate
+                limit can handle it.
+              </InfoTip>
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -104,9 +104,9 @@ export function BudgetSection() {
 
         <div className="flex items-start justify-between gap-3 px-3 py-3">
           <div className="min-w-0">
-            <div className="text-[13px] font-medium">Daily cost ceiling (native API)</div>
-            <div className="text-[12px] text-muted-foreground mt-0.5">
-              Stops new turns when today's native-API spend hits the cap. Resets at midnight UTC.
+            <div className="flex items-center gap-1.5 text-[13px] font-medium">
+              Daily cost ceiling (native API)
+              <InfoTip>Stops new turns when today's native-API spend hits the cap. Resets at midnight UTC.</InfoTip>
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -123,10 +123,12 @@ export function BudgetSection() {
 
         <div className="flex items-start justify-between gap-3 px-3 py-3">
           <div className="min-w-0">
-            <div className="text-[13px] font-medium">Soft turn ceiling</div>
-            <div className="text-[12px] text-muted-foreground mt-0.5">
-              After this many model calls in one continuous run, the agent is nudged to wrap up and
-              check in with you (re-nudged every 25 after). A runaway-loop guard — a nudge, not a hard stop.
+            <div className="flex items-center gap-1.5 text-[13px] font-medium">
+              Soft turn ceiling
+              <InfoTip>
+                After this many model calls in one continuous run, the agent is nudged to wrap up and
+                check in with you (re-nudged every 25 after). A runaway-loop guard — a nudge, not a hard stop.
+              </InfoTip>
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">

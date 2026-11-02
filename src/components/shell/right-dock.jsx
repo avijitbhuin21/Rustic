@@ -134,9 +134,9 @@ export function RightDock() {
           <div
             className={cn(
               'flex flex-col items-center px-1.5 py-3',
-              'border border-white/[0.09]',
+              'border border-ink/[0.09]',
               'bg-background/80 backdrop-blur-2xl',
-              'shadow-[0_8px_32px_rgba(0,0,0,0.55),inset_0_1px_0_rgba(255,255,255,0.05)]',
+              'shadow-[0_8px_32px_color-mix(in_oklab,var(--scrim)_55%,transparent),inset_0_1px_0_color-mix(in_oklab,var(--ink)_5%,transparent)]',
               'transition-[border-radius] duration-200',
               panelOpen ? 'rounded-l-[14px] rounded-r-none border-r-0' : 'rounded-[14px]',
             )}
@@ -163,7 +163,7 @@ export function RightDock() {
                         onClick={() => toggleRightPanel(id)}
                         className={cn(
                           'size-[42px] rounded-[10px] text-muted-foreground',
-                          'hover:bg-white/10 hover:text-foreground transition-colors',
+                          'hover:bg-ink/10 hover:text-foreground transition-colors',
                           isActive && 'bg-primary/15 text-primary hover:bg-primary/20 hover:text-primary'
                         )}
                       >
@@ -197,9 +197,9 @@ export function RightDock() {
             className={cn(
               'h-[80vh] max-h-[calc(100vh-4rem)] overflow-hidden',
               'rounded-[14px] rounded-l-none',
-              'border border-l-0 border-white/[0.09]',
+              'border border-l-0 border-ink/[0.09]',
               'bg-background/80 backdrop-blur-2xl',
-              'shadow-[0_8px_32px_rgba(0,0,0,0.55),inset_0_1px_0_rgba(255,255,255,0.05)]',
+              'shadow-[0_8px_32px_color-mix(in_oklab,var(--scrim)_55%,transparent),inset_0_1px_0_color-mix(in_oklab,var(--ink)_5%,transparent)]',
             )}
           >
             <PanelSideContext.Provider value="right">

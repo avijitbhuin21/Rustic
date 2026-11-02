@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { InfoTip } from '@/components/ui/info-tip';
 import { useExplorer } from '@/state/explorer';
 
 // Accept both full URLs ("https://github.com/user/repo[.git]") and the bare
@@ -128,7 +129,10 @@ export default function CloneRepoDialog({ open: isOpen, onOpenChange }) {
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="clone-dest">Clone into folder</Label>
+            <div className="flex items-center gap-1.5">
+              <Label htmlFor="clone-dest">Clone into folder</Label>
+              <InfoTip>The repository is cloned into a new sub-folder here and opened as a project.</InfoTip>
+            </div>
             <div className="flex gap-1.5">
               <Input
                 id="clone-dest"
@@ -149,9 +153,6 @@ export default function CloneRepoDialog({ open: isOpen, onOpenChange }) {
                 <FolderOpen className="size-3.5" />
               </Button>
             </div>
-            <p className="text-[11px] text-muted-foreground">
-              The repository is cloned into a new sub-folder here and opened as a project.
-            </p>
           </div>
 
           {(cloning || progressText) && (

@@ -491,7 +491,7 @@ function PdfPageCanvas({
                 <textarea
                   autoFocus
                   defaultValue={t.text}
-                  className="h-full w-full resize-none border border-dashed border-blue-500 bg-white/80 p-0 text-inherit outline-none"
+                  className="h-full w-full resize-none border border-dashed border-info bg-white/80 p-0 text-inherit outline-none"
                   style={{
                     fontSize: t.fontSize * scale,
                     lineHeight: `${t.heightPdf * scale}px`,
@@ -534,7 +534,7 @@ function PdfPageCanvas({
                   className={cn(
                     'h-full w-full whitespace-pre-wrap',
                     editMode &&
-                      'rounded-sm outline outline-1 outline-transparent hover:outline-blue-400',
+                      'rounded-sm outline outline-1 outline-transparent hover:outline-info',
                   )}
                 >
                   {t.text || <span className="opacity-40">click to edit</span>}
@@ -597,7 +597,7 @@ function PdfPageCanvas({
       {(edit?.rotation || edit?.deleted) && (
         <div className="pointer-events-none absolute left-2 top-2 z-10 flex gap-1">
           {edit.rotation ? (
-            <span className="rounded bg-blue-600/90 px-1.5 py-0.5 text-[10px] font-medium text-white">
+            <span className="rounded bg-info/90 px-1.5 py-0.5 text-[10px] font-medium text-on-status">
               rot {edit.rotation}°
             </span>
           ) : null}

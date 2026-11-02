@@ -26,6 +26,11 @@ export const useExternalAgents = create((set, get) => ({
   // `[{ agent, label, path, version, shadowed, latestVersion }]` for every CLI
   // found on PATH, each resolved to its newest installed copy.
   installed: [],
+  // `[{ agent, label, installCommand }]` for supported CLIs not found on this
+  // machine (the server's, on web) — rendered as greyed-out install buttons.
+  missing: [],
+  // Agent kind whose install is running, polled until it's detected.
+  installing: null,
   detected: false,
   // projectId -> rows, newest first.
   sessionsByProject: {},
@@ -50,13 +55,46 @@ export const useExternalAgents = create((set, get) => ({
   detect: async ({ force = false } = {}) => {
     if (!force && get().detected) return get().installed;
     try {
-      const installed = await invoke('detect_external_agents');
-      set({ installed, detected: true });
+      const [installed, missing] = await Promise.all([
+        invoke('detect_external_agents'),
+        invoke('list_missing_external_agents').catch(() => []),
+      ]);
+      set({ installed, missing, detected: true });
       return installed;
     } catch {
       set({ detected: true });
       return [];
     }
+  },
+
+  /** Runs a missing CLI's install command in a visible terminal, then polls detection until it shows up. */
+  install: async (agent, cwd) => {
+    if (get().installing) return;
+    set({ installing: agent.agent });
+    try {
+      const terminal = useTerminal.getState();
+      const info = await terminal.createTerminal({ cwd, label: `Install ${agent.label}` });
+      useLayout.getState().setBottomPanelTab('terminal');
+      await terminal.writeTerminal(info.id, `${agent.installCommand}\r`);
+    } catch (err) {
+      set({ installing: null });
+      throw err;
+    }
+    const deadline = Date.now() + 10 * 60 * 1000;
+    const poll = async () => {
+      const installed = await get().detect({ force: true });
+      if (installed.some((a) => a.agent === agent.agent)) {
+        set({ installing: null });
+        toast.success(`${agent.label} installed`);
+        return;
+      }
+      if (Date.now() > deadline || get().installing !== agent.agent) {
+        set({ installing: null });
+        return;
+      }
+      setTimeout(poll, 4000);
+    };
+    setTimeout(poll, 4000);
   },
 
   loadSessions: async (projectId, { force = false } = {}) => {

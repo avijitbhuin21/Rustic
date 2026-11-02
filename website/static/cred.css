@@ -1,0 +1,120 @@
+/* ─────────────────────────── CRED NeoPOP theme overlay ───────────────────────────
+   Loaded after styles.css. Remove the <link> (or revert its commit) to go back. */
+:root {
+  --bg: #0d0d0d;
+  --bg-2: #121212;
+  --bg-3: #181818;
+  --fg: #ffffff;
+  --fg-2: #b3b3b3;
+  --fg-3: #8a8a8a;
+  --line: #262626;
+  --line-2: #3d3d3d;
+  --accent: #e5fe40;
+  --accent-2: #e5fe40;
+  --accent-soft: rgba(229, 254, 64, 0.1);
+  --purple: #6a35ff;
+  --orange: #ff8744;
+  --ok: #06c270;
+  --radius: 0px;
+  --radius-sm: 0px;
+  --pop-d: 6px;
+}
+
+::selection { background: var(--accent); color: #0d0d0d; }
+.serif { color: var(--accent); }
+.grain { opacity: 0.04; }
+.pulse { background: var(--accent); box-shadow: 0 0 0 0 rgba(229, 254, 64, 0.6); border-radius: 0; }
+@keyframes pulse { 70% { box-shadow: 0 0 0 10px rgba(229, 254, 64, 0); } 100% { box-shadow: 0 0 0 0 rgba(229, 254, 64, 0); } }
+.progress span { background: var(--accent); }
+.orb-a { background: radial-gradient(circle at 30% 30%, rgba(106, 53, 255, 0.55), transparent 65%); }
+.orb-b { background: radial-gradient(circle at 60% 40%, rgba(229, 254, 64, 0.16), transparent 65%); }
+.eyebrow { color: var(--accent); letter-spacing: 0.14em; }
+.display, .display-sm, .h2 { font-weight: 800; letter-spacing: -0.05em; }
+.swap::after { height: 3px; }
+.nav.scrolled { background: rgba(13, 13, 13, 0.85); }
+.nav-links a { border-radius: 0; }
+.brand img { border-radius: 0; }
+
+/* NeoPOP elevated button: flat face + two hard edge faces (right lighter, bottom darker) that collapse on press */
+.btn {
+  --lift: var(--pop-d); --edge-r: #9a9a9a; --edge-b: #5a5a5a;
+  border-radius: 0; overflow: visible; isolation: isolate;
+  margin: 0 var(--pop-d) var(--pop-d) 0;
+  translate: calc(var(--pop-d) - var(--lift)) calc(var(--pop-d) - var(--lift));
+  transition: translate 0.14s ease-out, background 0.2s, color 0.2s, border-color 0.2s;
+  text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; font-size: 0.82rem;
+}
+.btn::before, .btn::after { content: ""; position: absolute; z-index: -1; border-radius: 0; transition: width 0.14s ease-out, height 0.14s ease-out; }
+.btn::before { left: -1px; right: -1px; top: 100%; height: var(--lift); inset-block-end: auto; transform: skewX(45deg); transform-origin: top left; background: var(--edge-b); margin-top: 1px; }
+.btn::after { top: -1px; bottom: -1px; left: 100%; width: var(--lift); transform: skewY(45deg); transform-origin: top left; background: var(--edge-r); margin-left: 1px; }
+.btn:hover::before { transform: skewX(45deg); }
+.btn:hover { --lift: calc(var(--pop-d) - 2px); box-shadow: none; }
+.btn:active { --lift: 0px; }
+.btn:hover svg { transform: none; }
+.btn-primary { background: #ffffff; color: #0d0d0d; border-color: #ffffff; --edge-r: #c9c9c9; --edge-b: #8a8a8a; }
+.btn-primary:hover { background: var(--accent); color: #0d0d0d; border-color: var(--accent); --edge-r: #a8bb2f; --edge-b: #6f7b1f; }
+.btn-ghost { background: #0d0d0d; color: #fff; border-color: #ffffff; --edge-r: #7a7a7a; --edge-b: #4a4a4a; }
+.btn-ghost:hover { background: #161616; border-color: var(--accent); color: var(--accent); --edge-r: #a8bb2f; --edge-b: #6f7b1f; }
+.btn-lg { padding: 18px 30px; font-size: 0.88rem; }
+.btn-sm { padding: 10px 16px; font-size: 0.72rem; --pop-d: 4px; }
+
+/* Hard-edged elevated blocks for cards / stats / downloads */
+.card, .stat, .dl, .benefit {
+  --ext: #262626;
+  border-radius: 0; border: 1px solid var(--line-2); background: var(--bg-2);
+  box-shadow: 1px 1px 0 var(--ext), 2px 2px 0 var(--ext), 3px 3px 0 var(--ext), 4px 4px 0 var(--ext), 5px 5px 0 var(--ext), 6px 6px 0 var(--ext);
+  transition: transform 0.25s ease-out, box-shadow 0.25s ease-out, border-color 0.25s, background 0.25s;
+}
+.card:hover, .stat:hover, .dl:hover, .benefit:hover {
+  --ext: var(--accent); border-color: var(--accent); background: var(--bg-2);
+  transform: translate(-3px, -3px);
+  box-shadow: 1px 1px 0 var(--ext), 2px 2px 0 var(--ext), 3px 3px 0 var(--ext), 4px 4px 0 var(--ext), 5px 5px 0 var(--ext), 6px 6px 0 var(--ext), 7px 7px 0 var(--ext), 8px 8px 0 var(--ext), 9px 9px 0 var(--ext);
+}
+.card::before, .dl::before, .benefit::before, .step::before { background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 50%), rgba(229, 254, 64, 0.07), transparent 45%); }
+.card::after { display: none; }
+.card-icon { border-radius: 0; background: var(--accent); color: #0d0d0d; }
+.card:hover .card-icon { background: var(--accent); transform: rotate(-6deg); }
+.card h3, .benefit h4, .dl-os { font-weight: 800; letter-spacing: -0.03em; }
+.card p code, .sub code, .benefit code { border-radius: 0; }
+.chips li { border-radius: 0; border-color: var(--line-2); }
+.chips li:hover { border-color: var(--accent); background: var(--accent); color: #0d0d0d; }
+.stat-n { background: none; color: var(--accent); -webkit-background-clip: initial; background-clip: initial; font-weight: 800; }
+.stat:nth-child(2) .stat-n { color: #ffffff; }
+.stat:nth-child(3) .stat-n { color: var(--orange); }
+.stat:nth-child(4) .stat-n { color: #a98bff; }
+.benefit svg { stroke: var(--accent); }
+.dl.recommended { --ext: var(--purple); border-color: var(--purple); }
+.dl.recommended::after { border-radius: 0; background: var(--purple); color: #fff; }
+.dl:hover .dl-arrow { color: var(--accent); }
+
+/* Marquee becomes a solid Neo Paccha band */
+.marquee { background: var(--accent); border-block: 0; -webkit-mask-image: none; mask-image: none; padding: 16px 0; }
+.marquee-track { color: #0d0d0d; font-weight: 700; }
+.marquee-track i { color: var(--purple); }
+
+/* Lists, steps, links */
+.ticks li::before { border-radius: 0; border-color: var(--accent); background: radial-gradient(circle, var(--accent) 0 0, transparent 0), linear-gradient(var(--accent), var(--accent)) center / 6px 6px no-repeat; }
+.step-num { color: var(--accent); font-weight: 700; }
+.step:hover .step-num { color: #fff; }
+.logo-pill { border-radius: 0; }
+.big-link::before { background: var(--accent); }
+.roll span::after { color: var(--accent); }
+.section-dark { background: #0a0a0a; }
+
+/* Frames keep the real-editor internals, but sit as hard-edged blocks */
+.mock, .term {
+  border-radius: 0; border: 1px solid var(--line-2);
+  box-shadow: 1px 1px 0 #262626, 2px 2px 0 #262626, 3px 3px 0 #262626, 4px 4px 0 #262626, 5px 5px 0 #262626, 6px 6px 0 #262626, 7px 7px 0 #262626, 8px 8px 0 #262626, 0 40px 120px -40px rgba(106, 53, 255, 0.4);
+}
+.term-body .p { color: var(--accent); }
+.caret { background: var(--accent); }
+.phone { box-shadow: 0 50px 120px -40px rgba(0, 0, 0, 0.95), 0 30px 90px -40px rgba(106, 53, 255, 0.55), inset 0 0 0 2px rgba(0, 0, 0, 0.6); }
+
+/* Footer */
+.footer { background: #0a0a0a; }
+.footer-cols h5 { color: var(--accent); }
+.footer-giant span { background: linear-gradient(180deg, rgba(229, 254, 64, 0.3) 10%, rgba(229, 254, 64, 0.02) 95%); -webkit-background-clip: text; background-clip: text; }
+
+@media (prefers-reduced-motion: reduce) {
+  .btn { translate: none; }
+}

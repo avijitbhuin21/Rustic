@@ -9,10 +9,34 @@ export const WINDOW_CONTROLS_WIDTH = 130;
 // buttons clear the fixed OS window controls.
 export const WINDOW_CONTROLS_OFFSET = WINDOW_CONTROLS_WIDTH + 8;
 
+const TITLE_STRIP_PX = 32;
+const NO_DRAG_SELECTOR =
+  'button,a,input,textarea,select,label,[role="button"],[role="tab"],[role="menuitem"],[role="combobox"],[draggable="true"],[contenteditable="true"],[data-no-window-drag],[data-tauri-drag-region],.cm-editor,.xterm';
+
+/** Lets any non-interactive spot in the top strip move the frameless window (native drag → OS snap) and double-click toggle maximize. */
+function useTitleStripDrag() {
+  useEffect(() => {
+    const onMouseDown = (e) => {
+      if (e.button !== 0 || e.clientY > TITLE_STRIP_PX) return;
+      const target = e.target;
+      if (!(target instanceof Element) || target.closest(NO_DRAG_SELECTOR)) return;
+      const win = getCurrentWindow();
+      if (e.detail === 2) {
+        win.toggleMaximize().catch(() => {});
+      } else {
+        win.startDragging().catch(() => {});
+      }
+    };
+    document.addEventListener('mousedown', onMouseDown);
+    return () => document.removeEventListener('mousedown', onMouseDown);
+  }, []);
+}
+
 export function WindowControls() {
-  // On macOS the middle button drives native fullscreen (its own Space)
-  // instead of maximize — the window stays borderless for square corners.
+  // On macOS the middle button drives simple fullscreen instead of maximize —
+  // the window stays borderless for square corners.
   const [expanded, setExpanded] = useState(false);
+  useTitleStripDrag();
 
   useEffect(() => {
     // Simple fullscreen isn't reported by isFullscreen(); the toggle command's

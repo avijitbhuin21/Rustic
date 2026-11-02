@@ -10,6 +10,7 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
+import { InfoTip } from '@/components/ui/info-tip';
 
 const BACKENDS_KEY = 'rustic.remoteBackends';
 const LEGACY_URL_KEY = 'rustic.remoteBackend.url';
@@ -186,8 +187,8 @@ export function ItemPicker({ title, items, selected, onChange, loading, empty, p
 export function StatusPill({ online }) {
   const label = online == null ? 'checking' : online ? 'online' : 'offline';
   return (
-    <span className={cn('flex items-center gap-1 text-[10.5px]', online ? 'text-emerald-500' : 'text-muted-foreground')}>
-      <span className={cn('size-1.5 rounded-full', online ? 'bg-emerald-500' : online === false ? 'bg-muted-foreground/50' : 'bg-amber-500 animate-pulse')} />
+    <span className={cn('flex items-center gap-1 text-[10.5px]', online ? 'text-success' : 'text-muted-foreground')}>
+      <span className={cn('size-1.5 rounded-full', online ? 'bg-success' : online === false ? 'bg-muted-foreground/50' : 'bg-warning animate-pulse')} />
       {label}
     </span>
   );
@@ -217,8 +218,8 @@ export function MachineCard({ machine, selected, onClick, actions, children }) {
             <span className="truncate font-medium">{machine.name}</span>
             <StatusPill online={machine.online} />
             {backend && <span className="rounded border border-primary/40 px-1 text-[9.5px] text-primary">backend</span>}
-            {machine.kind === 'lan' && !machine.paired && <span className="text-[10px] text-amber-500">not paired</span>}
-            {machine.windowOpen && <span className="text-[10px] text-emerald-500">window open</span>}
+            {machine.kind === 'lan' && !machine.paired && <span className="text-[10px] text-warning">not paired</span>}
+            {machine.windowOpen && <span className="text-[10px] text-success">window open</span>}
           </div>
           {machine.subtitle && <div className="truncate font-mono text-[10.5px] text-muted-foreground">{machine.subtitle}</div>}
         </div>
@@ -300,37 +301,41 @@ export function AddMachineDialog({ open, mode, onClose, lanEnabled, onLanAdded, 
           <div className="space-y-2">
             <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name (optional)" className="h-8 text-xs" />
             <Input autoFocus value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://rustic.example.com" className="h-8 font-mono text-xs" />
-            <Input
-              type="password"
-              autoComplete="off"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && canSubmit && addBackend()}
-              placeholder="Server password"
-              className="h-8 text-xs"
-            />
-            <p className="text-[10.5px] text-muted-foreground">Verified, then saved in your OS keychain for this backend only.</p>
+            <div className="flex items-center gap-1.5">
+              <Input
+                type="password"
+                autoComplete="off"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && canSubmit && addBackend()}
+                placeholder="Server password"
+                className="h-8 text-xs"
+              />
+              <InfoTip side="left">Verified, then saved in your OS keychain for this backend only.</InfoTip>
+            </div>
           </div>
         ) : (
           <div className="space-y-2">
-            {!lanEnabled && <p className="text-[11.5px] text-amber-500">Turn on local-network sync under My machine first.</p>}
-            <Input
-              autoFocus
-              value={address}
-              onChange={(e) => setAddress(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && canSubmit && addDesktop()}
-              placeholder={tab === 'lan' ? '192.168.1.20  or  192.168.1.20:47820' : 'https://xyz.trycloudflare.com  or  203.0.113.7:47820'}
-              className="h-8 font-mono text-xs"
-            />
-            <p className="text-[10.5px] text-muted-foreground">
-              {tab === 'lan'
-                ? 'The other machine shows its address under My machine.'
-                : 'On the other machine, turn on the Cloudflare tunnel under My machine and paste its URL here — or forward port 47820 on its router and enter its public IP.'}
-              {' '}You'll pair next, confirming the same 6-digit code on both screens.
-            </p>
+            {!lanEnabled && <p className="text-[11.5px] text-warning">Turn on local-network sync under My machine first.</p>}
+            <div className="flex items-center gap-1.5">
+              <Input
+                autoFocus
+                value={address}
+                onChange={(e) => setAddress(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && canSubmit && addDesktop()}
+                placeholder={tab === 'lan' ? '192.168.1.20  or  192.168.1.20:47820' : 'https://xyz.trycloudflare.com  or  203.0.113.7:47820'}
+                className="h-8 font-mono text-xs"
+              />
+              <InfoTip side="left">
+                {tab === 'lan'
+                  ? 'The other machine shows its address under My machine.'
+                  : 'On the other machine, turn on the Cloudflare tunnel under My machine and paste its URL here — or forward port 47820 on its router and enter its public IP.'}
+                {' '}You'll pair next, confirming the same 6-digit code on both screens.
+              </InfoTip>
+            </div>
           </div>
         )}
-        {error && <p className="break-all text-[11px] text-rose-500">{error}</p>}
+        {error && <p className="break-all text-[11px] text-danger">{error}</p>}
         <DialogFooter>
           <Button variant="outline" size="sm" className="h-7 text-xs" onClick={onClose}>Cancel</Button>
           <Button size="sm" className="h-7 text-xs" disabled={busy || !canSubmit} onClick={isBackend ? addBackend : addDesktop}>
