@@ -90,13 +90,18 @@ impl Node {
     }
 }
 
-/// Wait for `event` on a hub subscription and return its payload.
-async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<rustic_server::hub::EventMsg>, event: &str) -> Value {
+/// Wait for `event` on a hub subscription and return its payload. The hub
+/// fans out pre-serialized `EventMsg` JSON, so each message is parsed here.
+async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<str>>, event: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match rx.recv().await {
-                Ok(m) if m.event == event => return m.payload,
-                Ok(_) => continue,
+                Ok(text) => {
+                    let mut msg: Value = serde_json::from_str(&text).expect("hub message is JSON");
+                    if msg["event"] == event {
+                        return msg["payload"].take();
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(e) => panic!("hub closed: {e}"),
             }

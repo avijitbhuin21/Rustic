@@ -524,7 +524,10 @@ fn walk_manifest(abs: &Path, rel: &str, project_id: &str, src: &str, out: &mut V
 pub fn manifest(items: &[(String, String, PathBuf, String)]) -> Vec<ManifestEntry> {
     let mut out = Vec::new();
     for (pid, src, abs, top) in items {
-        walk_manifest(abs, top, pid, src.trim_matches('/'), &mut out);
+        // Push sources (no project id) are local ABSOLUTE paths: trimming the
+        // leading '/' turns `/Users/..` into a relative path on macOS/Linux.
+        let src = if pid.is_empty() { src.trim_end_matches('/') } else { src.trim_matches('/') };
+        walk_manifest(abs, top, pid, src, &mut out);
     }
     out
 }
