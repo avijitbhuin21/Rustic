@@ -10,7 +10,7 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from '@/components/ui/resizable';
-import { ConfirmDialogHost } from '@/components/confirm-dialog';
+import { ConfirmDialogHost, confirm } from '@/components/confirm-dialog';
 import { SaveConflictDialogHost } from '@/components/editor/save-conflict-dialog';
 import { CommandPalette } from '@/components/command-palette';
 import { TerminalProjectPicker } from '@/components/terminal-project-picker';
@@ -45,6 +45,7 @@ import { initGitAutoRefresh } from '@/lib/git-auto-refresh';
 import { initExternalAgents } from '@/state/external-agents';
 import { useBreakpoint } from '@/lib/use-breakpoint';
 import { IS_WEB } from '@/lib/platform';
+import { restoreLastSession, saveSessionNow } from '@/lib/session-restore';
 import { LanPairPrompt } from '@/components/settings/lan-pair-prompt';
 import { MobileShell } from '@/components/shell/mobile-shell';
 import { TabletShell } from '@/components/shell/tablet-shell';
@@ -60,6 +61,12 @@ function useActiveProjectSync() {
   useEffect(() => {
     if (!hasLoaded) loadProjects();
   }, [hasLoaded, loadProjects]);
+
+  const settingsLoaded = useSettings((s) => !!s.settings);
+  useEffect(() => {
+    if (!hasLoaded || !settingsLoaded) return;
+    restoreLastSession(!!useSettings.getState().settings?.general?.restore_last_session);
+  }, [hasLoaded, settingsLoaded]);
 
   useEffect(() => {
     const project = projects.find((p) => p.id === activeProjectId);
@@ -199,7 +206,21 @@ export default function App() {
   // emits this event so the frontend can clean up then call confirm_quit.
   useEffect(() => {
     let unlisten;
-    listen('rustic:close-requested', () => {
+    let prompting = false;
+    listen('rustic:close-requested', async () => {
+      if (prompting) return;
+      if (useSettings.getState().settings?.general?.confirm_quit) {
+        prompting = true;
+        const ok = await confirm({
+          title: 'Quit Rustic?',
+          description: 'Running agents and terminals will be stopped.',
+          confirmLabel: 'Quit',
+          destructive: true,
+        });
+        prompting = false;
+        if (ok !== true) return;
+      }
+      saveSessionNow();
       invoke('confirm_quit').catch(() => {});
     }).then((fn) => { unlisten = fn; }).catch(() => {});
     return () => { if (unlisten) unlisten(); };

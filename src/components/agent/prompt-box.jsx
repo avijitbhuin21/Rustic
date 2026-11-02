@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { isTauriAvailable as isTauri } from '@/lib/platform';
+import { isTauriAvailable as isTauri, IS_MAC_DESKTOP } from '@/lib/platform';
 import {
   ArrowUp,
   Check,
@@ -1502,7 +1502,9 @@ export function PromptBox({
   const startRecording = useCallback(async () => {
     if (recording) return;
     if (!navigator.mediaDevices?.getUserMedia) {
-      toast.error('Microphone is not available in this environment.');
+      toast.error(IS_MAC_DESKTOP
+        ? 'Microphone is not available. Make sure Rustic is launched from its .app bundle and allowed under System Settings › Privacy & Security › Microphone.'
+        : 'Microphone is not available in this environment.');
       return;
     }
     try {
@@ -1553,7 +1555,11 @@ export function PromptBox({
       mediaRecorderRef.current = mr;
       setRecording(true);
     } catch (err) {
-      toast.error(`Microphone unavailable: ${err}`);
+      if (IS_MAC_DESKTOP && err?.name === 'NotAllowedError') {
+        toast.error('Microphone access was denied. Allow Rustic under System Settings › Privacy & Security › Microphone, then try again.');
+      } else {
+        toast.error(`Microphone unavailable: ${err}`);
+      }
     }
   }, [recording]);
 

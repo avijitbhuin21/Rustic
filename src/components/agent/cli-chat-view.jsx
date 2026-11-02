@@ -6,7 +6,7 @@ import { IS_WEB } from '@/lib/platform';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { confirm } from '@/components/confirm-dialog';
 import { AgentLogo } from '@/components/icons/agent-logos';
-import { TerminalPane } from '@/components/terminal/terminal-pane';
+import { TerminalPane } from '@/components/terminal/lazy-terminal-pane';
 import { useExternalAgents } from '@/state/external-agents';
 import { agentLabel } from './external-agent-launchers';
 import { useCliBusy } from './cli-activity';

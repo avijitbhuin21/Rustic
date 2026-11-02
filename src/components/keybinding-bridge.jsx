@@ -14,6 +14,7 @@ import {
   buildKeyMap,
   eventToKey,
   isTypingTarget,
+  macCmdFallbackKey,
 } from '@/lib/commands';
 
 // A key is "safe to swallow inside typing targets" only if it uses a modifier
@@ -35,9 +36,13 @@ export function KeybindingBridge() {
       // Without this, a command that re-emits its own key produces an
       // infinite loop.
       if (e.__rusticSynthetic) return;
-      const key = eventToKey(e);
+      let key = eventToKey(e);
       if (!key) return;
-      const id = map.get(key);
+      let id = map.get(key);
+      if (!id) {
+        const alt = macCmdFallbackKey(key);
+        if (alt) { id = map.get(alt); key = alt; }
+      }
       if (!id) return;
       const cmd = COMMAND_BY_ID[id];
       if (!cmd?.run) return;

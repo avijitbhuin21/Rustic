@@ -9,13 +9,16 @@ import { useEditor } from '@/state/editor';
 import { SettingsSection, SettingRow } from './setting-row';
 import { TunnelSettings } from './tunnel-settings';
 import { PowerSettings } from './power-settings';
-import { IS_WEB } from '@/lib/platform';
+import { IS_WEB, IS_MAC_DESKTOP } from '@/lib/platform';
+import { readMacOptionIsMeta, setMacOptionIsMeta } from '@/components/terminal/terminal-instance';
 
 export function GeneralSettings() {
   const s = useSettings((s) => s.settings);
   const update = useSettings((u) => u.update);
   const [openWithRustic, setOpenWithRustic] = useState(false);
   const isWindows = !IS_WEB && navigator.userAgent.includes('Windows');
+  const isMac = IS_MAC_DESKTOP;
+  const [optionAsMeta, setOptionAsMeta] = useState(() => readMacOptionIsMeta());
 
   useEffect(() => {
     if (!isWindows) return;
@@ -121,6 +124,22 @@ export function GeneralSettings() {
               id="open-with-rustic"
               checked={openWithRustic}
               onCheckedChange={toggleOpenWithRustic}
+            />
+          </SettingRow>
+        </SettingsSection>
+      )}
+
+      {isMac && (
+        <SettingsSection title="Terminal">
+          <SettingRow
+            label="Use Option as Meta key"
+            description="Option+B/F/D etc. reach the shell as Meta shortcuts. Turn off to type Option symbols (e.g. @ on some layouts)."
+            htmlFor="option-as-meta"
+          >
+            <Switch
+              id="option-as-meta"
+              checked={optionAsMeta}
+              onCheckedChange={(v) => { setMacOptionIsMeta(v); setOptionAsMeta(v); }}
             />
           </SettingRow>
         </SettingsSection>

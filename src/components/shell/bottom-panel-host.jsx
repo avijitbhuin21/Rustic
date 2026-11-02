@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { WINDOW_CONTROLS_OFFSET } from '@/components/shell/window-controls';
 import { useLayout } from '@/state/layout';
-import { IS_WEB } from '@/lib/platform';
+import { IS_WEB, MOD_LABEL } from '@/lib/platform';
 import { TerminalPanel } from '@/components/terminal/terminal-panel';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
 
@@ -68,7 +68,7 @@ export function BottomPanelHost() {
                 <X className="size-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="top">Close panel (Ctrl+J)</TooltipContent>
+            <TooltipContent side="top">Close panel ({MOD_LABEL}+J)</TooltipContent>
           </Tooltip>
         </div>
       </div>

@@ -188,7 +188,21 @@ function displayPart(p) {
 export function displayKey(combo) {
   const norm = normalizeKey(combo);
   if (!norm) return '';
-  return norm.split('+').map(displayPart).join('+');
+  const parts = norm.split('+');
+  // On macOS a Ctrl binding also fires with Cmd (see macCmdFallbackKey), so
+  // show the Mac-native glyph — except Ctrl+Tab, which Cmd can't reach.
+  const showCmd = IS_MAC && parts.includes('ctrl') && !parts.includes('meta') && parts[parts.length - 1] !== 'tab';
+  return parts.map((p) => (showCmd && p === 'ctrl' ? '⌘' : displayPart(p))).join('+');
+}
+
+const IS_MAC = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform || '');
+
+/** On macOS, maps a Cmd combo to its Ctrl equivalent so Ctrl-defined bindings also fire with Cmd; null elsewhere. */
+export function macCmdFallbackKey(key) {
+  if (!IS_MAC || !key) return null;
+  const parts = key.split('+');
+  if (!parts.includes('meta') || parts.includes('ctrl')) return null;
+  return normalizeKey(parts.map((p) => (p === 'meta' ? 'ctrl' : p)).join('+'));
 }
 
 // Build the canonical key string from a KeyboardEvent. Returns '' if the

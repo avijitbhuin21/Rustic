@@ -12,6 +12,41 @@ import {
   copyTerminalSelection,
 } from '@/lib/terminal-clipboard';
 
+const IS_MAC = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform || '');
+
+const OPTION_META_KEY = 'rustic.terminal.macOptionIsMeta';
+const liveTerminals = new Set();
+
+/** Whether the macOS Option key should act as Meta in terminals (off by default so Option still types symbols). */
+export function readMacOptionIsMeta() {
+  try { return localStorage.getItem(OPTION_META_KEY) === '1'; } catch { return false; }
+}
+
+/** Persist the Option-as-Meta preference and apply it to every open terminal. */
+export function setMacOptionIsMeta(on) {
+  try { localStorage.setItem(OPTION_META_KEY, on ? '1' : '0'); } catch { /* non-fatal */ }
+  for (const t of liveTerminals) {
+    try { t.options.macOptionIsMeta = !!on; } catch { /* disposed */ }
+  }
+}
+
+/** Mac line-editing keys (as in Terminal.app/VS Code) mapped to readline sequences; null when unmapped. */
+function macLineEditSequence(e) {
+  if (e.ctrlKey || e.shiftKey) return null;
+  if (e.metaKey && !e.altKey) {
+    if (e.key === 'ArrowLeft') return '\x01';  // start of line
+    if (e.key === 'ArrowRight') return '\x05'; // end of line
+    if (e.key === 'Backspace') return '\x15';  // delete to line start
+    return null;
+  }
+  if (e.altKey && !e.metaKey) {
+    if (e.key === 'ArrowLeft') return '\x1bb';  // word back
+    if (e.key === 'ArrowRight') return '\x1bf'; // word forward
+    if (e.key === 'Backspace') return '\x17';   // delete word back
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Persistent terminal instances.
 //
@@ -68,10 +103,20 @@ const TERMINAL_PALETTE = {
 // In a production build there's no HMR, so this is a harmless alias. Grep: term-diag.
 const instances = (globalThis.__rusticTerminalInstances ??= new Map());
 
+/** Terminal diagnostics logger; silent unless localStorage['rustic.terminal.debug'] === '1'. */
+function termDiag(...args) {
+  try {
+    if (globalThis.localStorage?.getItem('rustic.terminal.debug') !== '1') return;
+  } catch {
+    return;
+  }
+  console.warn(...args);
+}
+
 // [term-diag] TEMP: announce module (re)loads so we can tell an HMR reload apart
 // from a real dispose in the console timeline.
 if (typeof import.meta !== 'undefined' && import.meta.hot) {
-  console.warn('[term-diag] terminal-instance.js (re)loaded — instances map size=' + instances.size);
+  termDiag('[term-diag] terminal-instance.js (re)loaded — instances map size=' + instances.size);
 }
 
 // [term-diag] TEMP: console-callable state dump for every live terminal. Run
@@ -80,9 +125,9 @@ if (typeof import.meta !== 'undefined' && import.meta.hot) {
 // `rows` vs the content you expect. Grep: term-diag.
 if (typeof globalThis !== 'undefined') {
   globalThis.__rusticTermDebug = () => {
-    console.warn('[term-diag] __rusticTermDebug: ' + instances.size + ' instance(s)');
+    termDiag('[term-diag] __rusticTermDebug: ' + instances.size + ' instance(s)');
     for (const inst of instances.values()) {
-      try { inst.debug?.('manual'); } catch (e) { console.warn('[term-diag] dump failed', e); }
+      try { inst.debug?.('manual'); } catch (e) { termDiag('[term-diag] dump failed', e); }
     }
   };
 }
@@ -94,7 +139,7 @@ export function acquireTerminalInstance(sessionId) {
     // [term-diag] TEMP: a NEW instance is being created. If this fires for a
     // session that already had history, the old instance was lost (disposed or
     // HMR-wiped) — the stack trace shows who triggered it. Grep: term-diag.
-    console.warn('[term-diag] CREATE new terminal instance session=' + sessionId +
+    termDiag('[term-diag] CREATE new terminal instance session=' + sessionId +
       ' (existingIds=[' + [...instances.keys()].join(',') + '])');
     inst = createTerminalInstance(sessionId);
     instances.set(sessionId, inst);
@@ -110,7 +155,7 @@ export function disposeTerminalInstance(sessionId) {
   // Logs which session + how much scrollback dies + the caller stack. Grep: term-diag.
   try {
     const buf = inst.term?.buffer?.active;
-    console.warn('[term-diag] DISPOSE terminal instance session=' + sessionId +
+    termDiag('[term-diag] DISPOSE terminal instance session=' + sessionId +
       ' scrollbackLines=' + (buf ? buf.length : '(no term)'));
   } catch (_) {}
   instances.delete(sessionId);
@@ -131,7 +176,7 @@ export function reconcileTerminalInstances(liveIds) {
       // much history is being thrown away, and the snapshot that triggered it, so
       // we can tell a real shell-exit from a transient/partial listing flap.
       // Remove once the "lost terminal history" repro is understood. Grep: term-diag.
-      console.warn('[term-diag] RECONCILE wants to dispose session=' + id +
+      termDiag('[term-diag] RECONCILE wants to dispose session=' + id +
         ' (liveIds=[' + [...liveIds].join(',') + '] allInstanceIds=[' + [...instances.keys()].join(',') + '])');
       disposeTerminalInstance(id);
     }
@@ -208,7 +253,7 @@ function createTerminalInstance(sessionId) {
   const debugDump = (tag) => {
     try {
       if (!term) {
-        console.warn('[term-diag] dump ' + tag + ' session=' + sessionId + ' term=null');
+        termDiag('[term-diag] dump ' + tag + ' session=' + sessionId + ' term=null');
         return;
       }
       const b = term.buffer?.active;
@@ -242,7 +287,7 @@ function createTerminalInstance(sessionId) {
         ' modes=' + modes
       );
     } catch (e) {
-      console.warn('[term-diag] dump error', e);
+      termDiag('[term-diag] dump error', e);
     }
   };
 
@@ -257,6 +302,7 @@ function createTerminalInstance(sessionId) {
     opened = true;
 
     term = new Terminal({
+      macOptionIsMeta: readMacOptionIsMeta(),
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 13,
       // 1.0 matches what most CLI logos (block-character pixel art) are designed
@@ -296,6 +342,7 @@ function createTerminalInstance(sessionId) {
       rescaleOverlappingGlyphs: true,
       minimumContrastRatio: 4.5,
     });
+    liveTerminals.add(term);
 
     fit = new FitAddon();
     term.loadAddon(fit);
@@ -405,9 +452,19 @@ function createTerminalInstance(sessionId) {
       // Suppress xterm's translation of Ctrl+V / Ctrl+C into raw ^V / ^C, and
       // intercept Ctrl+Shift+F for find. Ctrl+C still falls through as ^C when
       // there's no selection so SIGINT keeps working.
+      // On macOS the clipboard/find modifier is Cmd only: Ctrl must reach the
+      // shell untouched (^C, ^V literal-next in vim, …), and Cmd/Option get the
+      // standard Mac line-editing translations.
       term.attachCustomKeyEventHandler((e) => {
         if (e.type !== 'keydown') return true;
-        const mod = e.ctrlKey || e.metaKey;
+        if (IS_MAC) {
+          const seq = macLineEditSequence(e);
+          if (seq) {
+            useTerminal.getState().writeTerminal(sessionId, seq);
+            return false;
+          }
+        }
+        const mod = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey || e.metaKey;
         if (!mod || e.altKey) return true;
         const k = e.key.toLowerCase();
 
@@ -461,7 +518,7 @@ function createTerminalInstance(sessionId) {
       useTerminal.getState().readTerminalScrollback(sessionId).then((snapshot) => {
         if (disposed || !term) return;
         // [term-diag] TEMP: how big was the rehydrated history?
-        console.warn('[term-diag] REPLAY session=' + sessionId +
+        termDiag('[term-diag] REPLAY session=' + sessionId +
           ' snapshotBytes=' + (snapshot ? snapshot.length : 0) +
           ' snapshotLines=' + (snapshot ? snapshot.split('\n').length : 0));
         if (snapshot) {
@@ -620,6 +677,7 @@ function createTerminalInstance(sessionId) {
     webgl = null;
     searchResultSubs.clear();
     if (t) {
+      liveTerminals.delete(t);
       try { t.dispose(); } catch (_) {}
     }
     try { container.remove(); } catch (_) {}

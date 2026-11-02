@@ -3,6 +3,17 @@
 // false → Tauri desktop target
 export const IS_WEB = __IS_WEB__;
 
+/// Desktop build running on macOS — native traffic lights replace the custom
+/// window controls there (see tauri.macos.conf.json).
+export const IS_MAC_DESKTOP =
+  !IS_WEB && typeof navigator !== 'undefined' && /Mac/.test(navigator.platform || navigator.userAgent || '');
+
+/// Label for the primary shortcut modifier in UI hints: ⌘ on any Mac
+/// (desktop or Safari web), Ctrl elsewhere. Ctrl bindings also fire with Cmd
+/// on macOS (see commands.js macCmdFallbackKey).
+export const MOD_LABEL =
+  typeof navigator !== 'undefined' && /Mac/.test(navigator.platform || '') ? '⌘' : 'Ctrl';
+
 /// True when a backend transport is available: always in the web build (the
 /// HTTP/WS shims are compiled in), and in the desktop build only when the
 /// page actually runs inside the Tauri webview. Previously copy-pasted into

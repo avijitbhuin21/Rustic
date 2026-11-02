@@ -8,7 +8,7 @@ import { useEditor } from '@/state/editor';
 import { useExplorer, revealInFileManager } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
 import { WINDOW_CONTROLS_OFFSET } from '@/components/shell/window-controls';
-import { IS_WEB } from '@/lib/platform';
+import { IS_WEB, IS_MAC_DESKTOP } from '@/lib/platform';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
 import {
@@ -140,7 +140,7 @@ function Tab({
               <ContextMenuItem onSelect={() => onCopyRelativePath(tab.path)}>Copy Relative Path</ContextMenuItem>
             )}
             <ContextMenuSeparator />
-            <ContextMenuItem onSelect={() => onReveal(tab.path)}>Reveal in File Explorer</ContextMenuItem>
+            <ContextMenuItem onSelect={() => onReveal(tab.path)}>{IS_MAC_DESKTOP ? 'Reveal in Finder' : 'Reveal in File Explorer'}</ContextMenuItem>
           </>
         )}
       </ContextMenuContent>

@@ -29,6 +29,7 @@ import { PreviewSurface } from './preview-surface';
 import { useEditor } from '@/state/editor';
 import { setActiveSaver, clearActiveSaver } from '@/lib/active-editor';
 import { cn } from '@/lib/utils';
+import { MOD_LABEL } from '@/lib/platform';
 import './pdf-preview.css';
 
 // PDF.js singleton loader. We import the bundled worker URL through Vite so
@@ -1065,7 +1066,7 @@ export default function PdfPreview({ tab }) {
               variant={dirty ? 'default' : 'ghost'}
               disabled={!dirty || saving}
               onClick={onSave}
-              title="Save (Ctrl+S)"
+              title={`Save (${MOD_LABEL}+S)`}
             >
               <Save />
               <span className="ml-1">{saving ? 'Saving…' : 'Save'}</span>

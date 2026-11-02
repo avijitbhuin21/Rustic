@@ -8,21 +8,23 @@ import {
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useSettings } from '@/state/settings';
 import { COMMANDS, effectiveKey, displayKey } from '@/lib/commands';
+import { MOD_LABEL } from '@/lib/platform';
 
 // Hints that aren't registry commands (Monaco built-ins, chat composer,
 // pointer gestures) — merged into the derived groups below.
 const STATIC_EXTRAS = {
   Editor: [
-    ['Ctrl+F', 'Find'],
-    ['Ctrl+H', 'Replace'],
-    ['Ctrl+W', 'Close tab'],
+    [`${MOD_LABEL}+F`, 'Find'],
+    // Monaco's macOS replace binding is ⌥⌘F; Ctrl+H elsewhere.
+    [MOD_LABEL === '⌘' ? '⌥+⌘+F' : 'Ctrl+H', 'Replace'],
+    [`${MOD_LABEL}+W`, 'Close tab'],
     ['F2', 'Rename symbol'],
   ],
   Explorer: [
     ['Right-click', 'Context menu'],
   ],
   Agent: [
-    ['Ctrl+Enter', 'Send message'],
+    [`${MOD_LABEL}+Enter`, 'Send message'],
     ['Esc', 'Cancel streaming'],
   ],
 };

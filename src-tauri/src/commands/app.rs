@@ -51,7 +51,7 @@ pub struct LogFileInfo {
 
 /// List the rotating log files currently on disk, newest first. Used by the
 /// Settings → Logs panel so the user can pick a day and open it in the editor.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_log_files() -> Result<Vec<LogFileInfo>, String> {
     let dir = crate::logging::current_log_dir()
         .ok_or_else(|| "Logging is not initialised".to_string())?;
@@ -105,7 +105,7 @@ pub fn list_log_files() -> Result<Vec<LogFileInfo>, String> {
 /// to slurp arbitrary files off disk, even though the bytes themselves are
 /// plain text (defence-in-depth: an XSS-via-log-line attacker shouldn't be
 /// able to pivot to reading `~/.aws/credentials`).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_log_file(path: String) -> Result<String, String> {
     let log_dir = crate::logging::current_log_dir()
         .ok_or_else(|| "Logging is not initialised".to_string())?;
@@ -149,6 +149,27 @@ pub fn log_frontend_error(
         "frontend error: {}",
         message
     );
+}
+
+static SIMPLE_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Toggle macOS "simple" fullscreen (no title-bar strip or separate Space) and return the new state.
+#[tauri::command]
+pub fn toggle_simple_fullscreen(window: tauri::WebviewWindow) -> Result<bool, String> {
+    use std::sync::atomic::Ordering;
+    let next = !SIMPLE_FULLSCREEN.load(Ordering::SeqCst);
+    #[cfg(target_os = "macos")]
+    {
+        window.set_simple_fullscreen(next).map_err(|e| e.to_string())?;
+        let radius = if next { crate::macos_window::FULLSCREEN_TOP_RADIUS } else { 0.0 };
+        crate::macos_window::set_top_corner_radius(&window, radius);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        window.set_fullscreen(next).map_err(|e| e.to_string())?;
+    }
+    SIMPLE_FULLSCREEN.store(next, Ordering::SeqCst);
+    Ok(next)
 }
 
 /// Quit the app without further prompting. The frontend calls this after

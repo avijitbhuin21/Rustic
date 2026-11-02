@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Minus, Square, X, Copy } from 'lucide-react';
+import { Minus, Square, X, Copy, Maximize2, Minimize2 } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
+import { IS_MAC_DESKTOP } from '@/lib/platform';
 
 export const WINDOW_CONTROLS_WIDTH = 130;
 // Width plus a small breathing gap — what layouts reserve so their top-right
@@ -8,15 +10,20 @@ export const WINDOW_CONTROLS_WIDTH = 130;
 export const WINDOW_CONTROLS_OFFSET = WINDOW_CONTROLS_WIDTH + 8;
 
 export function WindowControls() {
-  const [maximized, setMaximized] = useState(false);
+  // On macOS the middle button drives native fullscreen (its own Space)
+  // instead of maximize — the window stays borderless for square corners.
+  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
+    // Simple fullscreen isn't reported by isFullscreen(); the toggle command's
+    // return value is the source of truth on macOS.
+    if (IS_MAC_DESKTOP) return undefined;
     const win = getCurrentWindow();
     let unlisten;
-    win.isMaximized().then(setMaximized).catch(() => {});
+    win.isMaximized().then(setExpanded).catch(() => {});
     win
       .onResized(() => {
-        win.isMaximized().then(setMaximized).catch(() => {});
+        win.isMaximized().then(setExpanded).catch(() => {});
       })
       .then((fn) => {
         unlisten = fn;
@@ -28,8 +35,21 @@ export function WindowControls() {
   }, []);
 
   const onMinimize = () => getCurrentWindow().minimize().catch(() => {});
-  const onToggleMax = () => getCurrentWindow().toggleMaximize().catch(() => {});
+  const onToggleMax = () => {
+    if (IS_MAC_DESKTOP) {
+      invoke('toggle_simple_fullscreen').then(setExpanded).catch(() => {});
+    } else {
+      getCurrentWindow().toggleMaximize().catch(() => {});
+    }
+  };
   const onClose = () => getCurrentWindow().close().catch(() => {});
+
+  const toggleLabel = IS_MAC_DESKTOP
+    ? (expanded ? 'Exit Full Screen' : 'Enter Full Screen')
+    : (expanded ? 'Restore' : 'Maximize');
+  let toggleIcon;
+  if (IS_MAC_DESKTOP) toggleIcon = expanded ? <Minimize2 className="size-3" /> : <Maximize2 className="size-3" />;
+  else toggleIcon = expanded ? <Copy className="size-3 -scale-x-100" /> : <Square className="size-3" />;
 
   return (
     <div
@@ -48,10 +68,11 @@ export function WindowControls() {
         <button
           type="button"
           onClick={onToggleMax}
-          aria-label={maximized ? 'Restore' : 'Maximize'}
+          aria-label={toggleLabel}
+          title={toggleLabel}
           className="flex w-11 items-center justify-center text-muted-foreground hover:bg-muted hover:text-foreground"
         >
-          {maximized ? <Copy className="size-3 -scale-x-100" /> : <Square className="size-3" />}
+          {toggleIcon}
         </button>
         <button
           type="button"

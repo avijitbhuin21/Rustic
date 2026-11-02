@@ -3,6 +3,10 @@ mod app_paths;
 mod commands;
 mod lan;
 mod logging;
+#[cfg(target_os = "macos")]
+mod macos_env;
+#[cfg(target_os = "macos")]
+mod macos_window;
 mod path_scope;
 mod secrets;
 mod state;
@@ -17,6 +21,9 @@ use tauri::{Emitter, Manager, WindowEvent};
 use state::AppState;
 
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    macos_env::import_login_shell_path();
+
     #[allow(unused_mut)] // Used in release builds for single-instance plugin
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -279,6 +286,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app::confirm_quit,
+            commands::app::toggle_simple_fullscreen,
             commands::app::log_frontend_error,
             commands::app::get_logs_dir,
             commands::app::list_log_files,
@@ -561,6 +569,18 @@ pub fn run() {
             commands::formatters::formatter_remove_custom,
             commands::formatters::formatter_format,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // macOS Cmd+Q / app-menu Quit ends the app without a window
+            // CloseRequested, skipping the frontend's quit path. Divert a
+            // user-initiated exit (code None) into the same event; confirm_quit
+            // then exits with Some(0), which passes through.
+            if let tauri::RunEvent::ExitRequested { api, code: None, .. } = &event {
+                if let Some(window) = app.get_webview_window("main") {
+                    api.prevent_exit();
+                    let _ = window.emit("rustic:close-requested", ());
+                }
+            }
+        });
 }

@@ -28,6 +28,7 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
+import { MOD_LABEL } from '@/lib/platform';
 import { useEditor, basename } from '@/state/editor';
 import { writeTextFileScoped } from '@/lib/fs-io';
 import { setActiveSaver, clearActiveSaver } from '@/lib/active-editor';
@@ -476,7 +477,7 @@ export default function NotebookPreview({ tab }) {
               <Save className="size-3.5" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent side="bottom">Save (Ctrl+S)</TooltipContent>
+          <TooltipContent side="bottom">Save ({MOD_LABEL}+S)</TooltipContent>
         </Tooltip>
         <div className="mx-1 h-4 w-px bg-border" />
         <Button
