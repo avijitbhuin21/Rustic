@@ -70,6 +70,35 @@ pub fn import_login_shell_path() {
     }
 }
 
+/// Point TMPDIR at the app bundle's volume when it differs from the system
+/// temp volume, so the updater's rename-based install doesn't fail with
+/// "Cross-device link (os error 18)" for apps on external drives
+/// (tauri-apps/plugins-workspace#1983).
+pub fn keep_temp_on_app_volume() {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(exe) = std::env::current_exe() else { return };
+    // <Name>.app/Contents/MacOS/<binary>
+    let Some(bundle) = exe.ancestors().nth(3) else { return };
+    if bundle.extension().map_or(true, |e| e != "app") {
+        return;
+    }
+    let Some(parent) = bundle.parent() else { return };
+    let tmp = std::env::temp_dir();
+    let (Ok(app_meta), Ok(tmp_meta)) = (std::fs::metadata(parent), std::fs::metadata(&tmp)) else {
+        return;
+    };
+    if app_meta.dev() == tmp_meta.dev() {
+        return;
+    }
+    let dir = parent.join(".rustic-tmp");
+    let probe = dir.join(".probe");
+    let writable = std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    if writable {
+        std::env::set_var("TMPDIR", &dir);
+    }
+}
+
 /// Pull the PATH value out from between the markers, ignoring any rc-file noise.
 fn extract_marked(output: &str) -> Option<&str> {
     let start = output.find(MARKER)? + MARKER.len();

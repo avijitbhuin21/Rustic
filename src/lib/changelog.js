@@ -2,6 +2,13 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.7.8',
+    date: 'November 2026',
+    entries: [
+      { tag: 'fixed', text: 'macOS — in-app updates now install when Rustic lives on an external drive (previously "Cross-device link (os error 18)"). Temporary files are kept on the same drive as the app.' },
+    ],
+  },
+  {
     version: '0.7.7',
     date: 'November 2026',
     entries: [

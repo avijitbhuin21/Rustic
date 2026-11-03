@@ -23,6 +23,8 @@ use state::AppState;
 pub fn run() {
     #[cfg(target_os = "macos")]
     macos_env::import_login_shell_path();
+    #[cfg(target_os = "macos")]
+    macos_env::keep_temp_on_app_volume();
 
     #[allow(unused_mut)] // Used in release builds for single-instance plugin
     let mut builder = tauri::Builder::default()
