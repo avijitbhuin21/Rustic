@@ -2,6 +2,24 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.8.0',
+    date: 'November 2026',
+    entries: [
+      { tag: 'new', text: 'Clickable file paths — paths in chat replies, tool cards and terminal output open in the editor (with `file:line` jumping to the line). Missing files show a toast instead of failing silently.' },
+      { tag: 'improved', text: 'Lower agent cost — the project tree and older tool results are now cache-friendly, Anthropic caches tools + system prompt for an hour, OpenAI and Gemini prompt caching are on, and OpenRouter gets cache markers, sticky routing and real cost/cache numbers.' },
+      { tag: 'improved', text: 'Agent terminals use zsh on macOS/Linux and Git Bash on Windows (falling back to bash/PowerShell), and the agent is told the shell it actually runs in. Your own terminals keep your login shell.' },
+      { tag: 'fixed', text: 'run_command on macOS notices when a command finishes, and commands started in the background (`cmd &`) no longer show as "running" forever.' },
+      { tag: 'fixed', text: 'Rustic Server — sending a message while the agent was working no longer makes it forget the turn it was in the middle of.' },
+      { tag: 'improved', text: 'Faster — smaller startup bundle, streamed tokens are batched before reaching the UI, long chats only re-render the turn that is changing, and the symbol index uses less memory.' },
+      { tag: 'fixed', text: 'Sync — re-pairing after one device forgot the other works again, pairing prompts bring the window to the front, failed pairings say why, and stuck loading now times out with Retry.' },
+      { tag: 'improved', text: 'The project tree sent to the agent always hides secret files (keys, .env) and collapses icon/font/fixture folders.' },
+      { tag: 'new', text: 'The send button is now the agent character, with a ring around it that fills as the context window fills (hover for the numbers). It hops when you send.' },
+      { tag: 'improved', text: 'Voice input has its own button next to the model picker, so you can dictate while a task is running.' },
+      { tag: 'fixed', text: 'Model templates — search results stay at the top instead of sliding to the bottom, and the list scrolls straight away inside the Edit model dialog.' },
+      { tag: 'improved', text: 'Restore last session shows a "Restoring your last session…" indicator while your files and chat reopen.' },
+    ],
+  },
+  {
     version: '0.7.8',
     date: 'November 2026',
     entries: [

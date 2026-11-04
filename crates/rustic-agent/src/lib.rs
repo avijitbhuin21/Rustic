@@ -1,3 +1,4 @@
+pub mod agent_shell;
 pub mod budget;
 pub mod commit_message;
 pub mod config;

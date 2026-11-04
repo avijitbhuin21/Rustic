@@ -2,6 +2,7 @@ pub mod claude;
 pub mod compatible;
 pub mod freebuff;
 pub mod gemini;
+pub mod gemini_cache;
 pub mod openai;
 pub mod request_overrides;
 
@@ -335,7 +336,17 @@ fn default_true() -> bool {
 /// lose the last delta (observed as tool arguments truncated mid-JSON).
 #[derive(Default)]
 pub struct SseLineBuffer {
+    /// Bytes not yet returned as a complete line. Always starts at a line
+    /// boundary: complete lines are cut off once per `push`, never per line.
     buf: Vec<u8>,
+}
+
+fn decode_line(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
 }
 
 impl SseLineBuffer {
@@ -345,13 +356,20 @@ impl SseLineBuffer {
 
     /// Appends `chunk` and returns every complete line (CR stripped) now available.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        // Only the new bytes can contain a newline the previous push didn't see.
+        let scan_from = self.buf.len();
         self.buf.extend_from_slice(chunk);
         let mut lines = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            let line = &line[..line.len() - 1];
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            lines.push(String::from_utf8_lossy(line).into_owned());
+        let mut start = 0usize;
+        let mut cursor = scan_from;
+        while let Some(off) = self.buf[cursor..].iter().position(|b| *b == b'\n') {
+            let end = cursor + off;
+            lines.push(decode_line(&self.buf[start..end]));
+            start = end + 1;
+            cursor = start;
+        }
+        if start > 0 {
+            self.buf.drain(..start);
         }
         lines
     }
@@ -362,10 +380,138 @@ impl SseLineBuffer {
             return None;
         }
         let rest = std::mem::take(&mut self.buf);
-        let rest = rest.strip_suffix(b"\r").unwrap_or(&rest);
-        let s = String::from_utf8_lossy(rest).into_owned();
+        let s = decode_line(&rest);
         (!s.trim().is_empty()).then_some(s)
     }
+}
+
+/// One classified SSE line, shared by every streaming adapter.
+#[derive(Debug, PartialEq)]
+pub enum SseLine<'a> {
+    /// Not a `data:` line (event:/id:/comments/blank) — ignore.
+    Skip,
+    /// The OpenAI-style `data: [DONE]` terminator.
+    Done,
+    /// The payload after `data:` (one optional leading space stripped).
+    Data(&'a str),
+}
+
+/// Classify a line from [`SseLineBuffer`]. Accepts both `data: x` and the
+/// spec-legal `data:x` form.
+pub fn classify_sse_line(line: &str) -> SseLine<'_> {
+    let Some(rest) = line.strip_prefix("data:") else {
+        return SseLine::Skip;
+    };
+    let data = rest.strip_prefix(' ').unwrap_or(rest);
+    if data.trim_end() == "[DONE]" {
+        SseLine::Done
+    } else if data.trim().is_empty() {
+        SseLine::Skip
+    } else {
+        SseLine::Data(data)
+    }
+}
+
+/// Parsed form of a `data:` JSON line.
+pub enum SseJson<T> {
+    Skip,
+    Done,
+    Value(T),
+    /// The data line was not valid JSON for `T`; already logged at debug.
+    Invalid,
+}
+
+/// Classify `line` and deserialize its `data:` payload as `T`. Unparseable
+/// payloads are logged at debug level with `tag` and reported as `Invalid`
+/// so callers can count them.
+pub fn parse_sse_json<T: serde::de::DeserializeOwned>(line: &str, tag: &str) -> SseJson<T> {
+    match classify_sse_line(line) {
+        SseLine::Skip => SseJson::Skip,
+        SseLine::Done => SseJson::Done,
+        SseLine::Data(data) => match serde_json::from_str(data) {
+            Ok(v) => SseJson::Value(v),
+            Err(e) => {
+                let mut cut = data.len().min(200);
+                while !data.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                tracing::debug!(
+                    error = %e,
+                    preview = %&data[..cut],
+                    "[{}] dropped unparseable SSE data line",
+                    tag
+                );
+                SseJson::Invalid
+            }
+        },
+    }
+}
+
+/// Tool definitions in deterministic name order. Tools sit at the very start
+/// of every provider's cacheable prefix, so a reordering (e.g. an MCP server
+/// listing its tools in a different order after a reconnect) would otherwise
+/// invalidate the whole prompt cache.
+pub fn sorted_tools(tools: &[ToolDef]) -> Vec<&ToolDef> {
+    let mut v: Vec<&ToolDef> = tools.iter().collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
+}
+
+/// Stable per-conversation prompt-cache routing key (OpenAI `prompt_cache_key`,
+/// OpenRouter sticky routing). Derived from the model, system prompt and the
+/// first message so it stays constant across every iteration of a task
+/// without needing a task id threaded through `ProviderConfig`, and differs
+/// between conversations that share the same system prompt.
+pub fn conversation_cache_key(config: &ProviderConfig, messages: &[Message]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(config.model.as_bytes());
+    h.update([0]);
+    h.update(config.system_prompt.as_deref().unwrap_or("").as_bytes());
+    h.update([0]);
+    if let Some(first) = messages.first() {
+        for block in &first.content {
+            if let ContentBlock::Text { text } = block {
+                h.update(text.as_bytes());
+                h.update([0]);
+            }
+        }
+    }
+    let digest = h.finalize();
+    format!("rustic-{}", hex::encode(&digest[..12]))
+}
+
+/// True when `base_url` targets OpenRouter.
+pub fn is_openrouter(config: &ProviderConfig) -> bool {
+    config
+        .base_url
+        .as_deref()
+        .map(|u| u.contains("openrouter.ai"))
+        .unwrap_or(false)
+}
+
+/// One info line per completed request so cache-hit ratios can be measured
+/// from the logs (`grep "\[usage\]"`).
+pub fn log_request_usage(provider: &str, model: &str, usage: &TokenUsage) {
+    let prompt_total = usage.input_tokens as u64
+        + usage.cache_read_tokens as u64
+        + usage.cache_write_tokens as u64;
+    let hit_pct = if prompt_total > 0 {
+        (usage.cache_read_tokens as u64 * 100) / prompt_total
+    } else {
+        0
+    };
+    tracing::info!(
+        target: "rustic::usage",
+        provider,
+        model,
+        input = usage.input_tokens,
+        cache_read = usage.cache_read_tokens,
+        cache_write = usage.cache_write_tokens,
+        output = usage.output_tokens,
+        cache_hit_pct = hit_pct,
+        "[usage] request completed"
+    );
 }
 
 /// Builds the reqwest client used for provider calls: bounded TCP connect (dead hosts fail in 20s instead of the OS default ~3 min), no overall timeout because SSE streams are long-lived, and a per-read idle timeout so a silently stalled stream errors (and retries) instead of hanging.
@@ -736,4 +882,71 @@ pub trait AiProvider: Send + Sync {
 
     fn name(&self) -> &str;
     fn available_models(&self) -> Vec<ModelInfo>;
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    fn cfg() -> ProviderConfig {
+        serde_json::from_value(serde_json::json!({
+            "api_key": "k", "model": "m", "max_tokens": 10, "temperature": 0.7,
+            "base_url": null, "system_prompt": "sys"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sse_buffer_splits_lines_across_chunks_and_flushes_tail() {
+        let mut b = SseLineBuffer::new();
+        assert!(b.push(b"data: a").is_empty());
+        assert_eq!(b.push(b"bc\r\ndata: x\n\ndata: tai"), vec!["data: abc", "data: x", ""]);
+        assert_eq!(b.push(b"l"), Vec::<String>::new());
+        assert_eq!(b.flush().as_deref(), Some("data: tail"));
+        assert_eq!(b.flush(), None);
+    }
+
+    #[test]
+    fn sse_buffer_keeps_multibyte_char_split_across_chunks() {
+        let s = "data: héllo\n".as_bytes();
+        let (a, c) = s.split_at(8); // splits inside 'é'
+        let mut b = SseLineBuffer::new();
+        assert!(b.push(a).is_empty());
+        assert_eq!(b.push(c), vec!["data: héllo"]);
+        let mut bad = SseLineBuffer::new();
+        assert_eq!(bad.push(b"data: \xff\n"), vec!["data: \u{fffd}"]);
+    }
+
+    #[test]
+    fn classify_sse_lines() {
+        assert_eq!(classify_sse_line("event: ping"), SseLine::Skip);
+        assert_eq!(classify_sse_line(""), SseLine::Skip);
+        assert_eq!(classify_sse_line("data: [DONE]"), SseLine::Done);
+        assert_eq!(classify_sse_line("data:[DONE] "), SseLine::Done);
+        assert_eq!(classify_sse_line("data: {\"a\":1}"), SseLine::Data("{\"a\":1}"));
+        assert_eq!(classify_sse_line("data:{}"), SseLine::Data("{}"));
+        assert!(matches!(parse_sse_json::<serde_json::Value>("data: {nope", "t"), SseJson::Invalid));
+        assert!(matches!(parse_sse_json::<serde_json::Value>("data: {\"a\":1}", "t"), SseJson::Value(v) if v["a"] == 1));
+    }
+
+    #[test]
+    fn tools_sorted_by_name() {
+        let t = |n: &str| ToolDef { name: n.into(), description: String::new(), parameters: serde_json::json!({}) };
+        let tools = vec![t("read_file"), t("mcp__z"), t("edit_file")];
+        let names: Vec<&str> = sorted_tools(&tools).iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["edit_file", "mcp__z", "read_file"]);
+    }
+
+    #[test]
+    fn conversation_cache_key_stable_per_conversation() {
+        let c = cfg();
+        let m = |s: &str| Message { role: Role::User, content: vec![ContentBlock::Text { text: s.into() }] };
+        let a = vec![m("task one")];
+        let mut a_later = a.clone();
+        a_later.push(m("follow-up"));
+        let k = conversation_cache_key(&c, &a);
+        assert!(k.starts_with("rustic-") && k.len() == 7 + 24);
+        assert_eq!(k, conversation_cache_key(&c, &a_later));
+        assert_ne!(k, conversation_cache_key(&c, &[m("task two")]));
+    }
 }

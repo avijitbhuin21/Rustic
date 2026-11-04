@@ -67,7 +67,7 @@ impl AiProvider for GeminiProvider {
         let mut function_decls: Vec<Value> = Vec::new();
         let mut saw_web_search = false;
         let mut saw_web_fetch = false;
-        for t in tools {
+        for t in super::sorted_tools(tools) {
             match t.name.as_str() {
                 "web_search" => saw_web_search = true,
                 "web_fetch" => saw_web_fetch = true,
@@ -155,19 +155,66 @@ impl AiProvider for GeminiProvider {
             });
         }
 
-        let builder = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("x-goog-api-key", &config.api_key);
-        let resp = super::send_json_with_retry(
-            builder,
-            &mut body,
-            "Gemini",
-            config,
-            super::BodyDialect::Gemini,
-        )
-        .await?;
+        let make_builder = || {
+            self.client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("x-goog-api-key", &config.api_key)
+        };
+        // Explicit context cache for the static prefix (system + tools) on
+        // multi-iteration tasks; any rejection falls back to the uncached body.
+        let mut cached_send: Option<Result<reqwest::Response>> = None;
+        if super::gemini_cache::eligible_base(base) {
+            if let Some(prefix) = super::gemini_cache::prefix_of(&body) {
+                let key =
+                    super::gemini_cache::cache_key(base, &config.model, &config.api_key, &prefix);
+                if let Some(name) = super::gemini_cache::resolve(
+                    &self.client,
+                    base,
+                    &config.model,
+                    &config.api_key,
+                    &key,
+                    prefix,
+                )
+                .await
+                {
+                    let removed = super::gemini_cache::apply_cached(&mut body, &name);
+                    match super::send_json_with_retry(
+                        make_builder(),
+                        &mut body,
+                        "Gemini",
+                        config,
+                        super::BodyDialect::Gemini,
+                    )
+                    .await
+                    {
+                        Ok(r) => cached_send = Some(Ok(r)),
+                        Err(e) if super::is_provider_client_error(&e) => {
+                            tracing::info!(
+                                error = %e,
+                                "[gemini-cache] request with cachedContent rejected; retrying uncached"
+                            );
+                            super::gemini_cache::invalidate(&key);
+                            super::gemini_cache::restore_prefix(&mut body, removed);
+                        }
+                        Err(e) => cached_send = Some(Err(e)),
+                    }
+                }
+            }
+        }
+        let resp = match cached_send {
+            Some(r) => r?,
+            None => {
+                super::send_json_with_retry(
+                    make_builder(),
+                    &mut body,
+                    "Gemini",
+                    config,
+                    super::BodyDialect::Gemini,
+                )
+                .await?
+            }
+        };
 
         // ── SSE stream loop ───────────────────────────────────────────────────
         // Each `data:` line is a complete GenerateContentResponse JSON object
@@ -213,24 +260,10 @@ impl AiProvider for GeminiProvider {
             };
 
             for line in lines {
-                if line.trim() == "data: [DONE]" {
-                    break 'stream;
-                }
-                let data = match line.strip_prefix("data: ") {
-                    Some(d) => d,
-                    None => continue, // skip event:/id: lines
-                };
-
-                let chunk_resp: GeminiResponse = match serde_json::from_str(data) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            preview = %&data[..data.len().min(200)],
-                            "[gemini] dropped unparseable SSE data line"
-                        );
-                        continue;
-                    }
+                let chunk_resp: GeminiResponse = match super::parse_sse_json(&line, "gemini") {
+                    super::SseJson::Skip | super::SseJson::Invalid => continue,
+                    super::SseJson::Done => break 'stream,
+                    super::SseJson::Value(r) => r,
                 };
 
                 if let Some(u) = chunk_resp.usage {
@@ -380,6 +413,7 @@ impl AiProvider for GeminiProvider {
             }
         }
 
+        super::log_request_usage("Gemini", &config.model, &usage);
         Ok(AiResponse {
             content,
             usage,

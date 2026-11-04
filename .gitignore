@@ -35,7 +35,7 @@ Desktop.ini
 .env.*.local
 
 # rustic-server runtime data dir (DB, logs, file-history, secrets.json,
-# .session-secret) — created by scripts/run-server.ps1; never commit it.
+# .session-secret) — created by scripts/run-server.mjs; never commit it.
 rustic-data/
 
 # Tauri build artifacts

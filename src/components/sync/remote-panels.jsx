@@ -1,12 +1,12 @@
 // Remote-machine panels for the sync overlay: Projects | Metadata | Sharing,
 // a lazily loaded file tree with multi-select + drag-drop both ways, and an
 // on-demand preview pane.
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import {
-  ChevronRight, Folder, FolderOpen, FileText, Loader2, Download, Upload, FolderUp, ShieldCheck,
-  KeyRound, CheckSquare, Square, RefreshCw, X, Lock,
+  ChevronRight, ChevronLeft, Folder, FolderOpen, FileText, Loader2, Download, ShieldCheck,
+  KeyRound, RefreshCw, X, Lock, ListChecks,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -15,6 +15,10 @@ import { formatBytes } from '@/lib/transfer-format';
 import { InfoTip } from '@/components/ui/info-tip';
 import { Slider, SearchBox, ItemPicker } from '@/components/settings/cloud-machines';
 import { errText } from './use-lan';
+import { useTreeSelection, setCountDragImage, parentPath } from './use-tree-selection';
+import { colorizeToHtml } from '@/lib/code-colorize';
+import { TransfersTray } from '@/components/transfers/transfers-tray';
+import { getMonacoLanguage } from '@/state/editor';
 
 export const REMOTE_MIME = 'application/x-rustic-remote';
 export const LOCAL_PATHS_MIME = 'application/x-rustic-local-paths';
@@ -29,7 +33,7 @@ export function Column({ title, actions, children, className, footer }) {
   return (
     <div className={cn('flex h-full min-w-0 flex-col border-r border-ink/[0.06] last:border-r-0', className)}>
       {(title || actions) && (
-        <div className="flex h-10 shrink-0 items-center gap-2 border-b border-ink/[0.06] px-3">
+        <div className="flex h-8 shrink-0 items-center gap-2 border-b border-ink/[0.06] px-3">
           <div className="min-w-0 flex-1 truncate text-[12px] font-semibold">{title}</div>
           {actions}
         </div>
@@ -57,13 +61,17 @@ export function hasLocalPaths(dt) {
 }
 
 /** Projects | Metadata | Sharing column for one paired machine. */
-export function MachineColumn({ device, tab, setTab, project, onProject, metaItem, onMetaItem, metaSel, setMetaSel, localProjects, localMeta, onImportMeta }) {
+export function MachineColumn({ device, onBack, tab, setTab, project, onProject, metaItem, onMetaItem, metaSel, setMetaSel, localProjects, localMeta, onImportMeta }) {
   const [projects, setProjects] = useState(null);
   const [error, setError] = useState(null);
   const [query, setQuery] = useState('');
   const load = useCallback(() => {
     setProjects(null); setError(null);
-    invoke('lan_list_projects', { deviceId: device.device_id })
+    const get = () => invoke('lan_list_projects', { deviceId: device.device_id });
+    // Right after a reconnect the first call can hit a stale route; retry once
+    // quietly so the user sees projects or a Retry, never an endless spinner.
+    get()
+      .catch(() => new Promise((r) => setTimeout(r, 1500)).then(get))
       .then((l) => setProjects(Array.isArray(l) ? l : []))
       .catch((e) => { setProjects([]); setError(errText(e)); });
   }, [device.device_id]);
@@ -72,7 +80,16 @@ export function MachineColumn({ device, tab, setTab, project, onProject, metaIte
   const q = query.trim().toLowerCase();
   return (
     <Column
-      title={device.name}
+      title={(
+        <span className="flex min-w-0 items-center gap-1">
+          {onBack && (
+            <Button size="icon-sm" variant="ghost" className="-ml-1.5 size-6 shrink-0 text-muted-foreground" title="Back to machines" onClick={onBack}>
+              <ChevronLeft className="size-4" />
+            </Button>
+          )}
+          <span className="truncate">{device.name}</span>
+        </span>
+      )}
       actions={tab === 'projects' && (
         <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="Refresh" onClick={load}><RefreshCw className="size-3.5" /></Button>
       )}
@@ -81,6 +98,7 @@ export function MachineColumn({ device, tab, setTab, project, onProject, metaIte
         <Slider
           value={tab}
           onChange={setTab}
+          labels="active"
           options={[
             { id: 'projects', label: 'Projects', icon: Folder },
             { id: 'meta', label: 'Metadata', icon: KeyRound },
@@ -194,14 +212,29 @@ function MetaList({ device, selected, onSelect, sel, setSel, onImport }) {
           <div className="px-1 text-[10px] uppercase tracking-wider text-muted-foreground/70">{META_LABELS[cat] || cat}</div>
           {list.map((it) => {
             const k = key(it);
-            const checked = sel.has(k);
+            const picked = sel.has(k);
+            const choose = (ev) => {
+              if (ev.metaKey || ev.ctrlKey) {
+                setSel((s) => { const n = new Set(s); if (n.has(k)) n.delete(k); else n.add(k); return n; });
+                return;
+              }
+              setSel(new Set([k]));
+              if (data.granted) onSelect(it);
+            };
             return (
-              <div key={k} className={cn('flex items-center gap-1.5 rounded-md px-1.5 py-1 hover:bg-ink/[0.06]', selected && key(selected) === k && 'bg-primary/15')}>
-                <button type="button" onClick={() => setSel((s) => { const n = new Set(s); if (n.has(k)) n.delete(k); else n.add(k); return n; })} className="text-muted-foreground hover:text-foreground">
-                  {checked ? <CheckSquare className="size-3.5 text-primary" /> : <Square className="size-3.5" />}
-                </button>
-                <button type="button" className="min-w-0 flex-1 truncate text-left font-mono text-[11.5px]" onClick={() => data.granted && onSelect(it)}>{it.name}</button>
-              </div>
+              <button
+                key={k}
+                type="button"
+                onClick={choose}
+                title={data.granted ? 'Click to preview · Cmd/Ctrl+click to select several' : 'Cmd/Ctrl+click to select several'}
+                className={cn(
+                  'flex w-full select-none items-center rounded-md px-2 py-1 text-left font-mono text-[11.5px] hover:bg-ink/[0.06]',
+                  picked && 'bg-primary/15 hover:bg-primary/20',
+                  !picked && selected && key(selected) === k && 'bg-ink/[0.06]',
+                )}
+              >
+                <span className="min-w-0 flex-1 truncate">{it.name}</span>
+              </button>
             );
           })}
         </div>
@@ -259,13 +292,46 @@ function SharingPane({ device, localProjects, localMeta }) {
 }
 
 /** Lazily loaded file tree of one remote project. */
-export function RemoteFiles({ device, project, onPreview, previewPath, onImport, onUpload, onDropLocal }) {
+export function RemoteFiles({ device, project, onPreview, previewPath, onDropLocal }) {
   const [entries, setEntries] = useState({});
   const [open, setOpen] = useState(new Set(['']));
   const [loading, setLoading] = useState(new Set());
-  const [sel, setSel] = useState(new Map());
+  const { sel, setSel, click, clear } = useTreeSelection();
   const [dropDir, setDropDir] = useState(null);
   const [error, setError] = useState(null);
+  const openRef = useRef(open);
+  openRef.current = open;
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
+
+  // Live view of the other machine: re-list the folders that are open and only
+  // re-render the ones whose contents changed (edits there show up here).
+  const refreshOpen = useCallback(async () => {
+    if (typeof document !== 'undefined' && document.hidden) return;
+    const sig = (l) => JSON.stringify((l || []).map((e) => [e.path, !!e.is_dir, e.size, e.modified]));
+    const dirs = [...openRef.current].filter((p) => entriesRef.current[p]);
+    await Promise.all(dirs.map(async (path) => {
+      try {
+        const list = await invoke('lan_list_files', { deviceId: device.device_id, projectId: project.id, path });
+        if (sig(list) !== sig(entriesRef.current[path])) setEntries((e) => ({ ...e, [path]: list }));
+      } catch { /* transient (offline / folder removed): the next tick retries */ }
+    }));
+  }, [device.device_id, project.id]);
+
+  useEffect(() => {
+    const t = setInterval(refreshOpen, 3000);
+    return () => clearInterval(t);
+  }, [refreshOpen]);
+
+  // A finished transfer changes one side or the other: refresh right away.
+  useEffect(() => {
+    let unlisten;
+    import('@tauri-apps/api/event')
+      .then(({ listen }) => listen('rustic:transfer', (e) => { if (e.payload?.state === 'done') refreshOpen(); }))
+      .then((fn) => { unlisten = fn; })
+      .catch(() => {});
+    return () => unlisten?.();
+  }, [refreshOpen]);
 
   const load = useCallback(async (path) => {
     setLoading((s) => new Set(s).add(path));
@@ -280,7 +346,7 @@ export function RemoteFiles({ device, project, onPreview, previewPath, onImport,
     }
   }, [device.device_id, project.id]);
 
-  useEffect(() => { setEntries({}); setOpen(new Set([''])); setSel(new Map()); load(''); }, [load]);
+  useEffect(() => { setEntries({}); setOpen(new Set([''])); clear(); load(''); }, [load, clear]);
 
   const toggleDir = (path) => {
     setOpen((s) => {
@@ -289,7 +355,20 @@ export function RemoteFiles({ device, project, onPreview, previewPath, onImport,
       return n;
     });
   };
-  const toggleSel = (e) => setSel((m) => { const n = new Map(m); if (n.has(e.path)) n.delete(e.path); else n.set(e.path, e); return n; });
+  /** Paths of every currently visible row, top to bottom (for Shift ranges). */
+  const visibleOrder = () => {
+    const out = [];
+    const walk = (p) => (entries[p] || []).forEach((x) => { out.push(x.path); if (x.is_dir && open.has(x.path)) walk(x.path); });
+    walk('');
+    return out;
+  };
+  const entryAt = (p) => {
+    for (const list of Object.values(entries)) {
+      const hit = list.find((x) => x.path === p);
+      if (hit) return hit;
+    }
+    return { path: p, name: p, is_dir: false };
+  };
   const allTop = entries[''] || [];
   const selectAll = () => setSel(new Map([['', { path: '', name: project.name, is_dir: true }]]));
   const items = useMemo(() => [...sel.values()].map((e) => ({
@@ -297,9 +376,10 @@ export function RemoteFiles({ device, project, onPreview, previewPath, onImport,
   })), [sel, project]);
 
   const onDragStart = (ev, e) => {
-    const list = sel.has(e.path) ? items : [{ project_id: project.id, project_name: project.name, path: e.path, is_dir: !!e.is_dir }];
+    const list = (sel.has(e.path) || sel.has('')) ? items : [{ project_id: project.id, project_name: project.name, path: e.path, is_dir: !!e.is_dir }];
     ev.dataTransfer.setData(REMOTE_MIME, JSON.stringify({ deviceId: device.device_id, items: list }));
     ev.dataTransfer.effectAllowed = 'copy';
+    setCountDragImage(ev.dataTransfer, list.length, device.name);
   };
   const dropProps = (dir) => ({
     onDragOver: (ev) => {
@@ -320,24 +400,26 @@ export function RemoteFiles({ device, project, onPreview, previewPath, onImport,
 
   const renderDir = (path, depth) => (entries[path] || []).map((e) => {
     const isOpen = open.has(e.path);
-    const checked = sel.has(e.path) || sel.has('');
+    const selected = sel.has(e.path) || sel.has('');
     return (
       <React.Fragment key={e.path}>
         <div
           draggable
           onDragStart={(ev) => onDragStart(ev, e)}
-          {...(e.is_dir ? dropProps(e.path) : {})}
+          {...dropProps(e.is_dir ? e.path : parentPath(e.path))}
           className={cn(
-            'group flex h-7 cursor-default items-center gap-1 pr-2 text-[12px] hover:bg-ink/[0.05]',
-            previewPath === e.path && 'bg-primary/15',
+            'group flex h-7 cursor-default select-none items-center gap-1 pr-2 text-[12px] hover:bg-ink/[0.05]',
+            selected && 'bg-primary/15 hover:bg-primary/20',
+            previewPath === e.path && !selected && 'bg-ink/[0.06]',
             dropDir === e.path && 'bg-primary/20 ring-1 ring-inset ring-primary/60',
           )}
-          style={{ paddingLeft: 6 + depth * 14 }}
-          onClick={() => (e.is_dir ? toggleDir(e.path) : onPreview(e))}
+          style={{ paddingLeft: 8 + depth * 14 }}
+          onClick={(ev) => {
+            if (click(ev, e.path, e, visibleOrder(), entryAt)) {
+              if (e.is_dir) toggleDir(e.path); else onPreview(e);
+            }
+          }}
         >
-          <button type="button" className="shrink-0 text-muted-foreground hover:text-foreground" onClick={(ev) => { ev.stopPropagation(); toggleSel(e); }}>
-            {checked ? <CheckSquare className="size-3.5 text-primary" /> : <Square className="size-3.5 opacity-40 group-hover:opacity-100" />}
-          </button>
           {e.is_dir
             ? <ChevronRight className={cn('size-3.5 shrink-0 text-muted-foreground transition-transform', isOpen && 'rotate-90')} />
             : <span className="w-3.5 shrink-0" />}
@@ -358,19 +440,9 @@ export function RemoteFiles({ device, project, onPreview, previewPath, onImport,
       title={project.name}
       actions={(
         <>
-          <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="Select whole project" onClick={selectAll}><CheckSquare className="size-3.5" /></Button>
-          <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="Upload files here" onClick={() => onUpload('', false)}><Upload className="size-3.5" /></Button>
-          <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="Upload a folder here" onClick={() => onUpload('', true)}><FolderUp className="size-3.5" /></Button>
+          <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="Select whole project" onClick={selectAll}><ListChecks className="size-3.5" /></Button>
+          <TransfersTray alwaysVisible />
         </>
-      )}
-      footer={sel.size > 0 && (
-        <div className="flex items-center gap-2">
-          <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
-            {sel.has('') ? 'Whole project' : `${sel.size} selected`}
-          </span>
-          <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="Clear selection" onClick={() => setSel(new Map())}><X className="size-3.5" /></Button>
-          <Button size="sm" className="h-7 text-xs" onClick={() => onImport(items)}><Download className="size-3" /> Import to my machine</Button>
-        </div>
       )}
     >
       <div className={cn('min-h-full pb-6', dropDir === '' && 'bg-primary/10')} {...dropProps('')}>
@@ -381,6 +453,29 @@ export function RemoteFiles({ device, project, onPreview, previewPath, onImport,
       </div>
     </Column>
   );
+}
+
+/** Remote text file shown with the same syntax colours as an editor tab. */
+function CodePreview({ text, path }) {
+  const [html, setHtml] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    setHtml(null);
+    colorizeToHtml(text, getMonacoLanguage(path))
+      .then((h) => { if (alive) setHtml(h); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [text, path]);
+  if (html) {
+    return (
+      <pre
+        className="whitespace-pre p-3 font-mono text-[11.5px] leading-relaxed"
+        // Monaco.colorize output: escaped source wrapped in token spans.
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    );
+  }
+  return <pre className="whitespace-pre p-3 font-mono text-[11.5px] leading-relaxed">{text}</pre>;
 }
 
 /** Preview of one remote file (or metadata item), loaded on click. */
@@ -414,9 +509,7 @@ export function PreviewColumn({ device, project, file, metaItem, onClose }) {
         </div>
       )}
       {file && state.error && <div className="p-3"><ErrorNote text={state.error} /></div>}
-      {file && p?.kind === 'text' && (
-        <pre className="whitespace-pre p-3 font-mono text-[11.5px] leading-relaxed">{p.content}</pre>
-      )}
+      {file && p?.kind === 'text' && <CodePreview text={p.content} path={file.path} />}
       {file && p?.kind === 'image' && (
         <div className="flex h-full items-center justify-center p-4">
           <img alt={file.name} src={`data:${p.mime};base64,${p.content}`} className="max-h-full max-w-full rounded object-contain" />

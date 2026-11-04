@@ -3,6 +3,7 @@ import { Loader2, ExternalLink, Copy, KeyRound, MonitorSmartphone } from 'lucide
 import { GithubIcon } from '@/components/github/icon';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { toast } from 'sonner';
+import { copyText } from '@/lib/code-copy';
 import {
   Dialog,
   DialogContent,
@@ -158,7 +159,7 @@ function DevicePanel({ onSignedIn }) {
             variant="outline"
             size="icon-sm"
             onClick={() => {
-              navigator.clipboard.writeText(code).then(
+              copyText(code).then(
                 () => toast.success('Code copied'),
                 () => toast.error('Copy failed'),
               );

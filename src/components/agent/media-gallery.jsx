@@ -1,13 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
-  Copy, FolderOpen, ZoomIn, ZoomOut, Maximize2, Download,
+  Copy, ExternalLink, FolderOpen, ZoomIn, ZoomOut, Maximize2, Download,
 } from 'lucide-react';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { toast } from 'sonner';
 import { useAgent } from '@/state/agent';
+import { useEditor } from '@/state/editor';
 import { revealInFileManager } from '@/state/explorer';
 import { cn } from '@/lib/utils';
 import { isIOS, isSafari } from '@/lib/platform';
@@ -384,6 +385,13 @@ function Lightbox({ items, index, onClose, onNavigate }) {
               </Button>
             </>
           )}
+          <Button
+            size="icon-xs" variant="ghost"
+            onClick={() => { useEditor.getState().openFile(item.absPath); onClose(); }}
+            title="Open in editor"
+          >
+            <ExternalLink className="size-3.5" />
+          </Button>
           <Button
             size="icon-xs" variant="ghost"
             onClick={() => reveal(item.absPath)}

@@ -2,17 +2,9 @@ import React, { createContext, useContext } from 'react';
 import { Label } from '@/components/ui/label';
 import { InfoTip } from '@/components/ui/info-tip';
 
-// Shared filter context — settings-panel.jsx provides the current query; rows
-// and sections read it and hide themselves when their text doesn't match.
+// Shared filter context — rows and sections read the current query and hide
+// themselves when their text doesn't match.
 const SettingsFilterContext = createContext('');
-
-export function SettingsFilterProvider({ value, children }) {
-  return (
-    <SettingsFilterContext.Provider value={value || ''}>
-      {children}
-    </SettingsFilterContext.Provider>
-  );
-}
 
 function matchesQuery(query, ...parts) {
   if (!query) return true;
@@ -71,19 +63,6 @@ export function RowGroup({ title, actions, inset = false, className, children })
         {actions && <div className="ml-auto flex items-center gap-1.5">{actions}</div>}
       </div>
       {rows}
-    </div>
-  );
-}
-
-/** One row of a RowGroup: content left, controls right, filterable via data-setting-row. */
-export function GroupRow({ className, children, ...rest }) {
-  return (
-    <div
-      data-setting-row
-      className={['flex items-center gap-3 px-3 py-2.5', className].filter(Boolean).join(' ')}
-      {...rest}
-    >
-      {children}
     </div>
   );
 }

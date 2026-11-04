@@ -17,7 +17,7 @@ Rustic rule: backend fixes land in BOTH `src-tauri` and `rustic-server` unless n
 
 ## 1. Repo cleanup
 
-- [x] Removed `issues/` (all 16 items done); this file replaces it.
+- [x] Removed `issues/` (all 16 items done); this file replaces it. (It had been re-added in v0.7.6 with peer-sync notes; actually removed Nov 2026, items carried into `CHECKLIST.md`.)
 - [x] Deleted `HOW-TO-USE.md` (Lattice docs). The website "How to use" link now points to the README (`website/static/index.html`).
 - [~] `references/` (~105 MB, gitignored): reference source downloaded on purpose and not recoverable from git. **Kept**; delete by hand if no longer wanted.
 - [x] Deleted `rustic-data/` (local Chromium profile, recreated on demand) and the empty `.codex/`. Added `.codex/` to `.gitignore`.
@@ -37,7 +37,7 @@ Rustic rule: backend fixes land in BOTH `src-tauri` and `rustic-server` unless n
 - [x] Deleted `src/assets/new_logo.png` and `src/assets/ai_agent_animated.svg`.
 - [x] Deleted the spike/probe examples (`walk_timing_spike.rs`, `istty_probe.rs`, `fullscreen_probe.rs`).
 - [x] `rustic-server/src/app.rs` `match_preview_host` / `host_proxy_middleware`: these were the missing half of the "subdomain" tunnel mode, which can be picked in Settings but was never routed. **Wired up** as the outermost layer (reads the live tunnel config) instead of deleted.
-- [x] `rustic-server/src/commands/terminal.rs` `find_in_path`: actually has 11 callers. Only the stale `#[allow(dead_code)]` was removed.
+- [x] `rustic-server/src/commands/terminal.rs` `find_in_path`: actually has 11 callers. Only the stale `#[allow(dead_code)]` was removed. (The separate desktop copy in `src-tauri/src/commands/terminal.rs` had no callers; removed Nov 2026.)
 - [x] Removed:
   - dead `FileTrackedKindPayload::EditTool`;
   - unused `CreateTaskArg.project_name/project_root` and `RespondPermissionArg.task_id` (serde ignores the extra wire fields).
@@ -125,7 +125,7 @@ Rustic rule: backend fixes land in BOTH `src-tauri` and `rustic-server` unless n
 
 ### Medium
 - [x] **P4** xterm and its addons moved out of the entry chunk into a lazy `terminal-instance` chunk (497 KB). `TerminalPane` is loaded through `src/components/terminal/lazy-terminal-pane.jsx`, and the store imports the instance module lazily.
-- [x] **P5** Baseline recorded: entry `index-*.js` is about 2,078 KB. Monaco (about 4.6 MB) and the previews are already lazy.
+- [x] **P5** Baseline recorded: entry `index-*.js` is about 2,078 KB. Monaco (about 4.6 MB) and the previews are already lazy. (Had drifted to ~2,711 KB by Nov 2026; re-addressed in `CHECKLIST.md`.)
 - [x] **P6** The parent-history snapshot is only cloned on turns that call `spawn_subagent`.
   - [x] `AiProvider::chat` now takes `&[Message]` / `&[ToolDef]`. All five providers and every caller (executor, condense, goal, commit message, web summarize) were updated, and the per-retry history and tool-def clones are gone.
 - [x] **P7** In-memory transcripts are cached per task as slimmed `MessageDto`s.

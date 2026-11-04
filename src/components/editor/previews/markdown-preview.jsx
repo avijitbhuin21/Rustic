@@ -2,54 +2,15 @@ import React, { useEffect, useMemo, useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileReloadVersion } from '@/lib/use-file-change';
 import { dirname, handleMarkdownLinkClick } from '@/lib/markdown-assets';
-import { Marked } from 'marked';
-import { markedHighlight } from 'marked-highlight';
-import hljs from 'highlight.js/lib/common';
-import DOMPurify from 'dompurify';
+import { renderMarkdown as render } from '@/lib/markdown-render';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { useCodeCopyButtons } from '@/lib/code-copy';
 import { ZoomControls, ToolbarToggleGap, useCtrlWheelZoom } from './preview-zoom';
-import 'highlight.js/styles/github-dark.css';
 
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 4;
-
-// Single configured marked instance — created once at module load so we
-// don't rebuild the lexer + register hooks on every keystroke. The
-// markedHighlight extension routes every fenced code block through
-// highlight.js. We register only the "common" subset to keep the bundle
-// reasonable; that gives us javascript, typescript, python, rust, json,
-// bash, markdown, html/css and ~30 others.
-const md = new Marked(
-  markedHighlight({
-    emptyLangClass: 'hljs',
-    langPrefix: 'hljs language-',
-    highlight(code, lang) {
-      const language = hljs.getLanguage(lang) ? lang : 'plaintext';
-      try {
-        return hljs.highlight(code, { language, ignoreIllegals: true }).value;
-      } catch {
-        return code;
-      }
-    },
-  }),
-  { gfm: true, breaks: true },
-);
-
-function render(text) {
-  if (!text) return '';
-  const raw = md.parse(text);
-  // Allow GFM checkbox inputs (DOMPurify's default profile strips <input>).
-  // highlight.js emits <span class="hljs-...">; we whitelist the class
-  // attribute on those spans (DOMPurify keeps class by default for known
-  // tags, but explicit is safer).
-  return DOMPurify.sanitize(raw, {
-    ADD_TAGS: ['input'],
-    ADD_ATTR: ['type', 'checked', 'disabled', 'class'],
-  });
-}
 
 // Pure rendered preview. Editing is handled by the Monaco editor via the
 // shared Edit ⇄ Preview toggle in editor-pane.jsx (ViewModeToggle) — this

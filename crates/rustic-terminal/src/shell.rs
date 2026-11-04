@@ -223,6 +223,13 @@ impl TerminalManager {
             .and_then(|s| s.command_in_flight.lock().ok().and_then(|g| *g))
     }
 
+    /// Is the session's shell busy with a foreground command? Background
+    /// `cmd &` jobs don't count (see [`crate::pty::shell_command_busy`]).
+    pub fn command_busy(&self, id: SessionId) -> Option<bool> {
+        let s = self.sessions.get(&id)?;
+        crate::pty::shell_command_busy(s.pid?, s.foreground_pgid())
+    }
+
     /// Append a literal string to the session's output buffer. Used to record
     /// agent-issued commands so they appear in `read_terminal_output` alongside
     /// actual pty output (pty echo may lag on some platforms).

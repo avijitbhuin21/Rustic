@@ -23,15 +23,9 @@ use std::path::Path;
 
 // ── platform helpers ─────────────────────────────────────────────────────────
 
-/// Short label for the platform-default shell. Used in the system info line.
+/// Short label for the shell agent terminals actually run. Used in the system info line.
 pub fn shell_env() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "PowerShell on Windows"
-    } else if cfg!(target_os = "macos") {
-        "bash on macOS"
-    } else {
-        "bash on Linux"
-    }
+    crate::agent_shell::agent_shell_label()
 }
 
 fn os_label() -> &'static str {
@@ -97,6 +91,9 @@ Follow this loop for every non-trivial task.
 - To write or modify a file, use `create_file` / `edit_file` — never shell redirection (`>`, `>>`, `tee`, `Out-File`, `Set-Content`).
 - Reserve `run_command` for builds, tests, git, package installs, file deletes (`rm`), and anything without a dedicated tool.
 - Every tool call takes a required `description`: one short present-tense line (≤ ~10 words) saying what that specific call does and why (e.g. "Reading auth middleware to trace the 401"). It's shown to the user beside the tool name, so make it specific and human-readable, not a restatement of the tool name.
+
+## Project tree
+A `<project_structure>` block carries an auto-generated file tree of the project (gitignore-aware, capped, depth-limited). It is re-sent only when the layout changes; when only a few paths changed you get a short `<project_structure>` delta listing added (`+`) / removed (`-`) paths relative to the last full tree. Directories flagged "more ... not shown" are incomplete; asset/fixture directories are summarised on one line (e.g. `icons/ (18 png, 1 icns)`), and files created very recently may not appear yet. A path missing from the tree does NOT prove it doesn't exist. Before `create_file` on a path you have not read, confirm with `glob` or `list_directory` — or just call `create_file` and let a FILE_EXISTS error tell you to switch to `edit_file`.
 
 ## Sub-agents
 Sub-agents are a context-offloading tool, not a parallel execution model. You do the coding yourself; sub-agents take work that would otherwise bloat your context or genuinely doesn't interact with yours.
@@ -291,7 +288,9 @@ pub fn is_project_tree_block(text: &str) -> bool {
     text.starts_with(PROJECT_TREE_OPEN)
 }
 
-/// Build the project-tree block that gets appended to the last user message.
+/// Build the project-tree block that gets appended to a user message.
+/// Usage instructions live in the cached system prompt ("## Project tree");
+/// the block itself carries only a one-line header.
 ///
 /// Returns an empty string when the project has no listable entries.
 pub fn build_project_tree_block(project_root: &Path, include_gitignored: bool) -> String {
@@ -302,13 +301,7 @@ pub fn build_project_tree_block(project_root: &Path, include_gitignored: bool) -
     }
     format!(
         "{open}\n\
-         Auto-generated file tree for {path}, refreshed whenever the project changes \
-         (gitignore-aware, capped, depth-limited). Directories flagged \"more ... not shown\" are \
-         incomplete, and files created later in this turn may not appear yet: a path missing from \
-         this tree does NOT prove it doesn't exist. Before `create_file` on a path you have not \
-         read, confirm with `glob` or `list_directory` — or just call `create_file` and let a \
-         FILE_EXISTS error tell you to switch to `edit_file`.\n\
-         \n\
+         File tree for {path} (see \"Project tree\" in the system prompt):\n\
          ```\n\
          {tree}\n\
          ```\n\
@@ -317,6 +310,29 @@ pub fn build_project_tree_block(project_root: &Path, include_gitignored: bool) -
         close = PROJECT_TREE_CLOSE,
         path = project_root.display(),
         tree = trimmed,
+    )
+}
+
+/// Build a small delta block listing paths added / removed since the full
+/// tree that was sent earlier in the conversation. Starts with
+/// [`PROJECT_TREE_OPEN`] so providers treat it like the tree block.
+pub fn build_project_tree_delta_block(added: &[String], removed: &[String]) -> String {
+    let mut body = String::new();
+    for p in added {
+        body.push_str("+ ");
+        body.push_str(p);
+        body.push('\n');
+    }
+    for p in removed {
+        body.push_str("- ");
+        body.push_str(p);
+        body.push('\n');
+    }
+    format!(
+        "{open}\nProject tree changes since the full tree sent earlier:\n```\n{body}```\n{close}",
+        open = PROJECT_TREE_OPEN,
+        close = PROJECT_TREE_CLOSE,
+        body = body,
     )
 }
 

@@ -20,7 +20,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 use crate::app_paths::app_data_dir;
-use crate::commands::agent_terminals::{preferred_agent_shell, wait_for_shell_output};
+use crate::commands::agent_terminals::{default_terminal_shell, wait_for_shell_output};
 use crate::commands::terminal::{
     emit_terminal_list_changed, spawn_output_reader, spawn_session_monitor,
 };
@@ -147,7 +147,7 @@ fn launch_blocking(
     target: SpawnTarget,
 ) -> Result<SpawnedAgent, String> {
     let state = app.state::<AppState>();
-    let shell = preferred_agent_shell();
+    let shell = default_terminal_shell();
     let shell_kind = ShellKind::from_program(shell.as_deref());
 
     let prep = {

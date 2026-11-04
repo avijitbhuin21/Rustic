@@ -74,6 +74,13 @@ pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
 /// agent works closer to the context edge.
 pub const CONDENSE_THRESHOLD_PCT: f64 = 0.93;
 
+/// Windows larger than this get an absolute condense ceiling: on 1M-token
+/// models, letting history grow to ~900K means every call re-reads (and every
+/// cache expiry re-writes) a huge prefix. Cost, not capacity, is the limit.
+pub const LARGE_WINDOW_MIN: u32 = 400_000;
+/// Absolute input-token ceiling applied to windows above [`LARGE_WINDOW_MIN`].
+pub const LARGE_WINDOW_CONDENSE_CEILING: u32 = 200_000;
+
 /// Returns the input-token count at which auto-condense triggers for the given limits.
 pub fn condense_threshold(
     context_window: u32,
@@ -85,7 +92,12 @@ pub fn condense_threshold(
     }
     let reserved = max_output_tokens.saturating_add(thinking_budget);
     let available = context_window.saturating_sub(reserved);
-    (available as f64 * CONDENSE_THRESHOLD_PCT) as u32
+    let pct = (available as f64 * CONDENSE_THRESHOLD_PCT) as u32;
+    if context_window > LARGE_WINDOW_MIN {
+        pct.min(LARGE_WINDOW_CONDENSE_CEILING)
+    } else {
+        pct
+    }
 }
 
 pub fn should_condense(
@@ -1078,5 +1090,22 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn large_windows_get_absolute_ceiling() {
+        // 200K window: plain 93% of available.
+        assert_eq!(condense_threshold(200_000, 32_000, 0), (168_000f64 * 0.93) as u32);
+        // 1M window: capped at the absolute ceiling instead of ~900K.
+        assert_eq!(condense_threshold(1_000_000, 32_000, 0), LARGE_WINDOW_CONDENSE_CEILING);
+        // Exactly at the boundary: no ceiling.
+        assert_eq!(condense_threshold(400_000, 0, 0), (400_000f64 * 0.93) as u32);
+        assert!(should_condense(210_000, 1_000_000, 32_000, 0));
+        assert!(!should_condense(190_000, 1_000_000, 32_000, 0));
     }
 }

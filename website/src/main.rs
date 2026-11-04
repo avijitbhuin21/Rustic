@@ -1,5 +1,7 @@
 use std::{env, net::SocketAddr, path::PathBuf};
 
+mod issues;
+
 use axum::{
     http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
@@ -25,8 +27,8 @@ fn static_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static"))
 }
 
-/// Builds the router: `/healthz`, then static files with `index.html` as the SPA-style fallback.
-fn app(static_dir: PathBuf) -> Router {
+/// Builds the router: `/healthz`, the issues API, then static files with `index.html` as the SPA-style fallback.
+fn app(static_dir: PathBuf, issues_state: issues::IssuesState) -> Router {
     let index = static_dir.join("index.html");
     let not_found = static_dir.join("404.html");
     let fallback = if not_found.exists() {
@@ -42,6 +44,7 @@ fn app(static_dir: PathBuf) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(issues::router(issues_state))
         .fallback_service(files)
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
@@ -113,7 +116,8 @@ async fn main() {
         }
     };
     tracing::info!(%addr, static_dir = %dir.display(), "rustic-website listening");
-    if let Err(err) = axum::serve(listener, app(dir))
+    let issues_state = issues::IssuesState::from_env();
+    if let Err(err) = axum::serve(listener, app(dir, issues_state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
     {

@@ -1,9 +1,10 @@
 import React, { Suspense, useEffect, useMemo, useState } from 'react';
-import { Eye, Code2 } from 'lucide-react';
+import { Eye, Code2, Loader2 } from 'lucide-react';
 import { TabBar } from '@/components/editor/tab-bar';
 import { Breadcrumb } from '@/components/editor/breadcrumb';
 import { useEditor, TOGGLEABLE_PREVIEW_KINDS } from '@/state/editor';
 import { useSettings } from '@/state/settings';
+import { useSessionRestore } from '@/lib/session-restore';
 import { COMMAND_BY_ID, effectiveKey, displayKey } from '@/lib/commands';
 import { Skeleton } from '@/components/ui/skeleton';
 import { TerminalPane } from '@/components/terminal/lazy-terminal-pane';
@@ -151,6 +152,18 @@ function EmptyState() {
         .filter(Boolean),
     [keybindings],
   );
+  const restoring = useSessionRestore((s) => s.restoring);
+  if (restoring) {
+    return (
+      <div className="flex h-full w-full flex-1 flex-col items-center justify-center gap-6" role="status" aria-live="polite">
+        <Logo className="pointer-events-none size-48 animate-pulse opacity-20 select-none" />
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Loader2 className="size-3.5 animate-spin" />
+          Restoring your last session…
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="flex h-full w-full flex-1 flex-col items-center justify-center gap-8">
       <Logo className="pointer-events-none size-48 opacity-20 select-none" />

@@ -6,23 +6,26 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use super::{Discovered, Identity, LanState, SERVICE_TYPE};
 
-/// Advertise this device on `port` and keep `lan.discovered` up to date with
-/// other Rustic instances. Returns the daemon; dropping/shutting it down stops both.
-pub fn start(lan: &LanState, id: &Identity, port: u16) -> Result<ServiceDaemon, String> {
+/// Keep `lan.discovered` up to date with other Rustic instances and, when
+/// `advertise` is set, announce this device on `port`. Returns the daemon;
+/// dropping/shutting it down stops both.
+pub fn start(lan: &LanState, id: &Identity, port: u16, advertise: bool) -> Result<ServiceDaemon, String> {
     let daemon = ServiceDaemon::new().map_err(|e| format!("mDNS unavailable: {e}"))?;
-    let host = format!("{}.local.", id.device_id);
-    let mut props: HashMap<String, String> = HashMap::new();
-    props.insert("id".into(), id.device_id.clone());
-    props.insert("name".into(), id.device_name.clone());
-    props.insert("fp".into(), id.fingerprint.clone());
-    props.insert("v".into(), "1".into());
-    props.insert("ver".into(), super::app_version().into());
-    let info = ServiceInfo::new(SERVICE_TYPE, &id.device_id, &host, "", port, props)
-        .map_err(|e| format!("mDNS service info: {e}"))?
-        .enable_addr_auto();
-    daemon
-        .register(info)
-        .map_err(|e| format!("mDNS register: {e}"))?;
+    if advertise {
+        let host = format!("{}.local.", id.device_id);
+        let mut props: HashMap<String, String> = HashMap::new();
+        props.insert("id".into(), id.device_id.clone());
+        props.insert("name".into(), id.device_name.clone());
+        props.insert("fp".into(), id.fingerprint.clone());
+        props.insert("v".into(), "1".into());
+        props.insert("ver".into(), super::app_version().into());
+        let info = ServiceInfo::new(SERVICE_TYPE, &id.device_id, &host, "", port, props)
+            .map_err(|e| format!("mDNS service info: {e}"))?
+            .enable_addr_auto();
+        daemon
+            .register(info)
+            .map_err(|e| format!("mDNS register: {e}"))?;
+    }
 
     let rx = daemon
         .browse(SERVICE_TYPE)

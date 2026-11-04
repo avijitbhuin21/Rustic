@@ -18,7 +18,6 @@ import { ThemeBridge } from '@/components/theme-bridge';
 import { OnboardingWizard } from '@/components/onboarding/onboarding-wizard';
 import { PatchNotesDialog } from '@/components/patch-notes-dialog';
 import { ShortcutCheatsheet } from '@/components/shortcut-cheatsheet';
-import { SettingsModal } from '@/components/settings/settings-modal';
 import { KeybindingBridge } from '@/components/keybinding-bridge';
 import { FontBridge } from '@/components/shell/font-bridge';
 import { WindowControls } from '@/components/shell/window-controls';
@@ -30,7 +29,7 @@ import { EditorAreaHost } from '@/components/shell/editor-area-host';
 import { BottomPanelHost } from '@/components/shell/bottom-panel-host';
 import { StatusBar } from '@/components/shell/status-bar';
 import AgentPanel from '@/components/agent/agent-panel';
-import { useLayout } from '@/state/layout';
+import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
 import { useExplorer } from '@/state/explorer';
 import { useGit } from '@/state/git';
 import { useAgent } from '@/state/agent';
@@ -53,6 +52,23 @@ import { MobileShell } from '@/components/shell/mobile-shell';
 import { TabletShell } from '@/components/shell/tablet-shell';
 import { FolderPickerHost } from '@/components/web/folder-picker-host';
 import { BrowserWindow } from '@/components/browser/browser-window';
+
+// Settings (every section + its deps) is only fetched the first time it opens,
+// then stays mounted so close animations and later opens are instant.
+const SettingsModalLazy = React.lazy(() =>
+  import('@/components/settings/settings-modal').then((m) => ({ default: m.SettingsModal })),
+);
+function SettingsModal() {
+  const open = useLayout((s) => s.settingsOpen);
+  const [loaded, setLoaded] = React.useState(open);
+  useEffect(() => { if (open) setLoaded(true); }, [open]);
+  if (!loaded) return null;
+  return (
+    <React.Suspense fallback={null}>
+      <SettingsModalLazy />
+    </React.Suspense>
+  );
+}
 
 function useActiveProjectSync() {
   const activeProjectId = useExplorer((s) => s.activeProjectId);
@@ -200,6 +216,9 @@ export default function App() {
   const { panelRef: sidebarPanelRef, wide: syncSidebarWide } = useSyncSidebarWidth();
   const bottomPanelVisible = useLayout((s) => s.bottomPanelVisible);
   const chatDockOpen = useLayout((s) => s.chatDockOpen);
+  // Cloud & Sync brings its own explorer columns; hide chat while it's open
+  // without touching the user's persisted chatDockOpen.
+  const syncOpen = useLayout((s) => s.sidebarVisible && s.activeSidebarPanel === SIDEBAR_PANELS.SYNC);
   const hasMiddleContent = useHasMiddleContent();
   useActiveProjectSync();
   useBottomPanelAutoVisibility();
@@ -373,15 +392,15 @@ export default function App() {
           <ResizablePanelGroup direction="horizontal" className="flex-1">
             {sidebarVisible && (
               <>
-                <ResizablePanel id="sidebar" panelRef={sidebarPanelRef} defaultSize="20%" minSize="12%" maxSize={syncSidebarWide ? '88%' : '40%'}>
+                <ResizablePanel id="sidebar" panelRef={sidebarPanelRef} defaultSize="20%" minSize="12%" maxSize={syncSidebarWide ? '100%' : '40%'}>
                   <SidebarHost />
                 </ResizablePanel>
-                <ResizableHandle />
+                <ResizableHandle className={syncSidebarWide ? 'hidden' : undefined} />
               </>
             )}
             <ResizablePanel id="main" defaultSize={sidebarVisible ? '80%' : '100%'}>
               <MainArea
-                chatDockOpen={chatDockOpen}
+                chatDockOpen={chatDockOpen && !syncOpen}
                 bottomPanelVisible={bottomPanelVisible}
                 hasMiddleContent={hasMiddleContent}
               />

@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core';
 import { isTauriAvailable as isTauri, IS_MAC_DESKTOP } from '@/lib/platform';
 import {
-  ArrowUp,
   Check,
   ChevronRight,
   ChevronDown,
@@ -40,13 +39,14 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { useAgent } from '@/state/agent';
+import { useMascotRunState } from './agent-mascot';
 import { useTerminal } from '@/state/terminal';
 import { useCustomModels } from '@/state/custom-models';
 import { useLiveModels } from '@/state/live-models';
 import { useOpenRouterSpecs } from '@/state/openrouter';
 import { tiersForModel, modelSupportsAdaptiveThinking } from '@/state/agent';
 import { RegisterModelModal } from './register-model-modal';
-import { ContextUsageCapsule } from './context-usage-capsule';
+import { MascotSendButton, useContextUsage } from './context-usage-capsule';
 import { GoalCapsule } from './goal-capsule';
 import { SLASH_COMMANDS, parseSlashCommand } from '@/lib/slash-commands';
 import {
@@ -914,7 +914,22 @@ function ModelPopover({ open, onOpenChange }) {
   const thinkingTier = useAgent((s) => s.thinkingTier);
   const setThinkingTier = useAgent((s) => s.setThinkingTier);
   const tiers = useMemo(() => tiersForModel(selectedModel), [selectedModel]);
-  const isAdaptive = useMemo(() => modelSupportsAdaptiveThinking(selectedModel), [selectedModel]);
+  // Registered capability flags (the "Supports adaptive thinking" checkbox).
+  // The backend engages adaptive mode on that flag OR the model-id match
+  // (claude.rs `use_adaptive`); mirror both so the control matches what's sent.
+  const [caps, setCaps] = useState({});
+  useEffect(() => {
+    if (!isTauri()) return;
+    let alive = true;
+    invoke('get_model_capabilities')
+      .then((c) => { if (alive && c && typeof c === 'object') setCaps(c); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [open, selectedModel]);
+  const isAdaptive = useMemo(
+    () => modelSupportsAdaptiveThinking(selectedModel) || !!caps?.[selectedModel]?.supports_adaptive_thinking,
+    [selectedModel, caps],
+  );
   const tint = tierMeta(thinkingTier);
 
   // Ensure we have a fresh provider config when the popover opens — the user
@@ -1385,6 +1400,24 @@ export function PromptBox({
   // that render the prompt standalone (welcome hero) leave this false.
   flatTop = false,
 }) {
+  const mascotTaskId = useAgent((s) => s.activeTaskId);
+  const mascotStatus = useAgent((s) => (s.activeTaskId ? s.statusByTask[s.activeTaskId] : null));
+  const mascotSubagents = useAgent((s) => {
+    const subs = s.activeTaskId ? s.subagentsByTask?.[s.activeTaskId] : null;
+    if (!subs) return 0;
+    let n = 0;
+    for (const k in subs) if (subs[k]?.status === 'running') n += 1;
+    return n;
+  });
+  const mascotState = useMascotRunState({
+    taskId: mascotTaskId,
+    isStreaming,
+    runningTool: runInfo?.runningTool || null,
+    waitingOnSubagents,
+    status: mascotStatus,
+  });
+  const contextUsage = useContextUsage();
+  const [sendPetKey, setSendPetKey] = useState(0);
   const [value, setValue] = useState('');
   const [modelOpen, setModelOpen] = useState(false);
   const [modeOpen, setModeOpen] = useState(false);
@@ -1660,6 +1693,23 @@ export function PromptBox({
   useEffect(() => {
     autoGrow();
   }, [value, autoGrow]);
+
+  // Re-measure when the width changes: a measurement taken while the panel was
+  // collapsed (e.g. zero-width behind Cloud & Sync) wraps every character and
+  // would otherwise leave the empty box stuck at the max height.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    let lastWidth = el.clientWidth;
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth !== lastWidth) {
+        lastWidth = el.clientWidth;
+        autoGrow();
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [autoGrow]);
 
   useEffect(() => {
     if (autoFocus) textareaRef.current?.focus();
@@ -2128,11 +2178,6 @@ export function PromptBox({
     !!commandTag;
   const isHero = variant === 'hero';
 
-  // The send button doubles as a mic when the composer is empty and an audio
-  // input model is configured. Recording/transcribing take over the same
-  // button so the user's eye doesn't have to move.
-  const showMic = !isStreaming && !recording && !transcribing && !hasContent && audioEnabled;
-
   return (
     <div
       className={cn(
@@ -2262,6 +2307,41 @@ export function PromptBox({
             <div className="h-4 w-px bg-border/60" />
             <ModelPopover open={modelOpen} onOpenChange={setModelOpen} />
           </div>
+          {/* Voice input lives here, separate from send, so dictation stays
+              available while a task is running (send turns into stop then). */}
+          {audioEnabled && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (recording) { stopRecording(); return; }
+                    if (!transcribing) startRecording();
+                  }}
+                  disabled={transcribing}
+                  aria-label={recording ? 'Stop recording' : transcribing ? 'Transcribing' : 'Voice input'}
+                  className={cn(
+                    'ml-1 flex size-7 shrink-0 items-center justify-center rounded-md transition-colors',
+                    recording
+                      ? 'animate-pulse bg-danger text-on-status hover:bg-danger/85'
+                      : 'text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground',
+                    transcribing && 'opacity-60',
+                  )}
+                >
+                  {recording ? (
+                    <span className="size-2.5 rounded-[2px] bg-current" />
+                  ) : transcribing ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Mic className="size-4" />
+                  )}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="top">
+                {recording ? 'Stop recording' : transcribing ? 'Transcribing…' : 'Voice input'}
+              </TooltipContent>
+            </Tooltip>
+          )}
           {isStreaming && runInfo && (
             <RunningStatusInline
               startedAt={runInfo.startedAt}
@@ -2270,7 +2350,15 @@ export function PromptBox({
             />
           )}
           {!isStreaming && waitingOnSubagents > 0 && (
-            <div className="flex min-w-0 items-center gap-1.5 px-1.5 text-[11px] text-muted-foreground">
+            <button
+              type="button"
+              onClick={() => {
+                const s = useAgent.getState();
+                if (s.activeTaskId) s.setDockActiveTab(s.activeTaskId, 'subagents');
+              }}
+              title="Show running sub-agents"
+              className="flex min-w-0 items-center gap-1.5 rounded px-1.5 text-[11px] text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
+            >
               <span className="relative flex size-2 shrink-0">
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning/50" />
                 <span className="relative inline-flex size-2 rounded-full bg-warning/80" />
@@ -2278,75 +2366,25 @@ export function PromptBox({
               <span className="shrink-0 font-medium">
                 Waiting on {waitingOnSubagents} sub-agent{waitingOnSubagents > 1 ? 's' : ''}
               </span>
-            </div>
+            </button>
           )}
         </div>
 
         <div className="flex items-center gap-1.5">
           <GoalCapsule />
-          <ContextUsageCapsule />
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                onClick={() => {
-                  if (isStreaming) { onAbort?.(); return; }
-                  if (recording) { stopRecording(); return; }
-                  if (hasContent) { submit(); return; }
-                  if (audioEnabled && !transcribing) { startRecording(); return; }
-                }}
-              disabled={
-                !isStreaming && !recording &&
-                (transcribing || (hasContent ? disabled : !audioEnabled))
-              }
-              aria-label={
-                isStreaming ? 'Stop generating'
-                  : recording ? 'Stop recording'
-                  : transcribing ? 'Transcribing'
-                  : hasContent ? 'Send'
-                  : showMic ? 'Record audio'
-                  : 'Send'
-              }
-              className={cn(
-                'flex size-7 items-center justify-center rounded-full transition-all duration-200',
-                isStreaming
-                  // Destructive-tinted stop pill — same slot as the send
-                  // button so the eye doesn't have to move, but reads as
-                  // "stop" via colour + filled square. Ring keeps it visually
-                  // distinct from the recording state's solid red.
-                  ? 'bg-destructive text-white hover:bg-destructive/85 ring-2 ring-destructive/25 animate-pulse'
-                  : recording
-                    // Recording: red, pulsing, click to stop.
-                    ? 'bg-danger text-on-status hover:bg-danger/85 animate-pulse'
-                    : hasContent
-                      ? 'bg-foreground text-background hover:bg-foreground/85'
-                      : 'bg-transparent text-muted-foreground',
-                (!isStreaming && !recording && transcribing) && 'opacity-60',
-                (!isStreaming && !recording && !transcribing && !hasContent && !audioEnabled) && 'opacity-60',
-              )}
-            >
-              {isStreaming ? (
-                <span className="size-2.5 rounded-[2px] bg-current" />
-              ) : recording ? (
-                <span className="size-2.5 rounded-[2px] bg-current" />
-              ) : transcribing ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : showMic ? (
-                <Mic className="size-4" />
-              ) : (
-                <ArrowUp className="size-4" />
-              )}
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="top">
-            {isStreaming ? 'Stop generating'
-              : recording ? 'Stop recording'
-              : transcribing ? 'Transcribing…'
-              : hasContent ? 'Send'
-              : showMic ? 'Record audio'
-              : 'Type a message'}
-          </TooltipContent>
-          </Tooltip>
+          <MascotSendButton
+            usage={contextUsage}
+            mascotState={mascotState}
+            subagents={mascotSubagents || waitingOnSubagents}
+            petKey={sendPetKey}
+            badge={!isStreaming && hasContent ? 'send' : null}
+            label={isStreaming ? 'Stop generating' : hasContent ? 'Send' : 'Type a message'}
+            inactive={!isStreaming && (!hasContent || disabled)}
+            onClick={() => {
+              if (isStreaming) { onAbort?.(); return; }
+              if (hasContent) { setSendPetKey((k) => k + 1); submit(); }
+            }}
+          />
         </div>
       </div>
     </div>

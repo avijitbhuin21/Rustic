@@ -4,6 +4,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
+import { copyText } from '@/lib/code-copy';
 import {
   Check, Upload, ClipboardPaste, FolderOpen, MoreHorizontal, Download, Trash2, ShieldCheck, ShieldAlert,
   FileCode2, FileDown, Copy, Moon, Sun, MonitorSmartphone, Pencil, AlertTriangle, Ban, Globe,
@@ -444,7 +445,7 @@ export function ThemesSection() {
   const onCopy = async (entry) => {
     try {
       const d = await detail(entry.id);
-      await navigator.clipboard.writeText(d.text);
+      await copyText(d.text);
       toast.success(`Copied ${entry.name} theme file`);
     } catch (e) { toast.error(errText(e)); }
   };

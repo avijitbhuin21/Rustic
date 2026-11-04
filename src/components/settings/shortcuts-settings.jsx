@@ -9,6 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { isTauriAvailable as isTauri } from '@/lib/platform';
 import { open } from '@tauri-apps/plugin-dialog';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { Search, RotateCcw, X } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -205,7 +206,7 @@ export function ShortcutsSettings() {
       await useSettings.getState().load();
       toast.success('VS Code keybindings imported');
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     } finally {
       setBusy(false);
     }

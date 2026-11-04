@@ -166,29 +166,28 @@ async fn transfers_pause_survive_network_change_and_resume_from_offsets() {
     let pid = project["id"].as_str().unwrap().to_string();
     b.call("lan_set_share", json!({ "deviceId": a_id, "share": { "projects": [pid], "meta": [] } })).await;
 
-    // 1) Pause while waiting for approval; nothing moves until resumed.
+    // 1) Files in a shared project need no second approval: B auto-accepts
+    //    (no prompt), and a user pause / resume still lands the files intact.
     let dest = a.shared.config.data_dir.join("pulled");
     let items = json!([{ "project_id": pid, "project_name": "big-proj", "path": "data", "is_dir": true }]);
     let pull = {
         let (a, id, items, dest) = (a.clone(), b_id.clone(), items.clone(), dest.to_string_lossy().into_owned());
         tokio::spawn(async move { a.try_call("lan_pull_files", json!({ "deviceId": id, "items": items, "destDir": dest })).await })
     };
-    let t = wait_transfer(&a, |t| t["direction"] == json!("pull") && t["state"] == json!("waiting")).await;
+    let accepted = next_event(&mut b_events, "lan-transfer-auto-accepted").await;
+    assert_eq!(accepted["kind"], json!("pull"), "{accepted}");
+    assert_eq!(accepted["files"][0]["path"], json!("data"));
+    let t = wait_transfer(&a, |t| t["direction"] == json!("pull") && t["label"] == json!("data")).await;
     assert_eq!(t["can_pause"], json!(true));
     assert_eq!(t["total"].as_u64(), Some(big.len() as u64 + 4), "size known up front: {t}");
     let tid = t["id"].as_str().unwrap().to_string();
-    a.call("lan_transfer_pause", json!({ "id": tid })).await;
-    let req = next_event(&mut b_events, "lan-transfer-request").await;
-    b.call("lan_respond_transfer", json!({ "requestId": req["request_id"], "accept": true })).await;
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let t = wait_transfer(&a, |t| t["id"] == json!(tid)).await;
-    assert_eq!(t["paused"], json!(true), "{t}");
-    assert_eq!(t["paused_reason"], json!("Paused"));
-    assert_eq!(t["done"].as_u64(), Some(0), "no bytes while paused: {t}");
+    // The pull may already be far along on loopback; pausing must never corrupt it.
+    let _ = a.try_call("lan_transfer_pause", json!({ "id": tid })).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // 2) Resume, and immediately simulate a network switch: the transfer
     //    pauses for the lost connection, then carries on by itself.
-    a.call("lan_transfer_resume", json!({ "id": tid })).await;
+    let _ = a.try_call("lan_transfer_resume", json!({ "id": tid })).await;
     rustic_app::transfers::network_changed();
     let summary = tokio::time::timeout(Duration::from_secs(60), pull).await.expect("pull finished").unwrap().expect("pull ok");
     assert_eq!(summary["files"], json!(2));
@@ -205,26 +204,38 @@ async fn transfers_pause_survive_network_change_and_resume_from_offsets() {
     let http = reqwest::Client::new();
     let lan = format!("{}/lan", b.base);
     let ver = rustic_app::peer::app_version();
-    // Pull needs B's approval: answer it.
-    let pull_req = {
-        let (http, lan, token, pid) = (http.clone(), lan.clone(), peer.token_out.clone(), pid.clone());
-        tokio::spawn(async move {
-            http.post(format!("{lan}/request"))
-                .bearer_auth(&token)
-                .header("x-rustic-version", ver)
-                .json(&json!({ "kind": "pull", "files": [{ "project_id": pid, "path": "data", "is_dir": true }] }))
-                .send()
-                .await
-                .unwrap()
-                .json::<Value>()
-                .await
-                .unwrap()
-        })
-    };
-    let req = next_event(&mut b_events, "lan-transfer-request").await;
-    b.call("lan_respond_transfer", json!({ "requestId": req["request_id"], "accept": true })).await;
-    let approved = pull_req.await.unwrap();
+    // Files in the shared project are approved without a prompt on B.
+    let approved: Value = http
+        .post(format!("{lan}/request"))
+        .bearer_auth(&peer.token_out)
+        .header("x-rustic-version", ver)
+        .json(&json!({ "kind": "pull", "files": [{ "project_id": pid, "path": "data", "is_dir": true }] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(approved["approved"], json!(true), "shared files auto-approve: {approved}");
     let pull_ticket = approved["ticket"].as_str().expect("pull ticket").to_string();
+
+    // Files in a project B does NOT share are refused outright (never auto-approved).
+    let private_dir = b.shared.config.data_dir.join("private-proj");
+    std::fs::create_dir_all(&private_dir).unwrap();
+    std::fs::write(private_dir.join("secret.txt"), "nope").unwrap();
+    let private = b.call("add_project", json!({ "path": private_dir.to_string_lossy() })).await;
+    let private_id = private["id"].as_str().unwrap().to_string();
+    let denied = http
+        .post(format!("{lan}/request"))
+        .bearer_auth(&peer.token_out)
+        .header("x-rustic-version", ver)
+        .json(&json!({ "kind": "pull", "files": [{ "project_id": private_id, "path": "secret.txt", "is_dir": false }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status().as_u16(), 403, "unshared files must not be approved");
+    let body: Value = denied.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap_or("").contains("not shared"), "{body}");
     let tail = http
         .post(format!("{lan}/api/fs/read"))
         .bearer_auth(&peer.token_out)
@@ -377,10 +388,10 @@ async fn two_servers_pair_browse_pull_push_and_forget() {
                     .await
             })
         };
-        let req = next_event(&mut b_events, "lan-transfer-request").await;
-        assert_eq!(req["kind"], json!("pull"));
-        assert_eq!(req["files"][0]["path"], json!("src"));
-        b.call("lan_respond_transfer", json!({ "requestId": req["request_id"], "accept": true })).await;
+        // Shared project: B auto-accepts, no prompt.
+        let accepted = next_event(&mut b_events, "lan-transfer-auto-accepted").await;
+        assert_eq!(accepted["kind"], json!("pull"));
+        assert_eq!(accepted["files"][0]["path"], json!("src"));
         let summary = pull.await.unwrap().expect("pull should succeed");
         assert_eq!(summary["files"], json!(1), "round {round}: {summary}");
     }
@@ -420,4 +431,160 @@ async fn two_servers_pair_browse_pull_push_and_forget() {
         b_devices.as_array().unwrap().iter().all(|d| d["paired"] != json!(true)),
         "B should have forgotten A too: {b_devices}"
     );
+}
+
+/// Cancelling an outgoing pairing request stops our wait AND dismisses the
+/// prompt on the other machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_pairing_dismisses_the_other_sides_prompt() {
+    let a = Arc::new(Node::start().await);
+    let b = Arc::new(Node::start().await);
+    a.call("lan_set_enabled", json!({ "enabled": true })).await;
+    b.call("lan_set_enabled", json!({ "enabled": true })).await;
+    let mut b_events = b.shared.ctx.hub.subscribe();
+    let dev = a.call("lan_add_manual", json!({ "address": b.base })).await;
+    let b_id = dev["device_id"].as_str().unwrap().to_string();
+    let pair = {
+        let (a, id) = (a.clone(), b_id.clone());
+        tokio::spawn(async move { a.try_call("lan_pair", json!({ "deviceId": id })).await })
+    };
+    let req = next_event(&mut b_events, "lan-pair-request").await;
+    a.call("lan_cancel_outgoing", json!({ "deviceId": b_id })).await;
+    let gone = next_event(&mut b_events, "lan-pair-cancelled").await;
+    assert_eq!(gone["request_id"], req["request_id"], "B's prompt is dismissed");
+    let res = tokio::time::timeout(Duration::from_secs(10), pair).await.expect("pair returns promptly").unwrap();
+    assert_eq!(res.unwrap_err(), "Pairing cancelled");
+    // The answer is gone on B; nobody ended up paired.
+    assert!(b.try_call("lan_respond_pair", json!({ "requestId": req["request_id"], "accept": true })).await.is_err());
+    let devices = a.call("lan_devices", json!({})).await;
+    assert!(devices.as_array().unwrap().iter().all(|d| d["paired"] != json!(true)), "{devices}");
+}
+
+/// A transfer waiting for approval can be cancelled (prompt dismissed on the
+/// other side), and a running transfer can be cancelled without leaving
+/// partial files behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_waiting_and_running_transfers() {
+    let a = Arc::new(Node::start().await);
+    let b = Arc::new(Node::start().await);
+    let (b_id, a_id) = pair(&a, &b).await;
+    let mut b_events = b.shared.ctx.hub.subscribe();
+    let proj_dir = b.shared.config.data_dir.join("cancel-proj");
+    std::fs::create_dir_all(proj_dir.join("cancel-me")).unwrap();
+    for i in 0..8u8 {
+        std::fs::write(proj_dir.join(format!("cancel-me/f{i}.bin")), blob(5 * 1024 * 1024, i)).unwrap();
+    }
+    let project = b.call("add_project", json!({ "path": proj_dir.to_string_lossy() })).await;
+    let pid = project["id"].as_str().unwrap().to_string();
+    b.call("lan_set_share", json!({ "deviceId": a_id, "share": { "projects": [pid], "meta": [] } })).await;
+
+    // 1) Whole-project pull still prompts on B; cancel while it waits.
+    let sync = {
+        let (a, id, pid) = (a.clone(), b_id.clone(), pid.clone());
+        tokio::spawn(async move {
+            a.try_call("lan_sync_items", json!({ "deviceId": id, "direction": "pull", "projects": [{ "id": pid, "name": "cancel-proj" }], "meta": [] })).await
+        })
+    };
+    let prompt = next_event(&mut b_events, "lan-transfer-request").await;
+    a.call("lan_cancel_outgoing", json!({ "deviceId": b_id })).await;
+    let gone = next_event(&mut b_events, "lan-transfer-cancelled").await;
+    assert_eq!(gone["request_id"], prompt["request_id"], "B's approval prompt is dismissed");
+    let res = tokio::time::timeout(Duration::from_secs(15), sync).await.expect("sync returns promptly").unwrap();
+    assert!(res.is_err() || res.as_ref().is_ok_and(|v| v["failures"].as_array().is_some_and(|f| !f.is_empty())), "{res:?}");
+
+    // 2) Running per-file pull: pause as soon as it shows up, then cancel.
+    let dest = a.shared.config.data_dir.join("cancelled");
+    let items = json!([{ "project_id": pid, "project_name": "cancel-proj", "path": "cancel-me", "is_dir": true }]);
+    let pull = {
+        let (a, id, items, dest) = (a.clone(), b_id.clone(), items, dest.to_string_lossy().into_owned());
+        tokio::spawn(async move { a.try_call("lan_pull_files", json!({ "deviceId": id, "items": items, "destDir": dest })).await })
+    };
+    // The transfers registry is process-wide (parallel tests share it): match by label.
+    let t = wait_transfer(&a, |t| t["direction"] == json!("pull") && t["label"] == json!("cancel-me")).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    let _ = a.try_call("lan_transfer_pause", json!({ "id": tid })).await;
+    let cancel = a.try_call("lan_transfer_cancel", json!({ "id": tid })).await;
+    let res = tokio::time::timeout(Duration::from_secs(30), pull).await.expect("cancelled pull returns").unwrap();
+    let t = wait_transfer(&a, |t| t["id"] == json!(tid) && !matches!(t["state"].as_str(), Some("running" | "waiting"))).await;
+    match t["state"].as_str() {
+        // Loopback can finish 40 MB before the cancel lands; that's not a failure of cancel.
+        Some("done") => assert!(res.is_ok(), "{res:?}"),
+        Some("cancelled") => {
+            assert!(cancel.is_ok(), "{cancel:?}");
+            assert!(res.is_err(), "a cancelled pull reports an error: {res:?}");
+            let leftovers: Vec<_> = walk(&dest).into_iter().filter(|p| p.to_string_lossy().ends_with(".rustic-part")).collect();
+            assert!(leftovers.is_empty(), "no partial files after cancel: {leftovers:?}");
+        }
+        other => panic!("unexpected final state {other:?}: {t}"),
+    }
+}
+
+/// Every file under `dir` (empty when it doesn't exist).
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() { out.extend(walk(&p)); } else { out.push(p); }
+    }
+    out
+}
+
+/// Reconnects: B's listener restarting keeps the pairing usable, and when B
+/// lost the pairing on its own, A is told to re-pair (no "forget on both
+/// sides" needed) and one new pairing restores browsing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_after_restart_and_one_sided_forget() {
+    let a = Arc::new(Node::start().await);
+    let b = Arc::new(Node::start().await);
+    let (b_id, a_id) = pair(&a, &b).await;
+    let proj_dir = b.shared.config.data_dir.join("re-proj");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::write(proj_dir.join("x.txt"), "x").unwrap();
+    let project = b.call("add_project", json!({ "path": proj_dir.to_string_lossy() })).await;
+    let pid = project["id"].as_str().unwrap().to_string();
+    b.call("lan_set_share", json!({ "deviceId": a_id, "share": { "projects": [pid], "meta": [] } })).await;
+    let listed = |v: &Value| v.as_array().is_some_and(|l| l.iter().any(|p| p["id"] == json!(pid)));
+    assert!(listed(&a.call("lan_list_projects", json!({ "deviceId": b_id })).await));
+
+    // 1) B restarts sync (listener off → on): A keeps working without re-pairing.
+    b.call("lan_set_enabled", json!({ "enabled": false })).await;
+    b.call("lan_set_enabled", json!({ "enabled": true })).await;
+    let mut back = false;
+    for _ in 0..40 {
+        if a.try_call("lan_list_projects", json!({ "deviceId": b_id })).await.is_ok_and(|v| listed(&v)) {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(back, "A reaches B again after B's listener restarted, without re-pairing");
+
+    // 2) B loses the pairing on its own (reinstall / wiped data).
+    rustic_app::peer::save_peers(&b.shared.config.data_dir, &[]).unwrap();
+    let err = a.try_call("lan_list_projects", json!({ "deviceId": b_id })).await.unwrap_err();
+    assert!(!err.is_empty());
+    let devices = a.call("lan_devices", json!({})).await;
+    let d = devices.as_array().unwrap().iter().find(|d| d["device_id"] == json!(b_id)).expect("B still listed on A").clone();
+    assert_eq!(d["needs_repair"], json!(true), "A flags B for re-pairing: {d}");
+
+    // One re-pair from A (B approves) is enough; no forgetting on either side.
+    let mut b_events = b.shared.ctx.hub.subscribe();
+    let pair = {
+        let (a, id) = (a.clone(), b_id.clone());
+        tokio::spawn(async move { a.try_call("lan_pair", json!({ "deviceId": id })).await })
+    };
+    let req = next_event(&mut b_events, "lan-pair-request").await;
+    b.call("lan_respond_pair", json!({ "requestId": req["request_id"], "accept": true })).await;
+    pair.await.unwrap().expect("re-pair succeeds");
+    let b_devices = b.call("lan_devices", json!({})).await;
+    let a_id = b_devices.as_array().unwrap().iter().find(|d| d["paired"] == json!(true)).expect("A paired on B again")["device_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    b.call("lan_set_share", json!({ "deviceId": a_id, "share": { "projects": [pid], "meta": [] } })).await;
+    assert!(listed(&a.call("lan_list_projects", json!({ "deviceId": b_id })).await), "browsing works after one re-pair");
+    let devices = a.call("lan_devices", json!({})).await;
+    let d = devices.as_array().unwrap().iter().find(|d| d["device_id"] == json!(b_id)).unwrap().clone();
+    assert_eq!(d["needs_repair"], json!(false), "{d}");
 }

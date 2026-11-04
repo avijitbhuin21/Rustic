@@ -6,6 +6,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { SearchAddon } from '@xterm/addon-search';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { useTerminal } from '@/state/terminal';
+import { findPathsInText, openFileLink } from '@/lib/file-links';
 import {
   handleTerminalPaste,
   pasteViaClipboardApi,
@@ -436,6 +437,32 @@ function createTerminalInstance(sessionId) {
       } catch (err) {
         // eslint-disable-next-line no-console
         console.warn('[terminal] web-links addon unavailable:', err);
+      }
+
+      // Clickable file paths (+ :line:col) → open in the editor, resolved
+      // against the session's cwd first, then the project roots.
+      try {
+        term.registerLinkProvider({
+          provideLinks(y, callback) {
+            const line = term.buffer.active.getLine(y - 1);
+            if (!line) { callback(undefined); return; }
+            const text = line.translateToString(true);
+            const hits = findPathsInText(text, { allowBare: true });
+            if (!hits.length) { callback(undefined); return; }
+            callback(hits.map((h) => ({
+              range: { start: { x: h.start + 1, y }, end: { x: h.end, y } },
+              text: h.text,
+              decorations: { underline: true, pointerCursor: true },
+              activate(event) {
+                const session = useTerminal.getState().sessions.find((s) => s.id === sessionId);
+                openFileLink(h, { baseDir: session?.cwd || null });
+              },
+            })));
+          },
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[terminal] file link provider unavailable:', err);
       }
 
       // Find-in-terminal (Ctrl+Shift+F). Searches xterm's own buffer.

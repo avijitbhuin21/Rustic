@@ -65,7 +65,9 @@ export function applyMonacoTheme(monaco) {
       'editorLineNumber.foreground': muted,
       'editorLineNumber.activeForeground': fg,
       'editorCursor.foreground': fg,
-      'editor.lineHighlightBackground': `${strip(card)}80`,
+      // Translucent neutral grey (foreground at ~8%). The old value dropped the
+      // leading '#', and Monaco renders an invalid colour as red.
+      'editor.lineHighlightBackground': `#${strip(fg)}14`,
       'editor.lineHighlightBorder': '#00000000',
       'editorWidget.background': card,
       'editorWidget.border': border,
@@ -73,7 +75,7 @@ export function applyMonacoTheme(monaco) {
       'editorSuggestWidget.border': border,
       'editorHoverWidget.background': card,
       'editorHoverWidget.border': border,
-      'editorIndentGuide.background1': `${strip(border)}80`,
+      'editorIndentGuide.background1': `#${strip(border)}80`,
       'minimap.background': bg,
       'scrollbar.shadow': '#00000000',
       'editor.findMatchBackground': `#${a}40`,

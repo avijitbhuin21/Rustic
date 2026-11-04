@@ -5,12 +5,6 @@ import { isTauriAvailable } from '@/lib/platform';
 import { toast } from 'sonner';
 import { confirm } from '@/components/confirm-dialog';
 
-export const PLACEHOLDER_PROJECT = {
-  id: '',
-  name: '',
-  root: '',
-};
-
 // IMPORTANT: these names must match the strings the Rust backend passes to
 // app.emit(...) in src-tauri/src/commands/agent/mod.rs (and stream_coalesce.rs).
 // The earlier names `agent-stream-text`, `agent-status`, `agent-question-request`
@@ -61,10 +55,6 @@ const AGENT_EVENTS = [
   // Payload: { task_id, error }. Handler stores it so the UI can offer a
   // one-click "Repair & continue" that stubs the offending history content.
   'agent-provider-error',
-  // Per-turn checkpoint anchor. Fires once per send_message once the
-  // file-history snapshot has been captured. The handler tags the originating
-  // user message with the snapshot_message_id.
-  'agent-turn-started',
   // A concurrent agent task sent this task a message via `message_other_agent`.
   // Payload: { task_id (receiver), from_task_id, from_title, text }. Appended
   // to the receiver's transcript so a backend-originated message shows up
@@ -560,53 +550,6 @@ function normalizeLoadedMessages(taskId, dtos) {
   return out;
 }
 
-// Annotate user messages with their file-history snapshot ids after a task is
-// loaded from disk. Without this, hydrated chats lose their Revert buttons
-// (the `agent-turn-started` event that normally tags them only fires for
-// live turns, not for reloads). Snapshots are paired with user messages by
-// position: the N-th snapshot (sorted by `sequence`) belongs to the N-th
-// non-tool, non-synthetic user message in the loaded list — that's the same
-// ordering the executor uses when it opens snapshots.
-function applySnapshotAnchors(messages, snapshots) {
-  if (!Array.isArray(messages) || !Array.isArray(snapshots) || snapshots.length === 0) {
-    // eslint-disable-next-line no-console
-    console.warn('[applySnapshotAnchors] No snapshots to apply', {
-      messagesIsArray: Array.isArray(messages),
-      messagesCount: Array.isArray(messages) ? messages.length : 0,
-      snapshotsIsArray: Array.isArray(snapshots),
-      snapshotsCount: Array.isArray(snapshots) ? snapshots.length : 0,
-    });
-    return messages;
-  }
-  // Snapshots arrive sorted by sequence from `fh_list_snapshots` already, but
-  // sort defensively in case the backend changes its ordering — we'd rather
-  // recover gracefully than mis-anchor.
-  const sorted = [...snapshots].sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
-  let snapIdx = 0;
-  const result = messages.map((m) => {
-    if (snapIdx >= sorted.length) return m;
-    // Only count real user turns — the same condition that the executor
-    // uses when deciding to open a snapshot in `send_message`.
-    if (m.role !== 'user') return m;
-    const hasRealText = (m.content || []).some(
-      (b) => b && b.type === 'text' && (b.text || '').trim().length > 0,
-    );
-    if (!hasRealText) return m;
-    const snap = sorted[snapIdx++];
-    return {
-      ...m,
-      snapshotMessageId: snap.message_id,
-      // sortOrder was attached by normalizeLoadedMessages from the DTO's
-      // `sort_order` (the row's position in the backend's task.messages list).
-      // That's exactly what `truncate_task_messages` expects as `keepCount`.
-      userMessageIndex: typeof m.sortOrder === 'number' ? m.sortOrder : undefined,
-    };
-  });
-  
-
-  return result;
-}
-
 // Convert a persisted SubagentRecord (from `get_subagent_records`) into the
 // SubagentLive shape that `subagentsByTask` holds. Used on task open so the
 // SubagentInlineView can replay the sub-agent's run after a restart.
@@ -784,9 +727,8 @@ export const useAgent = create((set, get) => ({
   // counter for non-running tasks. Defaults to 5.
   historyLimitByProject: {},
   activeTaskId: null,
-  // When a user reverts a chat to a checkpoint, we seed the prompt box with
-  // the original message + attachments so the user can edit and resend
-  // without retyping. Shape: { taskId, text, attachments } or null.
+  // One-shot draft to seed the prompt box with (text + attachments).
+  // Shape: { taskId, text, attachments } or null.
   // PromptBox watches this slot and clears it after applying.
   pendingDraft: null,
   promptDrafts: {},
@@ -956,7 +898,7 @@ export const useAgent = create((set, get) => ({
   // (not per task) because reasoning effort is a workflow preference, not a
   // per-conversation setting — users tend to pick a tier and stick with it.
   thinkingTier: PERSISTED_THINKING_TIER ?? 'off',
-  // Per-tool on/off toggles surfaced from the chat-input "Tools" dropdown.
+  // Per-tool on/off toggles surfaced from the prompt box "Tools" dropdown.
   // Keyed by stable tool id (mirrors the keys backend uses where applicable —
   // `web_search`, `web_fetch`, etc.). Defaults to all enabled. Frontend-only
   // for now; the backend doesn't yet accept a disabled-tools list per send,
@@ -983,7 +925,6 @@ export const useAgent = create((set, get) => ({
   // the same project's task list every time the tree re-mounts.
   tasksLoadedByProject: {},
 
-  setPendingDraft: (draft) => set({ pendingDraft: draft }),
   clearPendingDraft: () => set({ pendingDraft: null }),
 
   // Session-only composer drafts keyed `task:<id>` / `new:<projectId>` so the
@@ -1203,40 +1144,6 @@ export const useAgent = create((set, get) => ({
     }));
   },
 
-  // Anchor the most recent user message in this task to a file-history
-  // checkpoint. The backend `agent-turn-started` event carries the
-  // snapshot_message_id captured by `open_snapshot` and the index of the user
-  // message in the backend's task.messages list — we stash both on the
-  // matching user message so the chat UI can render its per-message Revert
-  // button and pass the right keep_count to `truncate_task_messages`.
-  anchorCheckpoint: (taskId, snapshotMessageId, userMessageIndex) => {
-    if (!taskId || !snapshotMessageId) return;
-    set((s) => {
-      const list = s.messagesByTask[taskId];
-      if (!list || list.length === 0) return s;
-      // Find the most recent user message that doesn't already carry a
-      // checkpoint. Walking from the end is correct because the snapshot is
-      // emitted right after the user just sent — that user message is the tail
-      // user entry.
-      let lastUserIdx = -1;
-      for (let i = list.length - 1; i >= 0; i--) {
-        if (list[i].role === 'user') {
-          lastUserIdx = i;
-          break;
-        }
-      }
-      if (lastUserIdx < 0) return s;
-      const next = list.slice();
-      next[lastUserIdx] = {
-        ...next[lastUserIdx],
-        snapshotMessageId,
-        userMessageIndex,
-      };
-      return {
-        messagesByTask: { ...s.messagesByTask, [taskId]: next },
-      };
-    });
-  },
 
   appendAssistantText: (taskId, delta) => {
     set((s) => {
@@ -3071,7 +2978,7 @@ export const useAgent = create((set, get) => ({
     get().refreshTaskFiles(taskId);
 
     try {
-      const [messages, todos, cost, subagents, snapshots] = await Promise.all([
+      const [messages, todos, cost, subagents] = await Promise.all([
         safeInvoke('get_task_messages', { taskId }).catch((e) => {
           // eslint-disable-next-line no-console
           console.error('[agent.loadTaskHistory] get_task_messages failed', { taskId, error: e });
@@ -3080,20 +2987,9 @@ export const useAgent = create((set, get) => ({
         safeInvoke('get_task_todos', { taskId }).catch(() => []),
         safeInvoke('get_task_cost', { taskId }).catch(() => null),
         safeInvoke('get_subagent_records', { taskId }).catch(() => []),
-        // Pull the per-task snapshot rows so reloaded user messages can carry
-        // their checkpoint anchors. Empty list is fine — older tasks predating
-        // the file-history tracker just won't show Revert buttons.
-        safeInvoke('fh_list_snapshots', { taskId }).catch((e) => {
-          // eslint-disable-next-line no-console
-          console.error('[agent.loadTaskHistory] fh_list_snapshots failed', { taskId, error: e });
-          return [];
-        }),
       ]);
 
-      const normalized = applySnapshotAnchors(
-        normalizeLoadedMessages(taskId, messages),
-        Array.isArray(snapshots) ? snapshots : [],
-      );
+      const normalized = normalizeLoadedMessages(taskId, messages);
 
       set((s) => {
         // Re-check: a live stream may have started while we were awaiting. If
@@ -3328,12 +3224,6 @@ export const useAgent = create((set, get) => ({
         // Clear the condensing flag and send any queued message
         get()._flushCondenseQueue(taskId);
       },
-      'agent-turn-started': (p) =>
-        get().anchorCheckpoint(
-          p.task_id,
-          p.snapshot_message_id,
-          p.user_message_index,
-        ),
       // Sub-agent stream. Each event includes both task_id and agent_id; the
       // store keeps an independent live transcript per spawned child so the
       // user can click into a sub-agent and watch it work in real time.

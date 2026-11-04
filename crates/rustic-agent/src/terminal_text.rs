@@ -122,6 +122,33 @@ pub fn strip_command_echo(text: &str, cmd: &str) -> String {
         idx
     });
 
+    // A long command's echo wraps across pty rows, and line editors (zsh ZLE,
+    // readline) redraw the wrap with `\r`/cursor moves that the line-based
+    // sanitizer overlays into garbled residue rows (e.g. `js; ls …tail`).
+    // Those rows sit right after the matched echo and still carry the
+    // command's tail or head — skip past the last such row within the few
+    // rows a wrapped echo can occupy.
+    let echo_at = echo_at.map(|i| {
+        if cmd.chars().count() < 40 {
+            return i;
+        }
+        let window = (cmd.chars().count() / 40 + 2).min(10);
+        let mut end = i;
+        for (j, l) in lines.iter().enumerate().skip(i + 1).take(window) {
+            let t = l.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if (!tail.is_empty() && t.contains(tail))
+                || (!head.is_empty() && t.contains(head))
+                || is_echo_residue(t, cmd)
+            {
+                end = j;
+            }
+        }
+        end
+    });
+
     match echo_at {
         Some(i) => lines[(i + 1)..]
             .join("\n")
@@ -177,12 +204,28 @@ fn trim_line(buf: &[char]) -> String {
     s.trim_end().to_string()
 }
 
+/// A row made (almost) entirely of fragments of `cmd` — the overlay left when
+/// a line editor's wrapped-echo redraw is flattened. ≥80% of its
+/// non-whitespace chars must belong to tokens of ≥3 chars found in `cmd`.
+fn is_echo_residue(line: &str, cmd: &str) -> bool {
+    let mut total = 0usize;
+    let mut matched = 0usize;
+    for tok in line.split_whitespace() {
+        let n = tok.chars().count();
+        total += n;
+        if n >= 3 && cmd.contains(tok) {
+            matched += n;
+        }
+    }
+    total >= 12 && matched * 5 >= total * 4
+}
+
 fn is_prompt_line(line: &str) -> bool {
     let t = line.trim();
     if t.is_empty() {
         return false;
     }
-    if t == "$" || t == "#" || t == ">" {
+    if t == "$" || t == "#" || t == ">" || t == "%" {
         return true;
     }
     if t.starts_with("PS ") && t.ends_with('>') {
@@ -199,6 +242,30 @@ fn is_prompt_line(line: &str) -> bool {
             && t.contains(':')
             && (t.ends_with('$') || t.ends_with('#'))
         {
+            return true;
+        }
+        // zsh default `user@host dir %` (macOS), and `user@host dir $`.
+        let words = t.split_whitespace().count();
+        if !user.is_empty()
+            && !user.contains(char::is_whitespace)
+            && (2..=4).contains(&words)
+            && (t.ends_with(" %") || t.ends_with(" $") || t.ends_with(" #"))
+        {
+            return true;
+        }
+        // Git Bash header line `user@HOST MINGW64 /c/path` (the `$` sits on the next line).
+        let mut parts = t.split_whitespace();
+        let _ = parts.next();
+        if let Some(env) = parts.next() {
+            if ["MINGW", "MSYS", "UCRT", "CLANG"].iter().any(|p| env.starts_with(p)) && words <= 4 {
+                return true;
+            }
+        }
+    }
+    // macOS bash default `host:dir user$` / bare `bash-3.2$`.
+    if t.ends_with('$') && t.split_whitespace().count() <= 2 {
+        let first = t.split_whitespace().next().unwrap_or("");
+        if first.contains(':') || first.starts_with("bash-") || first.starts_with("sh-") {
             return true;
         }
     }
@@ -345,5 +412,50 @@ mod tests {
     #[test]
     fn empty_input_stays_empty() {
         assert_eq!(clean_command_output("", "git status"), "");
+    }
+
+    #[test]
+    fn zsh_wrapped_echo_residue_dropped() {
+        // Observed on macOS zsh (120 cols): seed line, then the ZLE wrap
+        // redraw flattened into one garbled row, then real output + prompt.
+        let cmd = "cd /Volumes/AcasisSSDDrive/projects/Personal/Rustic && ls crates/rustic-terminal/src | tr '\\n' ' '; echo; wc -l src-tauri/src/commands/shell_integration.rs rustic-server/src/commands/terminal.rs 2>&1; git --no-pager diff crates/rustic-terminal/src/pty.rs";
+        let raw = "avijit@Avijits-MacBook-Air Rustic %\n\
+                   $ cd /Volumes/AcasisSSDDrive/projects/Personal/Rustic && ls crates/rustic-terminal/src | tr '\\n' ' '; echo; wc -l src-tauri/src/commands/shell_integration.rs rustic-server/src/commands/terminal.rs 2>&1; git --no-pager diff crates/rustic-terminal/src/pty.rs\n\
+                   r/src/commands/terminal.rs 2>&1; git --no-pager diff crates/rustic-terminal/src/pty.rs/shell_integration.rs rustic-serve\n\
+                   emulator.rs lib.rs pty.rs shell.rs\n\
+                   avijit@Avijits-MacBook-Air Rustic %";
+        assert_eq!(
+            clean_command_output(raw, cmd),
+            "emulator.rs lib.rs pty.rs shell.rs"
+        );
+    }
+
+    #[test]
+    fn short_command_output_not_eaten_by_residue_logic() {
+        let raw = "$ echo hello world\nhello world\nuser@host dir %";
+        assert_eq!(clean_command_output(raw, "echo hello world"), "hello world");
+    }
+
+    #[test]
+    fn long_command_keeps_unrelated_output_rows() {
+        let cmd = "cargo test -p rustic-agent terminal_text -- --nocapture --test-threads=1";
+        let raw = format!("$ {cmd}\nrunning 3 tests\ntest ok\n");
+        assert_eq!(clean_command_output(&raw, cmd), "running 3 tests\ntest ok");
+    }
+
+    #[test]
+    fn zsh_and_macos_bash_prompts_dropped() {
+        assert_eq!(strip_trailing_prompt("out\nuser@host Rustic %"), "out");
+        assert_eq!(strip_trailing_prompt("out\nhost:Rustic user$"), "out");
+        assert_eq!(strip_trailing_prompt("out\nbash-3.2$"), "out");
+        assert_eq!(strip_trailing_prompt("out\n%"), "out");
+        // Git Bash: header line + `$` on its own line.
+        assert_eq!(strip_trailing_prompt("out\nuser@HOST MINGW64 /c/proj\n$"), "out");
+        assert_eq!(strip_trailing_prompt("out\nuser@HOST MSYS ~/proj (main)\n$"), "out");
+        // A normal sentence ending in % is output, not a prompt.
+        assert_eq!(
+            strip_trailing_prompt("coverage is now at 95 %"),
+            "coverage is now at 95 %"
+        );
     }
 }

@@ -82,7 +82,7 @@ export function InlineRename({ value, placeholder, onSave, onCancel }) {
 }
 
 /** Sliding segmented control (two or three options) with optional counts. */
-export function Slider({ value, onChange, options, className }) {
+export function Slider({ value, onChange, options, className, compact = false, labels = 'all' }) {
   const idx = Math.max(0, options.findIndex((o) => o.id === value));
   const n = options.length;
   return (
@@ -92,23 +92,36 @@ export function Slider({ value, onChange, options, className }) {
         className="absolute inset-y-0.5 left-0.5 rounded-md bg-background shadow-sm transition-transform duration-200 ease-out"
         style={{ width: `calc(${100 / n}% - ${4 / n}px)`, transform: `translateX(${idx * 100}%)` }}
       />
-      {options.map((o) => (
+      {options.map((o) => {
+        const showLabel = !compact && (labels === 'all' || value === o.id);
+        return (
         <button
           key={o.id}
           type="button"
+          title={o.label}
+          aria-label={o.label}
           onClick={() => onChange(o.id)}
           className={cn(
-            'relative z-10 flex items-center justify-center gap-1.5 truncate rounded-md px-3 py-1.5 text-[12px] transition-colors',
+            'relative z-10 flex min-w-0 items-center justify-center truncate rounded-md py-1.5 text-[12px] transition-all duration-200',
+            showLabel ? 'gap-1.5 px-3' : 'gap-0 px-2',
             value === o.id ? 'text-foreground' : 'text-muted-foreground hover:text-foreground',
           )}
         >
-          {o.icon && <o.icon className="size-3.5" />}
-          {o.label}
-          {o.count != null && (
+          {o.icon && <o.icon className="size-3.5 shrink-0" />}
+          <span
+            className={cn(
+              'overflow-hidden truncate whitespace-nowrap transition-all duration-200 ease-out',
+              showLabel ? 'max-w-[140px] opacity-100' : 'max-w-0 opacity-0',
+            )}
+          >
+            {o.label}
+          </span>
+          {o.count != null && showLabel && (
             <span className="rounded-full bg-muted px-1.5 text-[10px] tabular-nums text-muted-foreground">{o.count}</span>
           )}
         </button>
-      ))}
+        );
+      })}
     </div>
   );
 }

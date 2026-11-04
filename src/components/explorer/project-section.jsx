@@ -16,6 +16,7 @@ import {
   ContextMenuSubTrigger,
 } from '@/components/ui/context-menu';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { confirm } from '@/components/confirm-dialog';
 import { cn } from '@/lib/utils';
 import { IS_WEB } from '@/lib/platform';
@@ -75,7 +76,7 @@ export function ProjectSection({ project, onOpenFile }) {
       useEditor.getState().openTerminal(info.id, project.name);
       toast.success(`Terminal opened in ${project.name}`);
     } catch (err) {
-      toast.error(String(err));
+      toastError(null, err);
     }
   };
 
@@ -91,7 +92,7 @@ export function ProjectSection({ project, onOpenFile }) {
     try {
       await removeProject(project.id);
     } catch (err) {
-      toast.error(String(err));
+      toastError(null, err);
     }
   };
 

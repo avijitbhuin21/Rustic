@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -56,7 +57,7 @@ export function GithubAutoResolveSection() {
     let active = true;
     invoke('github_auto_get_project_config', { projectId })
       .then((r) => { if (active) { setProjCfg(r.config); setDetectedRepo(r.detectedRepo); } })
-      .catch((e) => { if (active) { setProjCfg(null); toast.error(String(e)); } });
+      .catch((e) => { if (active) { setProjCfg(null); toastError(null, e); } });
     return () => { active = false; };
   }, [projectId]);
 
@@ -69,7 +70,7 @@ export function GithubAutoResolveSection() {
       });
       setCfg(saved);
       toast.success('GitHub auto-resolve settings saved');
-    } catch (e) { toast.error(String(e)); refreshGlobal(); }
+    } catch (e) { toastError(null, e); refreshGlobal(); }
   };
 
   const saveProject = async (next) => {
@@ -89,7 +90,7 @@ export function GithubAutoResolveSection() {
       } else {
         toast.success('Project settings saved');
       }
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
     finally { setSavingProject(false); }
   };
 

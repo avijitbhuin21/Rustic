@@ -19,6 +19,7 @@ import {
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -91,7 +92,7 @@ export function SourceControlSection() {
         toast.success('Commit-message model cleared');
       }
       refreshAiConfig();
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
   };
 
   const clearChoice = async () => {
@@ -99,7 +100,7 @@ export function SourceControlSection() {
       await invoke('clear_source_control_config');
       setProviderKey(''); setModel('');
       refreshAiConfig();
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
   };
 
   return (

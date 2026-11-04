@@ -7,8 +7,43 @@ import { useLayout } from '@/state/layout';
 import { IS_WEB, MOD_LABEL } from '@/lib/platform';
 import { TerminalPanel } from '@/components/terminal/terminal-panel';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
+import { useTerminal } from '@/state/terminal';
+import { cn } from '@/lib/utils';
+
+/** Header switch between your terminals and every live agent terminal. */
+function TerminalViewSwitch({ view, onChange, agentCount }) {
+  const opts = [
+    { id: 'user', label: 'User terminals' },
+    { id: 'agent', label: 'Agent terminals', count: agentCount },
+  ];
+  return (
+    <div className="inline-flex items-center gap-0.5 rounded-md bg-muted/40 p-0.5" role="tablist" aria-label="Terminal view">
+      {opts.map((o) => (
+        <button
+          key={o.id}
+          type="button"
+          role="tab"
+          aria-selected={view === o.id}
+          onClick={() => onChange(o.id)}
+          className={cn(
+            'flex h-5 items-center gap-1 rounded px-2 text-[11px] font-medium transition-colors',
+            view === o.id ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
+          )}
+        >
+          {o.label}
+          {o.count > 0 && (
+            <span className="rounded-full bg-muted px-1.5 text-[9.5px] tabular-nums text-muted-foreground">{o.count}</span>
+          )}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 export function BottomPanelHost() {
+  const terminalView = useTerminal((s) => s.terminalView);
+  const setTerminalView = useTerminal((s) => s.setTerminalView);
+  const agentCount = useTerminal((s) => s.sessions.filter((x) => x.is_agent && !x.exited).length);
   const bottomPanelFullscreen = useLayout((s) => s.bottomPanelFullscreen);
   const toggleBottomPanelFullscreen = useLayout((s) => s.toggleBottomPanelFullscreen);
   const setBottomPanelVisible = useLayout((s) => s.setBottomPanelVisible);
@@ -38,16 +73,18 @@ export function BottomPanelHost() {
         className="flex h-7 shrink-0 items-center justify-between border-b border-border/60 px-2"
         style={{ paddingRight: needsWindowControlsOffset ? WINDOW_CONTROLS_OFFSET : undefined }}
       >
-        <span className="text-xs font-medium text-muted-foreground">Terminal</span>
+        <TerminalViewSwitch view={terminalView} onChange={setTerminalView} agentCount={agentCount} />
         <div className="flex items-center gap-1">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-xs" onClick={openTerminalPicker}>
-                <Plus className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="top">New terminal (Ctrl+`)</TooltipContent>
-          </Tooltip>
+          {terminalView === 'user' && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon-xs" onClick={openTerminalPicker}>
+                  <Plus className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top">New terminal (Ctrl+`)</TooltipContent>
+            </Tooltip>
+          )}
           <Tooltip>
             <TooltipTrigger asChild>
               <Button variant="ghost" size="icon-xs" onClick={toggleBottomPanelFullscreen}>

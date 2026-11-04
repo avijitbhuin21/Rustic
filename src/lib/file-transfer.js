@@ -5,6 +5,7 @@
 // build. It lazily imports the web transport so the desktop bundle never pulls
 // the fetch/FileReader code path.
 import { IS_WEB, isIOS } from './platform.js';
+import { formatBytes } from './transfer-format.js';
 import { toast } from 'sonner';
 
 async function transport() {
@@ -81,14 +82,6 @@ export async function uploadFileList(dstDir, files, { preserveTree = false } = {
     if (showProgress) toast.dismiss(toastId);
   }
   return count;
-}
-
-/// Render a byte count as a short human-readable size (e.g. "1.4 GB").
-function formatBytes(n) {
-  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
-  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
-  if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
-  return `${n} B`;
 }
 
 function pickFiles({ directory }) {

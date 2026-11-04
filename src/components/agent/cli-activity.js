@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { terminalLastOutputAt } from '@/state/terminal';
+import { useVisiblePoll } from '@/lib/use-visible-poll';
 
 // A TUI agent repaints continuously while it works and goes quiet at its
 // prompt, so "output within the last beat" is a good proxy for "still working".
@@ -15,15 +16,14 @@ export function useCliBusy(ptySessionId) {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    if (ptySessionId == null) {
-      setBusy(false);
-      return;
-    }
-    const tick = () => setBusy(Date.now() - terminalLastOutputAt(ptySessionId) < BUSY_WINDOW_MS);
-    tick();
-    const id = setInterval(tick, POLL_MS);
-    return () => clearInterval(id);
+    if (ptySessionId == null) setBusy(false);
   }, [ptySessionId]);
+
+  useVisiblePoll(
+    () => setBusy(Date.now() - terminalLastOutputAt(ptySessionId) < BUSY_WINDOW_MS),
+    ptySessionId == null ? 0 : POLL_MS,
+    [ptySessionId],
+  );
 
   return busy;
 }

@@ -28,6 +28,8 @@ base64 = { workspace = true }
 flate2 = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
+# Formatter release archives (host_ops::formatters); same workspace dep both hosts already use.
+zip = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true, features = ["zstdmt"] }
 notify = { workspace = true, features = ["macos_fsevent"] }

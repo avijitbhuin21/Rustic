@@ -336,10 +336,19 @@ pub(crate) fn spawn_session_monitor(
                     cmd_idle_since = None;
                 }
                 if is_agent || cmd_marker.is_some() {
-                    match rustic_terminal::process_has_children(pid) {
+                    // Completion follows the FOREGROUND job (`cmd &` leaves the
+                    // shell at its prompt); idle auto-close follows ANY child so
+                    // a shell with a live background job is never reclaimed.
+                    let has_children = rustic_terminal::process_has_children(pid);
+                    let cmd_busy = ctx
+                        .state()
+                        .terminal_manager
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.command_busy(session_id))
+                        .or(has_children);
+                    match cmd_busy {
                         Some(true) => {
-                            seen_running = true;
-                            idle_since = None;
                             if cmd_marker.is_some() {
                                 cmd_seen_running = true;
                                 cmd_idle_since = None;
@@ -369,6 +378,15 @@ pub(crate) fn spawn_session_monitor(
                                     }
                                 }
                             }
+                        }
+                        None => {}
+                    }
+                    match has_children {
+                        Some(true) => {
+                            seen_running = true;
+                            idle_since = None;
+                        }
+                        Some(false) => {
                             if is_agent && seen_running {
                                 let since = idle_since.get_or_insert_with(Instant::now);
                                 if since.elapsed() >= IDLE_CLOSE_TIMEOUT {
@@ -377,7 +395,7 @@ pub(crate) fn spawn_session_monitor(
                                 }
                             }
                         }
-                        _ => {}
+                        None => {}
                     }
                 }
             }
@@ -397,10 +415,11 @@ fn state_session_exists(ctx: &ServerContext, session_id: u64) -> bool {
 
 // ─── shell preference + validation (ported from desktop) ────────────────────
 
-/// Pick a sane default agent shell when the frontend doesn't specify one.
-/// Mirrors `commands::agent_terminals::preferred_agent_shell`.
+/// Default shell for USER terminals and external CLI agents (agent terminals
+/// use `rustic_agent::agent_shell` instead). Mirrors
+/// `commands::agent_terminals::default_terminal_shell`.
 #[cfg(target_os = "windows")]
-pub(crate) fn preferred_agent_shell() -> Option<String> {
+pub(crate) fn default_terminal_shell() -> Option<String> {
     if let Some(p) = find_in_path("pwsh.exe") {
         return Some(p);
     }
@@ -412,9 +431,13 @@ pub(crate) fn preferred_agent_shell() -> Option<String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn preferred_agent_shell() -> Option<String> {
+pub(crate) fn default_terminal_shell() -> Option<String> {
+    // On Unix, $SHELL / portable-pty's default is already the user's shell.
     None
 }
+
+/// Env for agent shells (shared with the desktop host).
+pub(crate) const AGENT_SHELL_ENV: &[(&str, &str)] = rustic_agent::agent_shell::AGENT_SHELL_ENV;
 
 /// Validate that a `shell_program` supplied to `create_terminal` matches a
 /// detected shell on this machine (anti-XSS: an arbitrary executable path must
@@ -460,7 +483,7 @@ fn create_terminal(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
     if let Some(ref prog) = a.shell_program {
         validate_shell_program(prog)?;
     }
-    let shell_program = a.shell_program.or_else(preferred_agent_shell);
+    let shell_program = a.shell_program.or_else(default_terminal_shell);
 
     let initial_size = match (a.cols, a.rows) {
         (Some(c), Some(r)) if c > 0 && r > 0 => Some((c, r)),
@@ -745,17 +768,7 @@ fn resolve_shell_name(raw: &str) -> Option<String> {
                 }
             }
             "pwsh" => find_in_path("pwsh.exe"),
-            "bash" => {
-                for candidate in [
-                    r"C:\Program Files\Git\bin\bash.exe",
-                    r"C:\Program Files (x86)\Git\bin\bash.exe",
-                ] {
-                    if Path::new(candidate).exists() {
-                        return Some(candidate.to_string());
-                    }
-                }
-                find_in_path("bash.exe").filter(|p| !p.to_ascii_lowercase().contains("system32"))
-            }
+            "bash" => rustic_agent::agent_shell::git_bash_path(),
             "zsh" => find_in_path("zsh.exe"),
             "sh" => find_in_path("sh.exe"),
             "fish" => find_in_path("fish.exe"),
@@ -795,7 +808,7 @@ impl AgentTerminals for ServerAgentTerminals {
         let shell = shell_override
             .as_deref()
             .and_then(resolve_shell_name)
-            .or_else(preferred_agent_shell);
+            .or_else(rustic_agent::agent_shell::agent_shell_path);
         let is_powershell = shell
             .as_ref()
             .map(|p| {
@@ -806,8 +819,12 @@ impl AgentTerminals for ServerAgentTerminals {
                     || low == "pwsh"
             })
             .unwrap_or(false);
+        let agent_env: Vec<(String, String)> = AGENT_SHELL_ENV
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let (info, reader, buffer, emulator, child) = manager
-            .create_session(cwd, label, true, shell.clone(), None, &[])
+            .create_session(cwd, label, true, shell.clone(), None, &agent_env)
             .map_err(|e| e.to_string())?;
         let id = info.id;
         let pid = info.pid;
@@ -941,12 +958,8 @@ impl AgentTerminals for ServerAgentTerminals {
     }
 
     fn available_shells(&self) -> Vec<String> {
-        #[cfg(target_os = "windows")]
-        let candidates: &[&str] = &["pwsh", "powershell", "cmd", "bash", "zsh", "sh", "fish"];
-        #[cfg(not(target_os = "windows"))]
-        let candidates: &[&str] = &["bash", "zsh", "sh", "fish"];
-
-        candidates
+        // First entry = the model's default; matches the system prompt's shell.
+        rustic_agent::agent_shell::preferred_shell_order()
             .iter()
             .filter(|name| resolve_shell_name(name).is_some())
             .map(|s| s.to_string())

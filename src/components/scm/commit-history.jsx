@@ -3,6 +3,7 @@ import { ChevronRight, ChevronDown, Loader2, Copy } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
+import { copyText } from '@/lib/code-copy';
 import { useGit, EMPTY_ARRAY } from '@/state/git';
 import { cn } from '@/lib/utils';
 
@@ -139,7 +140,7 @@ function CommitRow({ commit, projectId, onSelect, isLast }) {
                     onClick={async (e) => {
                       e.stopPropagation();
                       try {
-                        await navigator.clipboard.writeText(String(oid ?? ''));
+                        await copyText(String(oid ?? ''));
                         toast.success('Commit hash copied');
                       } catch {
                         toast.error('Copy failed');

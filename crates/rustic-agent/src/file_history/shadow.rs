@@ -97,24 +97,6 @@ pub struct ShadowSnapshot {
     slow_path_reads: AtomicUsize,
 }
 
-/// Delete the shadow repo backing `worktree_root`. Call BEFORE removing the
-/// worktree directory itself — the repo path is derived from the CANONICAL
-/// worktree path, which can no longer be resolved once the directory is gone.
-/// Best-effort: missing dirs are fine.
-pub fn remove_shadow_for_worktree(worktree_root: &Path, config_dir: &Path) {
-    let canon_root = worktree_root
-        .canonicalize()
-        .unwrap_or_else(|_| worktree_root.to_path_buf());
-    let project_hash = compute_project_hash(&canon_root);
-    let repo_path = config_dir
-        .join("file-history")
-        .join("shadow")
-        .join(project_hash);
-    if repo_path.exists() {
-        let _ = fs::remove_dir_all(repo_path);
-    }
-}
-
 impl ShadowSnapshot {
     /// Open or initialize the shadow repo for `worktree_root` under
     /// `shadow_root`. Returns an `Arc` so callers can share the snapshot

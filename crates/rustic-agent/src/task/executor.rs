@@ -290,6 +290,9 @@ pub struct TaskExecutor {
     /// mutated the layout or the copy aged out, so the model never navigates
     /// from a tree that is many turns old.
     tree_cache: std::sync::Mutex<TreeCache>,
+    /// Request bookkeeping for sub-agents (top-level agents use
+    /// `TASK_REQUEST_STATE`, which survives across per-turn executors).
+    local_request_state: std::sync::Mutex<RequestState>,
 }
 
 /// Cached render of the project tree plus the freshness bookkeeping used to
@@ -306,6 +309,174 @@ struct TreeCache {
 /// changes made outside the agent (editor saves, git checkout, sibling agents).
 const TREE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// Provider prompt caches (Anthropic's default TTL) expire after ~5 minutes.
+/// Past this gap since the previous request, rewriting older history bytes
+/// costs nothing extra — the next request re-writes the cache anyway.
+const CACHE_COLD_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Max `+`/`-` lines in a tree delta block before the full tree is re-anchored
+/// on the latest user message instead.
+const TREE_DELTA_MAX_LINES: usize = 40;
+
+/// Age-based tool-result clearing: newest results kept verbatim. A result
+/// stays while EITHER fewer than `keep_count` results have been kept OR the
+/// kept bodies total under `AGE_KEEP_BYTES` (~40K tokens).
+const AGE_KEEP_RESULTS_MAIN: usize = 8;
+const AGE_KEEP_RESULTS_SUBAGENT: usize = 12;
+const AGE_KEEP_BYTES: usize = 160_000;
+/// With a warm cache, aged results are only cleared once at least this much
+/// (~30K tokens) has accumulated, so the one-off cache rewrite is batched
+/// instead of happening on every iteration as each result ages out.
+const AGE_CLEAR_BATCH_BYTES: usize = 120_000;
+/// Tools whose results stay verbatim forever: user answers, loaded
+/// instructions and sub-agent reports are not re-derivable by re-running.
+const AGE_EXEMPT_TOOLS: &[&str] = &[
+    "ask_user",
+    "read_skill",
+    "read_workflow",
+    "tool_search",
+    "todo_write",
+    "spawn_subagent",
+    "check_subagent",
+];
+
+/// Where the full project tree was last attached in the conversation, so it
+/// can stay at that spot (inside the cached prefix) instead of riding the
+/// last message uncached on every request.
+#[derive(Clone)]
+struct TreeAnchor {
+    /// Index into the task's `messages` history.
+    msg_index: usize,
+    /// [`message_anchor_sig`] of that message, to detect condense / rewrites.
+    msg_sig: u64,
+    rendered: String,
+    fingerprint: u64,
+}
+
+/// Request bookkeeping that must outlive one `TaskExecutor` (hosts build a
+/// fresh executor per turn). Keyed by task id for top-level agents only;
+/// sub-agents keep theirs on the executor, which lives for the child's run.
+#[derive(Default, Clone)]
+struct RequestState {
+    last_request_at: Option<std::time::Instant>,
+    anchor: Option<TreeAnchor>,
+}
+
+static TASK_REQUEST_STATE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, RequestState>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Signature of a message that is stable under tool-result shrinking (it
+/// hashes tool_use ids, not result bodies) but changes when condense or a
+/// rewrite replaces the message.
+fn message_anchor_sig(msg: &Message) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    matches!(msg.role, Role::User).hash(&mut h);
+    for b in &msg.content {
+        match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                1u8.hash(&mut h);
+                tool_use_id.hash(&mut h);
+            }
+            ContentBlock::Text { text } => {
+                2u8.hash(&mut h);
+                text.hash(&mut h);
+            }
+            ContentBlock::ToolUse { id, .. } => {
+                3u8.hash(&mut h);
+                id.hash(&mut h);
+            }
+            _ => 4u8.hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
+/// Reconstruct full relative paths from a rendered tree block (indentation =
+/// depth, dirs end in `/`, summaries in trailing parens are dropped).
+fn tree_block_paths(block: &str) -> Vec<String> {
+    let inner = block.split("```").nth(1).unwrap_or("");
+    let mut stack: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for line in inner.lines() {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with("...") || t.starts_with('(') {
+            continue;
+        }
+        let depth = (line.len() - t.len()) / 2;
+        let name = t.split(" (").next().unwrap_or(t);
+        stack.truncate(depth);
+        let path = format!("{}{}", stack.concat(), name);
+        if name.ends_with('/') {
+            stack.push(name.to_string());
+        }
+        out.push(path);
+    }
+    out
+}
+
+/// Paths added to / removed from the tree between two renders. Removed
+/// entries are only reported when they are really gone from disk — a path can
+/// also drop out of a render because the entry budget shifted.
+fn tree_delta(
+    project_root: &std::path::Path,
+    old_block: &str,
+    new_block: &str,
+) -> (Vec<String>, Vec<String>) {
+    let old = tree_block_paths(old_block);
+    let new = tree_block_paths(new_block);
+    let old_set: std::collections::HashSet<&String> = old.iter().collect();
+    let new_set: std::collections::HashSet<&String> = new.iter().collect();
+    let added = new
+        .iter()
+        .filter(|p| !old_set.contains(p))
+        .cloned()
+        .collect();
+    let removed = old
+        .iter()
+        .filter(|p| !new_set.contains(p))
+        .filter(|p| !project_root.join(p.trim_end_matches('/')).exists())
+        .cloned()
+        .collect();
+    (added, removed)
+}
+
+/// Pick the tool results to clear by age. `results` is every tool result in
+/// conversation order as `(tool_use_id, tool_name, body_len, protected)`;
+/// protected results (in-flight batch, exempt tools, already superseded) are
+/// never chosen but still count toward the kept window. Returns the ids to
+/// stub, or empty when clearing isn't worth a cache rewrite yet.
+fn select_aged_results(
+    results: &[(String, String, usize, bool)],
+    keep_count: usize,
+    keep_bytes: usize,
+    min_bytes: usize,
+    cache_cold: bool,
+) -> std::collections::HashSet<String> {
+    let mut kept = 0usize;
+    let mut kept_bytes = 0usize;
+    let mut candidates: Vec<&String> = Vec::new();
+    let mut reclaimable = 0usize;
+    for (id, _name, len, protected) in results.iter().rev() {
+        if kept < keep_count || kept_bytes < keep_bytes {
+            kept += 1;
+            kept_bytes += *len;
+            continue;
+        }
+        if *protected || *len <= min_bytes {
+            continue;
+        }
+        candidates.push(id);
+        reclaimable += *len;
+    }
+    let worth_it = reclaimable > 0 && (cache_cold || reclaimable >= AGE_CLEAR_BATCH_BYTES);
+    if !worth_it {
+        return std::collections::HashSet::new();
+    }
+    candidates.into_iter().cloned().collect()
+}
+
 impl TaskExecutor {
     pub fn new(provider: Arc<dyn AiProvider>, config: ProviderConfig) -> Self {
         Self {
@@ -314,6 +485,45 @@ impl TaskExecutor {
             config,
             consecutive_condense_failures: std::sync::atomic::AtomicU32::new(0),
             tree_cache: std::sync::Mutex::new(TreeCache::default()),
+            local_request_state: std::sync::Mutex::new(RequestState::default()),
+        }
+    }
+
+    /// Snapshot of this agent's request bookkeeping.
+    fn request_state(&self, context: &ToolContext) -> RequestState {
+        if context.agent_depth == 0 {
+            let map = match TASK_REQUEST_STATE.lock() {
+                Ok(m) => m,
+                Err(e) => e.into_inner(),
+            };
+            map.get(&context.task_id).cloned().unwrap_or_default()
+        } else {
+            match self.local_request_state.lock() {
+                Ok(s) => s.clone(),
+                Err(e) => e.into_inner().clone(),
+            }
+        }
+    }
+
+    /// Store this agent's request bookkeeping. Prunes top-level entries idle
+    /// for over a day so the process-wide map can't grow without bound.
+    fn store_request_state(&self, context: &ToolContext, state: RequestState) {
+        if context.agent_depth == 0 {
+            let mut map = match TASK_REQUEST_STATE.lock() {
+                Ok(m) => m,
+                Err(e) => e.into_inner(),
+            };
+            map.retain(|_, s| {
+                s.last_request_at
+                    .map(|t| t.elapsed() < std::time::Duration::from_secs(24 * 3600))
+                    .unwrap_or(false)
+            });
+            map.insert(context.task_id.clone(), state);
+        } else {
+            match self.local_request_state.lock() {
+                Ok(mut s) => *s = state,
+                Err(e) => *e.into_inner() = state,
+            }
         }
     }
 
@@ -1094,13 +1304,10 @@ impl TaskExecutor {
             // CLEARED_STUB remains the fallback when no identity is known.
             const CLEARED_STUB: &str = "[Old tool result content cleared]";
 
-            // **Skip path-dedup for sub-agents.** Mutating old tool-result
-            // bodies busts the provider prompt cache (the cached prefix from
-            // the previous turn has the full body; this turn's has the stub),
-            // and stub text nudges the model into re-read loops. For
-            // sub-agents (agent_depth >= 1) the conversation is short and the
-            // file set small — shrinking can't pay for itself. Let condense
-            // handle context overflow if it ever happens.
+            // Sub-agents get the same dedup + age-based clearing as the main
+            // agent (research children read a lot over many iterations). Age
+            // clearing is batched (see AGE_CLEAR_BATCH_BYTES) so it doesn't
+            // turn into a cache rewrite on every iteration.
             let is_subagent = context.agent_depth >= 1;
 
             // --- Build the set of tool_use_ids that should be shrunk by path dedup.
@@ -1114,6 +1321,8 @@ impl TaskExecutor {
                 std::collections::HashSet::new();
             let mut shrink_identity: std::collections::HashMap<String, (String, String)> =
                 std::collections::HashMap::new();
+            let mut tool_names: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             // read_file ids → registry keys, so the persist-back step can
             // invalidate read-registry coverage for results it stubs out.
             // Without this the registry keeps refusing re-reads (FILE_UNCHANGED)
@@ -1121,7 +1330,7 @@ impl TaskExecutor {
             // ends up unable to see the file at all until it changes on disk.
             let mut shrink_read_paths: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
                 std::collections::HashMap::new();
-            if !is_subagent {
+            {
                 let mut latest_for_key: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
                 for msg in messages.iter() {
@@ -1130,6 +1339,7 @@ impl TaskExecutor {
                             id, name, input, ..
                         } = block
                         {
+                            tool_names.insert(id.clone(), name.clone());
                             if name == "read_file" {
                                 let mut paths: Vec<std::path::PathBuf> = Vec::new();
                                 if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
@@ -1164,6 +1374,50 @@ impl TaskExecutor {
                 }
             }
 
+            // --- Age-based clearing: beyond the newest K results (or ~40K
+            // tokens of them), stub older bodies. Only when the cache is cold
+            // anyway, or once enough has accumulated to be worth one rewrite.
+            let request_state = self.request_state(context);
+            let cache_cold = request_state
+                .last_request_at
+                .map(|t| t.elapsed() > CACHE_COLD_AFTER)
+                .unwrap_or(true);
+            let aged_ids: std::collections::HashSet<String> = {
+                let last_idx = messages.len().saturating_sub(1);
+                let mut results: Vec<(String, String, usize, bool)> = Vec::new();
+                for (mi, msg) in messages.iter().enumerate() {
+                    for block in msg.content.iter() {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } = block
+                        {
+                            let name = tool_names.get(tool_use_id).cloned().unwrap_or_default();
+                            let protected = mi == last_idx
+                                || AGE_EXEMPT_TOOLS.contains(&name.as_str())
+                                || shrink_ids.contains(tool_use_id);
+                            results.push((tool_use_id.clone(), name, content.len(), protected));
+                        }
+                    }
+                }
+                let keep = if is_subagent {
+                    AGE_KEEP_RESULTS_SUBAGENT
+                } else {
+                    AGE_KEEP_RESULTS_MAIN
+                };
+                select_aged_results(&results, keep, AGE_KEEP_BYTES, SHRINK_MIN_BYTES, cache_cold)
+            };
+            if !aged_ids.is_empty() {
+                tracing::info!(
+                    target: "rustic::context",
+                    task_id = %task_id,
+                    cleared = aged_ids.len(),
+                    cache_cold,
+                    "age-based tool-result clearing"
+                );
+            }
+
             // Anthropic server-side tool results (web_search/web_fetch) ride
             // through ContentBlock::ToolResult as a *stringified JSON array*
             // and get re-inflated to native shape by the Claude adapter on
@@ -1195,7 +1449,8 @@ impl TaskExecutor {
                             ..
                         } = b
                         {
-                            let superseded = shrink_ids.contains(tool_use_id);
+                            let superseded = shrink_ids.contains(tool_use_id)
+                                || aged_ids.contains(tool_use_id);
                             let would_shrink = superseded && content.len() > SHRINK_MIN_BYTES;
                             if would_shrink && server_tool_use_ids.contains(tool_use_id) {
                                 dropped.insert(tool_use_id.clone());
@@ -1243,28 +1498,49 @@ impl TaskExecutor {
                             }
                             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
                                 let superseded = shrink_ids.contains(tool_use_id);
-                                let should_shrink = superseded && content.len() > SHRINK_MIN_BYTES;
+                                let aged = !superseded && aged_ids.contains(tool_use_id);
+                                let should_shrink =
+                                    (superseded || aged) && content.len() > SHRINK_MIN_BYTES;
                                 Some(if should_shrink {
                                     // Deterministic per result — same bytes every
                                     // turn after the first clear → zero cache-write
                                     // cost on all subsequent turns for this result.
-                                    let stub = match shrink_identity.get(tool_use_id) {
-                                        Some((tool, key)) => {
-                                            // Keep the stub tiny and well under
-                                            // SHRINK_MIN_BYTES so it's never
-                                            // re-shrunk (idempotency invariant).
-                                            let mut target = key.clone();
-                                            if target.len() > 160 {
-                                                let mut b = 160;
-                                                while b > 0 && !target.is_char_boundary(b) { b -= 1; }
-                                                target.truncate(b);
-                                                target.push('…');
-                                            }
-                                            format!(
-                                                "[Old {tool} result for '{target}' cleared — superseded by a newer {tool} call for the same target later in this conversation. Use the newest result.]"
-                                            )
+                                    let identity = shrink_identity.get(tool_use_id);
+                                    let target_of = |key: &String| {
+                                        // Keep the stub tiny and well under
+                                        // SHRINK_MIN_BYTES so it's never
+                                        // re-shrunk (idempotency invariant).
+                                        let mut target = key.clone();
+                                        if target.len() > 160 {
+                                            let mut b = 160;
+                                            while b > 0 && !target.is_char_boundary(b) { b -= 1; }
+                                            target.truncate(b);
+                                            target.push('…');
                                         }
-                                        None => CLEARED_STUB.to_string(),
+                                        target
+                                    };
+                                    let stub = if aged {
+                                        let tool = tool_names
+                                            .get(tool_use_id)
+                                            .map(String::as_str)
+                                            .unwrap_or("tool");
+                                        match identity {
+                                            Some((_, key)) => format!(
+                                                "[Old {tool} result for '{}' cleared to save context — it is older than the most recent tool results. Re-run the tool if you still need it.]",
+                                                target_of(key)
+                                            ),
+                                            None => format!(
+                                                "[Old {tool} result cleared to save context — it is older than the most recent tool results. Re-run the tool if you still need it.]"
+                                            ),
+                                        }
+                                    } else {
+                                        match identity {
+                                            Some((tool, key)) => format!(
+                                                "[Old {tool} result for '{}' cleared — superseded by a newer {tool} call for the same target later in this conversation. Use the newest result.]",
+                                                target_of(key)
+                                            ),
+                                            None => CLEARED_STUB.to_string(),
+                                        }
                                     };
                                     ContentBlock::ToolResult {
                                         tool_use_id: tool_use_id.clone(),
@@ -1283,8 +1559,22 @@ impl TaskExecutor {
                         })
                         .collect(),
                 })
-                .filter(|msg| !msg.content.is_empty())
                 .collect();
+            // messages index → api_messages index (None when the message ended
+            // up empty and is dropped), used to place the tree anchor.
+            let mut api_index_of: Vec<Option<usize>> = Vec::with_capacity(api_messages.len());
+            {
+                let mut next = 0usize;
+                for m in api_messages.iter() {
+                    if m.content.is_empty() {
+                        api_index_of.push(None);
+                    } else {
+                        api_index_of.push(Some(next));
+                        next += 1;
+                    }
+                }
+            }
+            api_messages.retain(|msg| !msg.content.is_empty());
 
             // Image payloads live in the media store, not in `messages` — the
             // in-memory history and the DB both hold only a `path`. This is the
@@ -1292,19 +1582,89 @@ impl TaskExecutor {
             // one point that has to refill them.
             crate::media_store::hydrate_messages(&mut api_messages);
 
-            // The project tree rides at the very end of the last user message
-            // instead of in the system prompt: appended *after* the cached
-            // prefix, it can be refreshed every turn without invalidating the
-            // cache, and it is never written back into `messages` so history
-            // keeps exactly one (current) copy.
-            let tree_block = self.project_tree_block(context).await;
-            if !tree_block.is_empty() {
-                if let Some(last) = api_messages.last_mut() {
-                    if matches!(last.role, Role::User) {
-                        last.content.push(ContentBlock::Text { text: tree_block });
+            // Project tree (top-level agents only — sub-agents inherit the
+            // parent's context and can glob/list on demand). The full tree is
+            // ANCHORED on the user message where it was first attached and
+            // re-attached at that same spot on every request while it's
+            // unchanged, so after the first request it sits inside the cached
+            // prefix instead of being billed uncached every call. It is only
+            // ever added to `api_messages` — never written back into
+            // `messages` — so stored history never contains it.
+            //  • layout changed a little → a small delta block rides the last
+            //    message (uncached but tiny), the anchored copy stays put;
+            //  • changed a lot, anchor message gone (condense/rewrite), or the
+            //    cache is cold anyway → re-anchor on the latest user message.
+            let mut next_anchor = request_state.anchor.clone();
+            if context.agent_depth == 0 {
+                let tree_block = self.project_tree_block(context).await;
+                let last_user_idx = messages
+                    .iter()
+                    .rposition(|m| matches!(m.role, Role::User))
+                    .filter(|&i| api_index_of.get(i).copied().flatten().is_some());
+                if tree_block.is_empty() {
+                    next_anchor = None;
+                } else if let Some(last_user_idx) = last_user_idx {
+                    let fingerprint = crate::file_tree::tree_fingerprint(&tree_block);
+                    let usable_anchor = request_state.anchor.as_ref().filter(|a| {
+                        !cache_cold
+                            && a.msg_index < messages.len()
+                            && a.msg_index < last_user_idx
+                            && matches!(messages[a.msg_index].role, Role::User)
+                            && api_index_of.get(a.msg_index).copied().flatten().is_some()
+                            && message_anchor_sig(&messages[a.msg_index]) == a.msg_sig
+                    });
+                    let mut delta: Option<String> = None;
+                    let keep_anchor = match usable_anchor {
+                        Some(a) if a.fingerprint == fingerprint => true,
+                        Some(a) => {
+                            let (added, removed) =
+                                tree_delta(&context.project_root, &a.rendered, &tree_block);
+                            if added.len() + removed.len() <= TREE_DELTA_MAX_LINES {
+                                if !added.is_empty() || !removed.is_empty() {
+                                    delta = Some(
+                                        crate::system_prompt::build_project_tree_delta_block(
+                                            &added, &removed,
+                                        ),
+                                    );
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => false,
+                    };
+                    if !keep_anchor {
+                        next_anchor = Some(TreeAnchor {
+                            msg_index: last_user_idx,
+                            msg_sig: message_anchor_sig(&messages[last_user_idx]),
+                            rendered: tree_block,
+                            fingerprint,
+                        });
+                    }
+                    if let Some(anchor) = next_anchor.as_ref() {
+                        if let Some(ai) = api_index_of.get(anchor.msg_index).copied().flatten() {
+                            api_messages[ai].content.push(ContentBlock::Text {
+                                text: anchor.rendered.clone(),
+                            });
+                        }
+                    }
+                    if let Some(delta) = delta {
+                        if let Some(last) = api_messages.last_mut() {
+                            if matches!(last.role, Role::User) {
+                                last.content.push(ContentBlock::Text { text: delta });
+                            }
+                        }
                     }
                 }
             }
+            self.store_request_state(
+                context,
+                RequestState {
+                    last_request_at: Some(std::time::Instant::now()),
+                    anchor: next_anchor,
+                },
+            );
 
             // ── P0.6: persist shrinkage back into `messages` so the prefix bytes
             // sent to the provider stay stable across inner turns. Background:
@@ -1317,11 +1677,9 @@ impl TaskExecutor {
             // N+1 vs turn N. Different bytes in the cached prefix → cache
             // miss → 12K cache-creation tokens per turn (R.2 F3, 15× the CLI
             // baseline). Persisting the shrunk content makes "once shrunk,
-            // stays shrunk" an invariant (which is already true under current
-            // shrink rules — neither aging nor dedup can un-shrink). Sub-agents
-            // already skipped aging entirely, so the persist step is a no-op
-            // for them.
-            if !is_subagent {
+            // stays shrunk" an invariant (neither aging nor dedup can
+            // un-shrink). Applies to sub-agents too.
+            {
                 let shrunk_map: std::collections::HashMap<&str, &str> = api_messages
                     .iter()
                     .flat_map(|m| m.content.iter())
@@ -2173,16 +2531,32 @@ impl TaskExecutor {
                 response.stop_reason,
                 response.content.len()
             );
-            dump_request_if_enabled(
-                &task_id,
-                self.config.system_prompt.as_deref(),
-                &tool_defs,
-                &api_messages,
-                response.usage.cache_write_tokens,
-                response.usage.cache_read_tokens,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-            );
+            if std::env::var_os("RUSTIC_DUMP_PROMPTS").is_some() {
+                // Diagnostic file IO runs on the blocking pool, never on the
+                // async worker driving this turn.
+                let task_id_c = task_id.clone();
+                let system_prompt_c = self.config.system_prompt.clone();
+                let tool_defs_c = tool_defs.clone();
+                let api_messages_c = api_messages.clone();
+                let usage = (
+                    response.usage.cache_write_tokens,
+                    response.usage.cache_read_tokens,
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                );
+                tokio::task::spawn_blocking(move || {
+                    dump_request_if_enabled(
+                        &task_id_c,
+                        system_prompt_c.as_deref(),
+                        &tool_defs_c,
+                        &api_messages_c,
+                        usage.0,
+                        usage.1,
+                        usage.2,
+                        usage.3,
+                    );
+                });
+            }
             // Prefer OpenRouter's authoritative per-request cost; fall back to
             // the token × price estimate for providers that don't report one.
             let request_cost_usd = response.actual_cost_usd.unwrap_or_else(|| {
@@ -4153,5 +4527,77 @@ mod helper_tests {
         let ctx = "API error 413: prompt is too long: 250000 tokens > 200000 maximum";
         assert!(!super::is_gateway_body_limit(ctx));
         assert!(is_context_overflow_error(ctx));
+    }
+}
+
+#[cfg(test)]
+mod context_opt_tests {
+    use super::*;
+
+    fn r(id: &str, len: usize, protected: bool) -> (String, String, usize, bool) {
+        (id.to_string(), "read_file".to_string(), len, protected)
+    }
+
+    #[test]
+    fn aging_keeps_newest_window_and_skips_small_or_protected() {
+        // 12 results of 20K chars: newest 8 kept (160K bytes also reached).
+        let mut results: Vec<_> = (0..12).map(|i| r(&format!("t{i}"), 20_000, false)).collect();
+        results[1].3 = true; // protected (exempt tool / in-flight)
+        results[2].2 = 900; // already tiny
+        let cold = select_aged_results(&results, 8, 160_000, 1_500, true);
+        let mut ids: Vec<_> = cold.into_iter().collect();
+        ids.sort();
+        assert_eq!(ids, vec!["t0".to_string(), "t3".to_string()]);
+    }
+
+    #[test]
+    fn aging_waits_for_batch_when_cache_warm() {
+        let results: Vec<_> = (0..10).map(|i| r(&format!("t{i}"), 20_000, false)).collect();
+        // Only 2 × 20K reclaimable: below the warm batch threshold.
+        assert!(select_aged_results(&results, 8, 160_000, 1_500, false).is_empty());
+        assert_eq!(select_aged_results(&results, 8, 160_000, 1_500, true).len(), 2);
+        // 8 × 20K = 160K reclaimable ≥ batch → cleared even with a warm cache.
+        let many: Vec<_> = (0..16).map(|i| r(&format!("t{i}"), 20_000, false)).collect();
+        assert_eq!(select_aged_results(&many, 8, 160_000, 1_500, false).len(), 8);
+    }
+
+    #[test]
+    fn aging_byte_window_keeps_more_than_k_small_results() {
+        // 20 results of 5K: K=8 → 40K, byte window keeps going to 160K (32).
+        let results: Vec<_> = (0..20).map(|i| r(&format!("t{i}"), 5_000, false)).collect();
+        assert!(select_aged_results(&results, 8, 160_000, 1_500, true).is_empty());
+    }
+
+    #[test]
+    fn tree_paths_and_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/kept.rs"), "x").unwrap();
+        let old = "<project_structure>\nhdr\n```\nsrc/\n  a.rs\n  kept.rs\n  util/\n    b.rs\nicons/ (9 png)\nREADME.md\n  ... (more under src/ not shown)\n```\n</project_structure>";
+        let paths = tree_block_paths(old);
+        assert_eq!(
+            paths,
+            vec!["src/", "src/a.rs", "src/kept.rs", "src/util/", "src/util/b.rs", "icons/", "README.md"]
+        );
+        // kept.rs dropped out of the render but still exists on disk → not
+        // reported as removed; a.rs is really gone.
+        let new = "<project_structure>\n```\nsrc/\n  util/\n    b.rs\n    c.rs\nicons/ (10 png)\nREADME.md\n```\n</project_structure>";
+        let (added, removed) = tree_delta(root, old, new);
+        assert_eq!(added, vec!["src/util/c.rs".to_string()]);
+        assert_eq!(removed, vec!["src/a.rs".to_string()]);
+    }
+
+    #[test]
+    fn anchor_sig_survives_result_shrinking() {
+        let mk = |body: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: body.into(),
+                is_error: false,
+            }],
+        };
+        assert_eq!(message_anchor_sig(&mk("full body")), message_anchor_sig(&mk("[stub]")));
     }
 }

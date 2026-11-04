@@ -23,7 +23,8 @@ import { AskUserInline } from './ask-user-inline';
 import { cn } from '@/lib/utils';
 import { useRelativeTime } from '@/lib/relative-time';
 import { useCodeCopyButtons } from '@/lib/code-copy';
-import { handleMarkdownLinkClick, linkifyFilePaths, openWorkspaceFile } from '@/lib/markdown-assets';
+import { handleMarkdownLinkClick } from '@/lib/markdown-assets';
+import { activeChatRoot, handleFileLinkClick, linkifyFilePaths } from '@/lib/file-links';
 import { useMermaidBlocks } from '@/lib/mermaid';
 
 // Bounded LRU-ish cache of rendered markdown, keyed by raw source text.
@@ -57,34 +58,29 @@ function renderMarkdown(text) {
 function MarkdownBlock({ text }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
   const ref = useRef(null);
-  const projectRoot = useAgent((s) => s.activeProject?.root || null);
+  // Subscribe so the handler re-binds when the viewed task/project changes.
+  const activeTaskId = useAgent((s) => s.activeTaskId);
+  const activeRoot = useAgent((s) => s.activeProject?.root || null);
 
   // Route link clicks through the shared markdown link handler (scheme
   // allow-listed shell.open for external URLs, editor tab for local paths).
   // Delegated on the wrapper rather than attached per-anchor because the HTML
   // is injected via dangerouslySetInnerHTML — React doesn't see the anchors.
   // In-page anchors (`#section`) keep their native behaviour. File-path spans
-  // tagged by linkifyFilePaths open the cited file (and line) in the editor.
+  // tagged by linkifyFilePaths open the cited file (and line) in the editor,
+  // resolved against the project that owns the chat's task (not whichever
+  // project happens to be picked in the agent panel).
   useEffect(() => {
     const el = ref.current;
     if (!el) return undefined;
     const onClick = (e) => {
-      const fileEl = e.target?.closest?.('[data-file-link]');
-      if (fileEl && el.contains(fileEl)) {
-        e.preventDefault();
-        e.stopPropagation();
-        openWorkspaceFile(
-          fileEl.dataset.path,
-          Number(fileEl.dataset.line) || null,
-          projectRoot,
-        );
-        return;
-      }
-      handleMarkdownLinkClick(e, projectRoot);
+      const root = activeChatRoot();
+      if (handleFileLinkClick(e, root)) return;
+      handleMarkdownLinkClick(e, root);
     };
     el.addEventListener('click', onClick);
     return () => el.removeEventListener('click', onClick);
-  }, [html, projectRoot]);
+  }, [html, activeTaskId, activeRoot]);
 
   // Add a hover copy button to each fenced code block in this message.
   useCodeCopyButtons(ref, [html]);

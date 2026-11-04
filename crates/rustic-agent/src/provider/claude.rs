@@ -101,13 +101,19 @@ impl AiProvider for ClaudeProvider {
             "messages": api_messages,
         });
 
+        // Tools + system are the stable head of the prefix: give them the 1h
+        // TTL (GA, no beta header) so a pause between user messages doesn't
+        // rewrite them. Message breakpoints keep the 5m default — Anthropic
+        // requires longer-TTL breakpoints to precede shorter ones, which holds
+        // because tools → system → messages is the prefix order.
+        let static_cache_control = static_prefix_cache_control(config.base_url.as_deref());
+
         if let Some(sys) = system_msg {
-            // System prompt as a cached text block — same 5-minute TTL.
             body["system"] = json!([
                 {
                     "type": "text",
                     "text": sys,
-                    "cache_control": { "type": "ephemeral" }
+                    "cache_control": static_cache_control.clone()
                 }
             ]);
         }
@@ -183,7 +189,7 @@ impl AiProvider for ClaudeProvider {
         let mut claude_tools: Vec<serde_json::Value> = Vec::new();
         let mut saw_web_search = false;
         let mut saw_web_fetch = false;
-        for t in tools {
+        for t in super::sorted_tools(tools) {
             match t.name.as_str() {
                 "web_search" => {
                     saw_web_search = true;
@@ -221,13 +227,8 @@ impl AiProvider for ClaudeProvider {
         if !claude_tools.is_empty() {
             // Mark the last tool with cache_control — caches the entire tool
             // definitions block (which rarely changes between turns).
-            let last_idx = claude_tools.len() - 1;
-            for (i, t) in claude_tools.iter_mut().enumerate() {
-                if i == last_idx {
-                    if let Some(obj) = t.as_object_mut() {
-                        obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
-                    }
-                }
+            if let Some(obj) = claude_tools.last_mut().and_then(|t| t.as_object_mut()) {
+                obj.insert("cache_control".to_string(), static_cache_control);
             }
             body["tools"] = json!(claude_tools);
         }
@@ -292,7 +293,9 @@ impl AiProvider for ClaudeProvider {
             send_ms = request_start.elapsed().as_millis() as u64,
             "[stream] claude HTTP headers returned — beginning SSE parse"
         );
-        parse_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
+        let r = parse_sse_stream(resp, stream_cb, config.cancel_token.clone()).await?;
+        super::log_request_usage("Claude", &config.model, &r.usage);
+        Ok(r)
     }
 
     fn name(&self) -> &str {
@@ -514,14 +517,11 @@ async fn parse_sse_stream(
         for line in lines {
             {
                 {
-                    if !line.starts_with("data: ") {
-                        continue;
-                    }
-
-                    let data = &line["data: ".len()..];
-                    if data == "[DONE]" {
-                        break 'stream;
-                    }
+                    let data = match super::classify_sse_line(&line) {
+                        super::SseLine::Skip => continue,
+                        super::SseLine::Done => break 'stream,
+                        super::SseLine::Data(d) => d,
+                    };
 
                     event_count.fetch_add(1, Ordering::Relaxed);
                     let event: SseEvent = match serde_json::from_str(data) {
@@ -536,7 +536,7 @@ async fn parse_sse_stream(
                             // "thinking or redacted_thinking blocks ... cannot
                             // be modified" 400 on the next turn. Log the raw
                             // payload (truncated) so future drops are visible.
-                            let preview = &data[..data.len().min(500)];
+                            let preview: String = data.chars().take(500).collect();
                             tracing::warn!(
                                 "[claude] SSE event failed to deserialize: {} — raw: {:?}",
                                 e,
@@ -965,14 +965,16 @@ async fn parse_sse_stream(
         "[stream] claude SSE stream finished"
     );
 
+    let usage = TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    };
+
     Ok(AiResponse {
         content,
-        usage: TokenUsage {
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-        },
+        usage,
         stop_reason,
         actual_cost_usd: None,
         served_provider: None,
@@ -983,7 +985,6 @@ async fn parse_sse_stream(
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-#[allow(dead_code)]
 enum SseEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: SseMessage },
@@ -1016,12 +1017,13 @@ struct SseMessage {
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-#[allow(dead_code)]
 enum SseContentBlock {
+    // Initial text/thinking arrive via deltas; the start payload is ignored
+    // (serde skips unknown fields).
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {},
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {},
     /// Redacted reasoning — Anthropic safety stripped the text but the signed
     /// `data` payload MUST round-trip unchanged on the next request, otherwise
     /// the API rejects with "thinking or redacted_thinking blocks in the
@@ -1191,6 +1193,19 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Va
     }
 
     (system, api_msgs)
+}
+
+/// `cache_control` for the tools + system breakpoints. Native Anthropic API →
+/// 1h TTL (GA, no beta header). Custom gateways (base_url not
+/// api.anthropic.com) keep the plain 5m marker since some proxies reject the
+/// `ttl` field and the auto-learn path can't strip a nested key.
+fn static_prefix_cache_control(base_url: Option<&str>) -> serde_json::Value {
+    let native = base_url.map(|u| u.contains("api.anthropic.com")).unwrap_or(true);
+    if native {
+        json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        json!({ "type": "ephemeral" })
+    }
 }
 
 /// Stamp `cache_control: ephemeral` on a "rolling stable prefix" breakpoint —
@@ -2089,5 +2104,37 @@ mod foreign_thinking_tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["type"], "tool_use");
         assert_eq!(arr[0]["id"], "call_x");
+    }
+}
+
+#[cfg(test)]
+mod static_ttl_tests {
+    use super::*;
+
+    #[test]
+    fn native_api_gets_1h_gateways_keep_default() {
+        assert_eq!(static_prefix_cache_control(None), json!({ "type": "ephemeral", "ttl": "1h" }));
+        assert_eq!(
+            static_prefix_cache_control(Some("https://api.anthropic.com/v1/messages")),
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        assert_eq!(
+            static_prefix_cache_control(Some("https://my-gateway.example/v1/messages")),
+            json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn content_block_start_without_text_field_still_parses() {
+        let e: SseEvent = serde_json::from_str(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        )
+        .unwrap();
+        assert!(matches!(e, SseEvent::ContentBlockStart { content_block: SseContentBlock::Text {}, .. }));
+        let e: SseEvent = serde_json::from_str(
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        )
+        .unwrap();
+        assert!(matches!(e, SseEvent::ContentBlockStart { content_block: SseContentBlock::Thinking {}, .. }));
     }
 }

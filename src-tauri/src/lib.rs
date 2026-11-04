@@ -7,7 +7,9 @@ mod logging;
 mod macos_env;
 #[cfg(target_os = "macos")]
 mod macos_window;
+mod media_protocol;
 mod path_scope;
+mod screen_lock;
 mod secrets;
 mod state;
 mod sync_ext;
@@ -32,7 +34,12 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init());
+        .plugin(tauri_plugin_process::init())
+        // Streams large audio previews from disk with Range support.
+        .register_asynchronous_uri_scheme_protocol(media_protocol::SCHEME, |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            std::thread::spawn(move || responder.respond(media_protocol::handle(&app, &request)));
+        });
 
     // Single-instance is RELEASE-ONLY. The lock keys off the bundle
     // identifier, which dev and production share — with it installed, starting
@@ -490,6 +497,7 @@ pub fn run() {
             commands::lan_sync::lan_respond_transfer,
             commands::lan_sync::lan_sync_items,
             commands::lan_sync::lan_set_internet_mode,
+            commands::lan_sync::lan_set_local_reach,
             commands::lan_sync::lan_cancel_outgoing,
             commands::lan_sync::lan_list_files,
             commands::lan_sync::lan_preview_file,

@@ -24,8 +24,11 @@ export function useLan() {
   useEffect(() => {
     if (!enabled) { setDevices([]); return undefined; }
     refreshDevices();
-    const t = setInterval(refreshDevices, 3000);
-    return () => clearInterval(t);
+    // Skip ticks while the window is hidden; catch up as soon as it's visible.
+    const t = setInterval(() => { if (!document.hidden) refreshDevices(); }, 3000);
+    const onVis = () => { if (!document.hidden) refreshDevices(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVis); };
   }, [enabled, refreshDevices]);
   useEffect(() => {
     const unlistens = [];

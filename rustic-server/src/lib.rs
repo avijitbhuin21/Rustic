@@ -154,7 +154,7 @@ fn refuse_burned_password(config: &ServerConfig) -> anyhow::Result<()> {
         "change_me",
         "change-me-please",
         "password",
-        // NOTE: the run-server.ps1 dev default "rustic" is deliberately NOT
+        // NOTE: the run-server.mjs dev default "rustic" is deliberately NOT
         // here — the script itself refuses -BindAll with it unless the caller
         // passes an explicit -AllowInsecurePassword override.
         "example",

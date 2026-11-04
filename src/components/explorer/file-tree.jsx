@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useImperativeHandle, useMemo, useRef, us
 import { Tree } from 'react-arborist';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { FileNode } from './file-node';
 import { contextMenuState } from './context-menu-state';
 import { createFile, createFolder, readDir, renameEntry, moveEntry, deleteEntry, useExplorer } from '@/state/explorer';
@@ -177,7 +178,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
         console.error('createAndEdit: tree.edit failed', e);
       }
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   }, [rootPath, refreshDir]);
 
@@ -201,7 +202,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
       await refreshDir(srcParentOrig);
       await refreshDir(destDir);
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   }, [refreshDir]);
 
@@ -289,7 +290,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
         toast.success(`Deleted ${node.data.name}`);
         await refreshDir(parentDir);
       } catch (e) {
-        toast.error(String(e), { action: { label: 'Retry', onClick: runDelete } });
+        toastError(null, e, { action: { label: 'Retry', onClick: runDelete } });
       }
     };
     await runDelete();
@@ -494,13 +495,13 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
               await renameEntry(newPath, oldName);
               await refreshDir(parentDir);
             } catch (e) {
-              toast.error(String(e));
+              toastError(null, e);
             }
           },
         },
       });
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   }, [refreshDir]);
 

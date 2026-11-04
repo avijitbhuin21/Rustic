@@ -11,15 +11,6 @@ export const SLASH_COMMANDS = [
   },
 ];
 
-/** Returns registry entries matching a slash-menu query prefix. */
-export function matchSlashCommands(query) {
-  const q = (query || '').trim().toLowerCase();
-  if (!q) return SLASH_COMMANDS;
-  return SLASH_COMMANDS.filter(
-    (c) => c.name.startsWith(q) || c.description.toLowerCase().includes(q),
-  );
-}
-
 /** Parses submitted text into { command, args } when it invokes a registered command. */
 export function parseSlashCommand(text) {
   const m = /^\/([a-z][\w-]*)(?:\s+([\s\S]*))?$/i.exec((text || '').trim());

@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { isTauriAvailable as isTauri } from '@/lib/platform';
+import { useLockedScroll } from '@/lib/use-locked-scroll';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -231,6 +232,13 @@ export function RegisterModelModal({
   const orLoad = useOpenRouterSpecs((s) => s.load);
   const orLoading = useOpenRouterSpecs((s) => s.loading);
   const [templateOpen, setTemplateOpen] = useState(false);
+  const templatePickerRef = useRef(null);
+  useLockedScroll(templatePickerRef, '[cmdk-list]', templateOpen);
+  /** Keeps the best matches visible: jump the result list back to the top on every search edit. */
+  const resetTemplateScroll = () => {
+    const list = templatePickerRef.current?.querySelector('[cmdk-list]');
+    if (list) list.scrollTop = 0;
+  };
 
   const existing = modelId ? customModels[modelId] : null;
   const isEdit = !!existing;
@@ -535,13 +543,20 @@ export function RegisterModelModal({
                   </Button>
                 </PopoverTrigger>
                 <PopoverContent
+                  ref={templatePickerRef}
                   align="start"
                   collisionPadding={8}
                   className="w-[var(--radix-popover-trigger-width)] gap-0 p-0"
                 >
                   <Command>
-                    <CommandInput placeholder="Search models…" />
-                    <CommandList className="max-h-[min(320px,calc(var(--radix-popover-content-available-height)-3rem))] overscroll-contain [scrollbar-width:thin] [&::-webkit-scrollbar]:block">
+                    <CommandInput
+                      placeholder="Search models…"
+                      onValueChange={() => requestAnimationFrame(resetTemplateScroll)}
+                    />
+                    {/* Fixed height (not max-h): when the popover flips above the
+                        trigger, a list that shrank while filtering dragged the
+                        input + top matches down toward the trigger. */}
+                    <CommandList className="h-[min(320px,calc(var(--radix-popover-content-available-height)-3rem))] max-h-none overscroll-contain [scrollbar-width:thin] [&::-webkit-scrollbar]:block">
                       <CommandEmpty>
                         {orLoading ? 'Loading catalogue…' : 'No models found.'}
                       </CommandEmpty>

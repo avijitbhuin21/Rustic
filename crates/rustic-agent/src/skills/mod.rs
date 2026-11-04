@@ -15,6 +15,7 @@ pub enum SkillScope {
 /// Skills compiled into Rustic: (name, SKILL.md text).
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("rustic-themes", include_str!("builtin/rustic-themes.md")),
+    ("rustic-issues", include_str!("builtin/rustic-issues.md")),
 ];
 
 /// Text of built-in skill `name`.
@@ -285,6 +286,10 @@ mod tests {
         assert!(!s.description.is_empty());
         assert!(skill_body(builtin_skill_text("rustic-themes").unwrap()).contains("write_theme"));
         assert!(build_skills_system_section(&skills).contains("**rustic-themes** [built-in]"));
+        let issues = skills.iter().find(|s| s.name == "rustic-issues").expect("issues skill listed");
+        assert_eq!(issues.scope, SkillScope::Builtin);
+        let body = skill_body(builtin_skill_text("rustic-issues").unwrap());
+        assert!(body.contains("ask_user") && body.contains("/api/issues"));
 
         let dir = root.join(".rustic/skills/rustic-themes");
         std::fs::create_dir_all(&dir).unwrap();

@@ -79,8 +79,8 @@ impl OpenAiProvider {
         // `web_search` ToolUse + ToolResult pair — same UI treatment as
         // Anthropic's and Gemini's server-side web search.
         let mut saw_web_search = false;
-        let function_tools: Vec<&ToolDef> = tools
-            .iter()
+        let function_tools: Vec<&ToolDef> = super::sorted_tools(tools)
+            .into_iter()
             .filter(|t| {
                 if t.name == "web_search" {
                     saw_web_search = true;
@@ -110,6 +110,15 @@ impl OpenAiProvider {
             body["tools"] = json!(oai_tools);
         }
 
+        let is_openai_native = config
+            .base_url
+            .as_deref()
+            .map(|u| u.contains("api.openai.com"))
+            .unwrap_or(true);
+        if is_openai_native || super::is_openrouter(config) {
+            body["prompt_cache_key"] = json!(super::conversation_cache_key(config, messages));
+        }
+
         let builder = self
             .client
             .post(&url)
@@ -123,7 +132,110 @@ impl OpenAiProvider {
             super::BodyDialect::OpenAiResponses,
         )
         .await?;
-        parse_responses_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
+        let r = parse_responses_sse_stream(resp, stream_cb, config.cancel_token.clone()).await?;
+        super::log_request_usage("OpenAI", &config.model, &r.usage);
+        Ok(r)
+    }
+}
+
+/// Which upstream cache dialect an OpenRouter model id routes to.
+#[derive(Debug, PartialEq)]
+enum OpenRouterCacheFamily {
+    Anthropic,
+    Gemini,
+}
+
+fn openrouter_cache_family(model: &str) -> Option<OpenRouterCacheFamily> {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("anthropic/") || m.contains("claude") {
+        Some(OpenRouterCacheFamily::Anthropic)
+    } else if m.starts_with("google/") && m.contains("gemini") {
+        Some(OpenRouterCacheFamily::Gemini)
+    } else {
+        None
+    }
+}
+
+/// Put `cache_control` on the last stable text part of one chat message.
+/// A string body is converted to a text-part array; the volatile
+/// `<project_structure>` tail (joined into the last user message) is split
+/// into its own unmarked part so the breakpoint sits before it. Returns
+/// false when the message has no markable text.
+fn mark_openrouter_cache_part(msg: &mut serde_json::Value, cc: &serde_json::Value) -> bool {
+    let tree_open = crate::system_prompt::PROJECT_TREE_OPEN;
+    let Some(content) = msg.get_mut("content") else {
+        return false;
+    };
+    match content {
+        serde_json::Value::String(s) => {
+            let (head, tree) = match s.find(tree_open) {
+                Some(i) => (s[..i].trim_end_matches('\n').to_string(), Some(s[i..].to_string())),
+                None => (s.clone(), None),
+            };
+            if head.trim().is_empty() {
+                return false;
+            }
+            let mut parts = vec![json!({ "type": "text", "text": head, "cache_control": cc })];
+            if let Some(t) = tree {
+                parts.push(json!({ "type": "text", "text": t }));
+            }
+            *content = json!(parts);
+            true
+        }
+        serde_json::Value::Array(parts) => {
+            let target = parts.iter_mut().rev().find(|p| {
+                p.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && p.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|t| !t.trim().is_empty() && !t.starts_with(tree_open))
+                        .unwrap_or(false)
+            });
+            match target.and_then(|p| p.as_object_mut()) {
+                Some(obj) => {
+                    obj.insert("cache_control".to_string(), cc.clone());
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// OpenRouter prompt caching for models whose upstream needs explicit
+/// breakpoints. Anthropic: system (1h TTL) + the two most recent stable
+/// messages (rolling prefix, 5m) — 3 of Anthropic's 4 breakpoints. Gemini:
+/// OpenRouter honours only the last breakpoint and bills cache storage, so
+/// mark just the system prompt (tools precede it, so they are cached too).
+/// Other families (OpenAI, DeepSeek, Grok…) cache automatically.
+fn apply_openrouter_cache_control(msgs: &mut [serde_json::Value], model: &str) {
+    let Some(family) = openrouter_cache_family(model) else {
+        return;
+    };
+    let static_cc = match family {
+        OpenRouterCacheFamily::Anthropic => json!({ "type": "ephemeral", "ttl": "1h" }),
+        OpenRouterCacheFamily::Gemini => json!({ "type": "ephemeral" }),
+    };
+    if let Some(first) = msgs.first_mut() {
+        if first.get("role").and_then(|r| r.as_str()) == Some("system") {
+            mark_openrouter_cache_part(first, &static_cc);
+        }
+    }
+    if family != OpenRouterCacheFamily::Anthropic {
+        return;
+    }
+    let rolling_cc = json!({ "type": "ephemeral" });
+    let mut marked = 0;
+    for msg in msgs.iter_mut().rev() {
+        if marked == 2 {
+            break;
+        }
+        if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+            continue;
+        }
+        if mark_openrouter_cache_part(msg, &rolling_cc) {
+            marked += 1;
+        }
     }
 }
 
@@ -239,13 +351,9 @@ impl AiProvider for OpenAiProvider {
         // provider. Empty / None → no `provider` field, so OpenRouter routes
         // across all providers as usual. Gated on the OpenRouter base URL so the
         // field never leaks to other OpenAI-compatible hosts that would reject it.
+        let openrouter = super::is_openrouter(config);
         if let Some(providers) = config.allowed_providers.as_ref().filter(|p| !p.is_empty()) {
-            let is_openrouter = config
-                .base_url
-                .as_deref()
-                .map(|u| u.contains("openrouter.ai"))
-                .unwrap_or(false);
-            if is_openrouter {
+            if openrouter {
                 body["provider"] = json!({
                     "order": providers,
                     "allow_fallbacks": false,
@@ -253,9 +361,29 @@ impl AiProvider for OpenAiProvider {
             }
         }
 
+        // Prompt-cache routing key. OpenAI uses it to pin a conversation to
+        // the same cache shard; OpenRouter uses it as the provider sticky-
+        // routing key so follow-ups hit the upstream holding the warm cache.
+        // Only sent where the field is known to be accepted.
+        let is_openai_native = config
+            .base_url
+            .as_deref()
+            .map(|u| u.contains("api.openai.com"))
+            .unwrap_or(true);
+        if is_openai_native || openrouter {
+            body["prompt_cache_key"] = json!(super::conversation_cache_key(config, messages));
+        }
+        if openrouter {
+            // Real cost + cached-token counts in the final usage chunk.
+            body["usage"] = json!({ "include": true });
+            if let Some(msgs) = body["messages"].as_array_mut() {
+                apply_openrouter_cache_control(msgs, &config.model);
+            }
+        }
+
         if !tools.is_empty() {
-            let oai_tools: Vec<serde_json::Value> = tools
-                .iter()
+            let oai_tools: Vec<serde_json::Value> = super::sorted_tools(tools)
+                .into_iter()
                 .map(|t| {
                     json!({
                         "type": "function",
@@ -283,7 +411,9 @@ impl AiProvider for OpenAiProvider {
             super::BodyDialect::OpenAiChat,
         )
         .await?;
-        parse_completions_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
+        let r = parse_completions_sse_stream(resp, stream_cb, config.cancel_token.clone()).await?;
+        super::log_request_usage("OpenAI", &config.model, &r.usage);
+        Ok(r)
     }
 
     fn name(&self) -> &str {
@@ -387,27 +517,17 @@ where
         for line in lines {
             {
                 {
-                    if !line.starts_with("data: ") {
-                        continue;
-                    }
-
-                    let data = &line["data: ".len()..];
-                    if data == "[DONE]" {
-                        saw_done = true;
-                        break 'outer;
-                    }
-
-                    let v: serde_json::Value = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(e) => {
+                    let v: serde_json::Value = match super::parse_sse_json(&line, "openai") {
+                        super::SseJson::Skip => continue,
+                        super::SseJson::Done => {
+                            saw_done = true;
+                            break 'outer;
+                        }
+                        super::SseJson::Invalid => {
                             dropped_lines += 1;
-                            tracing::debug!(
-                                error = %e,
-                                preview = %&data[..data.len().min(200)],
-                                "[openai] dropped unparseable SSE data line"
-                            );
                             continue;
                         }
+                        super::SseJson::Value(v) => v,
                     };
 
                     // Usage chunk (comes with include_usage: true, often has no choices)
@@ -757,26 +877,12 @@ async fn parse_responses_sse_stream(
         for line in lines {
             {
                 {
-                    if !line.starts_with("data: ") {
-                        continue;
-                    }
-
-                    let data = &line["data: ".len()..];
-                    if data == "[DONE]" {
-                        break 'outer;
-                    }
-
-                    let v: serde_json::Value = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::debug!(
-                                error = %e,
-                                preview = %&data[..data.len().min(200)],
-                                "[openai-responses] dropped unparseable SSE data line"
-                            );
-                            continue;
-                        }
-                    };
+                    let v: serde_json::Value =
+                        match super::parse_sse_json(&line, "openai-responses") {
+                            super::SseJson::Skip | super::SseJson::Invalid => continue,
+                            super::SseJson::Done => break 'outer,
+                            super::SseJson::Value(v) => v,
+                        };
 
                     let event_type = match v.get("type").and_then(|t| t.as_str()) {
                         Some(t) => t,
@@ -1833,5 +1939,69 @@ mod stream_cut_tests {
         .await
         .expect("finish_reason alone marks a complete stream");
         assert!(matches!(r.stop_reason, StopReason::EndTurn));
+    }
+}
+
+#[cfg(test)]
+mod openrouter_cache_tests {
+    use super::*;
+
+    #[test]
+    fn family_detection() {
+        assert_eq!(openrouter_cache_family("anthropic/claude-sonnet-4.6"), Some(OpenRouterCacheFamily::Anthropic));
+        assert_eq!(openrouter_cache_family("google/gemini-2.5-pro"), Some(OpenRouterCacheFamily::Gemini));
+        assert_eq!(openrouter_cache_family("openai/gpt-5"), None);
+        assert_eq!(openrouter_cache_family("deepseek/deepseek-chat"), None);
+    }
+
+    fn convo() -> Vec<serde_json::Value> {
+        vec![
+            json!({ "role": "system", "content": "SYSTEM" }),
+            json!({ "role": "user", "content": "first" }),
+            json!({ "role": "assistant", "tool_calls": [{ "id": "c1" }] }),
+            json!({ "role": "tool", "tool_call_id": "c1", "content": "result" }),
+            json!({ "role": "user", "content": format!("latest\n{}\ntree", crate::system_prompt::PROJECT_TREE_OPEN) }),
+        ]
+    }
+
+    #[test]
+    fn anthropic_marks_system_1h_and_two_rolling_breakpoints_before_tree() {
+        let mut msgs = convo();
+        apply_openrouter_cache_control(&mut msgs, "anthropic/claude-opus-4.7");
+        assert_eq!(msgs[0]["content"][0]["cache_control"], json!({ "type": "ephemeral", "ttl": "1h" }));
+        assert_eq!(msgs[0]["content"][0]["text"], "SYSTEM");
+        // latest user message: split, stable head marked, tree tail unmarked
+        let last = msgs[4]["content"].as_array().unwrap();
+        assert_eq!(last[0]["text"], "latest");
+        assert_eq!(last[0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert!(last[1]["text"].as_str().unwrap().starts_with(crate::system_prompt::PROJECT_TREE_OPEN));
+        assert!(last[1].get("cache_control").is_none());
+        // tool result is the second rolling breakpoint; older messages untouched
+        assert_eq!(msgs[3]["content"][0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert_eq!(msgs[1]["content"], "first");
+        assert!(msgs[2].get("content").is_none());
+    }
+
+    #[test]
+    fn gemini_marks_only_system_and_others_untouched() {
+        let mut msgs = convo();
+        apply_openrouter_cache_control(&mut msgs, "google/gemini-2.5-flash");
+        assert_eq!(msgs[0]["content"][0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert!(msgs[4]["content"].is_string());
+        let mut msgs = convo();
+        let before = msgs.clone();
+        apply_openrouter_cache_control(&mut msgs, "openai/gpt-4.1");
+        assert_eq!(msgs, before);
+    }
+
+    #[test]
+    fn image_part_arrays_mark_last_text_part() {
+        let mut msgs = vec![json!({ "role": "user", "content": [
+            { "type": "text", "text": "look" },
+            { "type": "image_url", "image_url": { "url": "data:x" } }
+        ]})];
+        apply_openrouter_cache_control(&mut msgs, "anthropic/claude-sonnet-4.6");
+        assert!(msgs[0]["content"][0].get("cache_control").is_some());
+        assert!(msgs[0]["content"][1].get("cache_control").is_none());
     }
 }

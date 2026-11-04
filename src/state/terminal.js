@@ -76,6 +76,9 @@ export const useTerminal = create((set, get) => ({
   // reset every launch (same reason `order` isn't persisted), so overrides
   // live for the run only.
   labelOverrides: {},
+  // Bottom panel view: 'user' (your terminals) or 'agent' (every live agent terminal).
+  terminalView: 'user',
+  setTerminalView: (view) => set({ terminalView: view === 'agent' ? 'agent' : 'user' }),
   renameTerminal: (sessionId, name) =>
     set((s) => {
       const labelOverrides = { ...s.labelOverrides };

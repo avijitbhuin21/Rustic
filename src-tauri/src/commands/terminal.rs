@@ -321,11 +321,20 @@ pub fn spawn_session_monitor(
                     cmd_idle_since = None;
                 }
                 if is_agent || cmd_marker.is_some() {
-                    match rustic_terminal::process_has_children(pid) {
+                    // Two different questions: "is the agent's command done?"
+                    // follows the FOREGROUND job (a `cmd &` background job
+                    // leaves the shell at its prompt, accepting input), while
+                    // idle auto-close follows ANY child so a shell with a live
+                    // background job is never reclaimed.
+                    let has_children = rustic_terminal::process_has_children(pid);
+                    let cmd_busy = {
+                        let state = app.state::<AppState>();
+                        let m = state.terminal_manager.lock();
+                        m.ok().and_then(|m| m.command_busy(session_id))
+                    }
+                    .or(has_children);
+                    match cmd_busy {
                         Some(true) => {
-                            // A command is running — (re)arm and clear the timers.
-                            seen_running = true;
-                            idle_since = None;
                             if cmd_marker.is_some() {
                                 cmd_seen_running = true;
                                 cmd_idle_since = None;
@@ -355,6 +364,15 @@ pub fn spawn_session_monitor(
                                     }
                                 }
                             }
+                        }
+                        None => {}
+                    }
+                    match has_children {
+                        Some(true) => {
+                            seen_running = true;
+                            idle_since = None;
+                        }
+                        Some(false) => {
                             if is_agent && seen_running {
                                 let since = idle_since.get_or_insert_with(Instant::now);
                                 if since.elapsed() >= IDLE_CLOSE_TIMEOUT {
@@ -365,7 +383,7 @@ pub fn spawn_session_monitor(
                         }
                         // Either the shell never ran anything yet, or we
                         // couldn't determine child state — leave it alone.
-                        _ => {}
+                        None => {}
                     }
                 }
             }
@@ -441,7 +459,7 @@ pub fn create_terminal(
     // validate_shell_program here because the resolver returns trusted
     // hardcoded paths (or PATH-resolved pwsh.exe), not user input.
     let shell_program =
-        shell_program.or_else(crate::commands::agent_terminals::preferred_agent_shell);
+        shell_program.or_else(crate::commands::agent_terminals::default_terminal_shell);
 
     // Pass the frontend-measured panel size to the PTY at spawn time so TUIs
     // that read window-size at startup (claude, etc.) don't lay out for a
@@ -605,11 +623,11 @@ fn detect_shells_blocking() -> Result<Vec<ShellInfo>, String> {
     Ok(shells)
 }
 
-/// Search PATH for an executable
+/// Search PATH for an executable (only the Windows shell probe needs it).
+#[cfg(target_os = "windows")]
 fn find_in_path(exe: &str) -> Option<String> {
     if let Ok(path_var) = std::env::var("PATH") {
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(separator) {
+        for dir in path_var.split(';') {
             let full = PathBuf::from(dir).join(exe);
             if full.exists() {
                 return Some(full.to_string_lossy().to_string());

@@ -1,0 +1,508 @@
+//! Editor buffer commands shared by both hosts. They operate on the shared
+//! `AppState` `buffers` / `highlighters` maps; hosts only parse arguments and
+//! wrap the result for their transport.
+
+use std::path::Path;
+
+use rustic_core::buffer::{BufferInfo, Edit};
+use rustic_core::syntax::{RenderedLine, SyntaxHighlighter};
+use serde::{Deserialize, Serialize};
+
+use crate::path_scope::validate_readable_path;
+use crate::state::AppState;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EditResponse {
+    pub line_count: usize,
+    pub is_modified: bool,
+}
+
+pub fn open_file(state: &AppState, path: &str) -> Result<BufferInfo, String> {
+    let file_path = Path::new(path);
+    validate_readable_path(file_path)?;
+
+    // Check if buffer already exists for this path
+    {
+        let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+        for buffer in buffers.values() {
+            if buffer.file_path.as_deref() == Some(file_path) {
+                return Ok(buffer.info());
+            }
+        }
+    }
+
+    let buffer = rustic_core::buffer::Buffer::from_file(file_path).map_err(|e| e.to_string())?;
+
+    let buffer_id = buffer.id;
+    let info = buffer.info();
+    let lang = buffer.language.as_deref().unwrap_or("unknown");
+    tracing::debug!(
+        "[SyntaxHighlight] open_file: path={:?} lang={} buffer_id={}",
+        path,
+        lang,
+        buffer_id
+    );
+
+    // Highlighter is created lazily on the first highlight_range / highlight_buffer call
+    // so we don't pay the tree-sitter grammar + query compilation cost on the response path.
+
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    buffers.insert(buffer_id, buffer);
+
+    Ok(info)
+}
+
+/// Ensure a highlighter exists in the map for this buffer, creating one based
+/// on the buffer's detected language if needed. Cheap if one already exists.
+/// Performs the (potentially expensive) `SyntaxHighlighter::new()` without
+/// holding the highlighters lock so other commands aren't blocked.
+fn ensure_highlighter(state: &AppState, buffer_id: u64) -> Result<(), String> {
+    {
+        let highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        if highlighters.contains_key(&buffer_id) {
+            return Ok(());
+        }
+    }
+    let language = {
+        let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+        let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+        buffer.language.clone()
+    };
+    let highlighter = language
+        .as_deref()
+        .and_then(SyntaxHighlighter::new)
+        .unwrap_or_else(SyntaxHighlighter::new_generic);
+    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    // If another command raced us and created one already, keep theirs to avoid
+    // discarding any cache it may have already populated.
+    highlighters.entry(buffer_id).or_insert(highlighter);
+    Ok(())
+}
+
+pub fn open_scratch_buffer(
+    state: &AppState,
+    title: &str,
+    content: &str,
+    language: Option<String>,
+) -> Result<BufferInfo, String> {
+    let mut buffer = rustic_core::buffer::Buffer::from_string(content);
+
+    // Use title as a synthetic file path so the tab shows a meaningful name
+    buffer.file_path = Some(std::path::PathBuf::from(title));
+    buffer.language = language.clone();
+
+    let buffer_id = buffer.id;
+
+    let highlighter = language
+        .as_deref()
+        .and_then(SyntaxHighlighter::new)
+        .unwrap_or_else(SyntaxHighlighter::new_generic);
+    {
+        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        highlighters.insert(buffer_id, highlighter);
+    }
+
+    let info = buffer.info();
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    buffers.insert(buffer_id, buffer);
+
+    Ok(info)
+}
+
+pub fn get_visible_lines(
+    state: &AppState,
+    buffer_id: u64,
+    start: usize,
+    end: usize,
+) -> Result<Vec<RenderedLine>, String> {
+    let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+
+    // Try to serve highlighted lines from cache.
+    // Use try_lock so we never block if highlight_buffer is running a parse.
+    if let Ok(highlighters) = state.highlighters.try_lock() {
+        if let Some(highlighter) = highlighters.get(&buffer_id) {
+            if let Some(lines) = highlighter.get_cached_range(start, end) {
+                return Ok(lines);
+            }
+        }
+    }
+
+    // No highlight cache available — return plain text instantly
+    let lines = (start..end.min(buffer.line_count()))
+        .map(|i| RenderedLine {
+            line_number: i + 1,
+            text: buffer.get_line(i).unwrap_or_default(),
+            spans: Vec::new(),
+        })
+        .collect();
+    Ok(lines)
+}
+
+/// Trigger a full Tree-sitter parse for a buffer.
+/// Returns true if highlighting was performed, false if no highlighter exists.
+/// The result is cached — subsequent get_visible_lines calls will return highlighted data.
+pub fn highlight_buffer(state: &AppState, buffer_id: u64) -> Result<bool, String> {
+    ensure_highlighter(state, buffer_id)?;
+
+    // Clone the rope so we don't hold the buffers lock during parsing.
+    // Ropey's clone is O(1) — it shares the underlying data via reference counting.
+    let rope_clone = {
+        let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+        let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+        buffer.rope.clone()
+    };
+
+    // Take the highlighter OUT of the map so we can drop the lock before the
+    // expensive Tree-sitter parse; other commands can proceed meanwhile.
+    let mut highlighter = {
+        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        match highlighters.remove(&buffer_id) {
+            Some(h) => h,
+            // Another concurrent highlight call has the highlighter; skip.
+            None => return Ok(false),
+        }
+    };
+
+    highlighter.ensure_highlighted(&rope_clone);
+
+    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    highlighters.insert(buffer_id, highlighter);
+    Ok(true)
+}
+
+/// Highlight only a specific line range of a buffer.
+/// Does a full Tree-sitter parse for correctness but only builds span data
+/// for the requested range — much faster than highlight_buffer for viewport use.
+pub fn highlight_range(
+    state: &AppState,
+    buffer_id: u64,
+    start_line: usize,
+    end_line: usize,
+) -> Result<Vec<RenderedLine>, String> {
+    ensure_highlighter(state, buffer_id)?;
+
+    let rope_clone = {
+        let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+        let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+        buffer.rope.clone()
+    };
+
+    // Check cache first (quick lock)
+    {
+        let highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        if let Some(highlighter) = highlighters.get(&buffer_id) {
+            if let Some(lines) = highlighter.get_cached_range(start_line, end_line) {
+                return Ok(lines);
+            }
+        }
+    }
+
+    // No cache — take highlighter out, parse without lock, put it back.
+    // If another command (highlight_buffer) has temporarily removed the highlighter,
+    // fall back to plain text instead of erroring.
+    let highlighter_opt = {
+        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        highlighters.remove(&buffer_id)
+    };
+
+    match highlighter_opt {
+        Some(mut highlighter) => {
+            let lines = highlighter.highlight_range(&rope_clone, start_line, end_line);
+            let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+            highlighters.insert(buffer_id, highlighter);
+            Ok(lines)
+        }
+        None => {
+            let line_count = rope_clone.len_lines();
+            let lines = (start_line..end_line.min(line_count))
+                .map(|i| {
+                    let text = rope_clone
+                        .line(i)
+                        .to_string()
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r')
+                        .to_string();
+                    RenderedLine {
+                        line_number: i + 1,
+                        text,
+                        spans: Vec::new(),
+                    }
+                })
+                .collect();
+            Ok(lines)
+        }
+    }
+}
+
+pub fn edit_buffer(
+    state: &AppState,
+    buffer_id: u64,
+    line: usize,
+    col: usize,
+    new_text: String,
+    delete_count: usize,
+) -> Result<EditResponse, String> {
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
+
+    // Convert line/col to byte offset
+    let line_idx = line.min(buffer.line_count().saturating_sub(1));
+    let line_start_byte = buffer.byte_offset_of_line(line_idx);
+    let line_text = buffer.get_line(line_idx).unwrap_or_default();
+
+    let col_byte: usize = line_text.chars().take(col).map(|c| c.len_utf8()).sum();
+    let byte_offset = line_start_byte + col_byte;
+
+    // Compute old_text (what will be deleted) by slicing only the affected
+    // range out of the rope — never materialize the entire buffer to a String.
+    let old_text = if delete_count > 0 {
+        let total_bytes = buffer.rope.len_bytes();
+        let end_byte = (byte_offset + delete_count).min(total_bytes);
+        let start_char = buffer.rope.byte_to_char(byte_offset);
+        let end_char = buffer.rope.byte_to_char(end_byte);
+        buffer.rope.slice(start_char..end_char).to_string()
+    } else {
+        String::new()
+    };
+
+    // Capture pre-edit positional info for the InputEdit. Tree-sitter wants
+    // (start_byte, old_end_byte, new_end_byte) plus row/col Points for each.
+    let old_text_len = old_text.len();
+    let new_text_len = new_text.len();
+    let start_row = buffer.rope.byte_to_line(byte_offset);
+    let start_line_byte = buffer.byte_offset_of_line(start_row);
+    let start_column = byte_offset - start_line_byte;
+
+    let old_end_byte = byte_offset + old_text_len;
+    let old_end_row = buffer
+        .rope
+        .byte_to_line(old_end_byte.min(buffer.rope.len_bytes()));
+    let old_end_line_byte = buffer.byte_offset_of_line(old_end_row);
+    let old_end_column = old_end_byte.saturating_sub(old_end_line_byte);
+
+    let edit = Edit {
+        byte_offset,
+        old_text,
+        new_text,
+    };
+
+    buffer.apply_edit(edit).map_err(|e| e.to_string())?;
+
+    let new_end_byte = byte_offset + new_text_len;
+    let new_end_row = buffer
+        .rope
+        .byte_to_line(new_end_byte.min(buffer.rope.len_bytes()));
+    let new_end_line_byte = buffer.byte_offset_of_line(new_end_row);
+    let new_end_column = new_end_byte.saturating_sub(new_end_line_byte);
+
+    // Snapshot the post-edit source for the highlighter while we still hold
+    // the buffers lock, then drop the lock before the (expensive) parse.
+    let new_source = buffer.rope.to_string();
+    drop(buffers);
+
+    // Push the edit into the persistent Tree-sitter tree so the next
+    // highlight call reparses incrementally instead of from scratch.
+    let input_edit = rustic_core::tree_sitter::InputEdit {
+        start_byte: byte_offset,
+        old_end_byte,
+        new_end_byte,
+        start_position: rustic_core::tree_sitter::Point {
+            row: start_row,
+            column: start_column,
+        },
+        old_end_position: rustic_core::tree_sitter::Point {
+            row: old_end_row,
+            column: old_end_column,
+        },
+        new_end_position: rustic_core::tree_sitter::Point {
+            row: new_end_row,
+            column: new_end_column,
+        },
+    };
+
+    {
+        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+            highlighter.apply_edit(input_edit, &new_source);
+        }
+    }
+
+    let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+    Ok(EditResponse {
+        line_count: buffer.line_count(),
+        is_modified: buffer.is_modified(),
+    })
+}
+
+/// Drops the cached highlight spans for `buffer_id`, if a highlighter exists.
+fn invalidate_highlights(state: &AppState, buffer_id: u64) {
+    if let Ok(mut highlighters) = state.highlighters.lock() {
+        if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+            highlighter.invalidate_cache();
+        }
+    }
+}
+
+/// Format a buffer's content using the built-in formatter.
+/// Returns the new line count if formatting changed anything, or None if no changes.
+pub fn format_buffer(
+    state: &AppState,
+    buffer_id: u64,
+    indent_size: usize,
+) -> Result<Option<usize>, String> {
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
+
+    let language = buffer.language.as_deref().unwrap_or("text").to_string();
+    let source = buffer.rope.to_string();
+
+    let (detected_use_tabs, detected_indent_size) = detect_indent_style(&source);
+    let effective_indent_size = if detected_indent_size > 0 {
+        detected_indent_size
+    } else {
+        indent_size
+    };
+
+    match rustic_core::formatter::format_code(
+        &source,
+        &language,
+        effective_indent_size,
+        detected_use_tabs,
+    ) {
+        Some(formatted) => {
+            tracing::warn!(
+                "[Formatter] buffer_id={} lang={} changed=true",
+                buffer_id,
+                language
+            );
+            buffer.rope = rustic_core::buffer::Rope::from_str(&formatted);
+            drop(buffers);
+            invalidate_highlights(state, buffer_id);
+
+            let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+            let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+            Ok(Some(buffer.line_count()))
+        }
+        None => {
+            tracing::warn!(
+                "[Formatter] buffer_id={} lang={} changed=false",
+                buffer_id,
+                language
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Saves the buffer. If the on-disk file changed since we loaded it and the
+/// caller did not pass force=true, refuses with the `EXTERNAL_CHANGE_DETECTED`
+/// sentinel so the frontend can prompt reload / overwrite / cancel.
+pub fn save_file(state: &AppState, buffer_id: u64, force: Option<bool>) -> Result<(), String> {
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
+    if !force.unwrap_or(false) && buffer.external_change_detected() {
+        return Err("EXTERNAL_CHANGE_DETECTED".to_string());
+    }
+    buffer.save().map_err(|e| e.to_string())
+}
+
+/// Re-stat the file backing this buffer and report whether it changed on disk.
+pub fn buffer_external_change(state: &AppState, buffer_id: u64) -> Result<bool, String> {
+    let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+    Ok(buffer.external_change_detected())
+}
+
+/// Discard in-memory edits and reload the buffer from disk.
+pub fn reload_buffer(state: &AppState, buffer_id: u64) -> Result<BufferInfo, String> {
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
+    buffer.reload_from_disk().map_err(|e| e.to_string())?;
+    drop(buffers);
+    invalidate_highlights(state, buffer_id);
+
+    let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+    Ok(buffer.info())
+}
+
+/// Undo (`redo == false`) or redo the last edit and invalidate highlights.
+pub fn undo_redo(state: &AppState, buffer_id: u64, redo: bool) -> Result<EditResponse, String> {
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
+    if redo {
+        buffer.redo();
+    } else {
+        buffer.undo();
+    }
+
+    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+        highlighter.invalidate_cache();
+    }
+
+    Ok(EditResponse {
+        line_count: buffer.line_count(),
+        is_modified: buffer.is_modified(),
+    })
+}
+
+pub fn close_buffer(state: &AppState, buffer_id: u64) -> Result<(), String> {
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    buffers.remove(&buffer_id);
+
+    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    highlighters.remove(&buffer_id);
+    Ok(())
+}
+
+/// Returns `(use_tabs, indent_size)` inferred from the first 500 lines;
+/// `indent_size == 0` means "no confident guess".
+pub fn detect_indent_style(source: &str) -> (bool, usize) {
+    let mut tab_lines: usize = 0;
+    let mut space_lines: usize = 0;
+    let mut space_run_counts: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+
+    for line in source.lines().take(500) {
+        if line.starts_with('\t') {
+            tab_lines += 1;
+        } else if line.starts_with("  ") {
+            let run = line.len() - line.trim_start_matches(' ').len();
+            if run > 0 {
+                space_lines += 1;
+                *space_run_counts.entry(run).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if tab_lines > space_lines {
+        return (true, 0);
+    }
+    if space_lines == 0 {
+        return (false, 0);
+    }
+    let most_common = space_run_counts
+        .into_iter()
+        .max_by_key(|&(_, count)| count)
+        .map(|(run, _)| run)
+        .unwrap_or(0);
+    (false, most_common)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_indent_style;
+
+    #[test]
+    fn detects_tabs_spaces_and_none() {
+        assert_eq!(detect_indent_style("fn a() {\n\tx();\n\ty();\n}\n"), (true, 0));
+        assert_eq!(
+            detect_indent_style("a:\n    b\n    c\n        d\n"),
+            (false, 4)
+        );
+        assert_eq!(detect_indent_style("plain\ntext\n"), (false, 0));
+    }
+}

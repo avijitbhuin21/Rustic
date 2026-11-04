@@ -22,6 +22,8 @@ pub struct LanStatus {
     pub tunnel_url: Option<String>,
     /// `"cloudflare"`, `"portforward"`, or `None` (LAN only).
     pub internet_mode: Option<String>,
+    /// Advertised on the local network via mDNS (false = internet only).
+    pub local_reach: bool,
     /// The listener's fixed port others forward to (for port-forwarding instructions).
     pub default_port: u16,
 }
@@ -112,7 +114,8 @@ pub async fn start(host: &HostRef, lan: &LanState) -> Result<(), String> {
             return Err(e);
         }
     };
-    match super::discovery::start(lan, &id, port) {
+    let advertise = host.data_dir().map(|d| super::is_local_reach(&d)).unwrap_or(true);
+    match super::discovery::start(lan, &id, port, advertise) {
         Ok(daemon) => lan.lock().mdns = Some(daemon),
         Err(e) => tracing::warn!("LAN discovery unavailable: {e}"),
     }
@@ -167,7 +170,8 @@ async fn watch_network(host: HostRef, lan: LanState, port: u16) {
         crate::transfers::network_changed();
         host.emitter().emit_json("lan-peers-changed", serde_json::json!({}));
         if ip.is_some() {
-            match super::discovery::start(&lan, &id, port) {
+            let advertise = host.data_dir().map(|d| super::is_local_reach(&d)).unwrap_or(true);
+            match super::discovery::start(&lan, &id, port, advertise) {
                 Ok(daemon) => lan.lock().mdns = Some(daemon),
                 Err(e) => tracing::warn!("LAN discovery restart failed: {e}"),
             }
@@ -258,6 +262,7 @@ pub async fn status(host: &HostRef, lan: &LanState) -> Result<LanStatus, String>
         ip,
         tunnel_url,
         internet_mode: host.data_dir().ok().and_then(|d| super::internet_mode(&d)),
+        local_reach: host.data_dir().map(|d| super::is_local_reach(&d)).unwrap_or(true),
         default_port: super::DEFAULT_PORT,
     })
 }
@@ -754,6 +759,23 @@ pub fn pair_code_for(host: &HostRef, lan: &LanState, device_id: &str) -> Result<
     })
 }
 
+/// User-facing text for a non-2xx answer to `POST /lan/pair` (409 handled
+/// separately). Tunnel / origin errors mean the request never reached a
+/// running listener, so no prompt was shown on the other machine.
+fn pair_failure_message(name: &str, status: u16, body: &serde_json::Value) -> String {
+    let theirs = body.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    match (status, theirs) {
+        (423, Some(e)) => e.to_string(),
+        (423, None) => format!("{name} is locked — try again once it's unlocked"),
+        (503, _) => format!("{name} has sync turned off — turn on Discoverable there and try again"),
+        (502 | 504 | 520..=530, _) => format!(
+            "{name}'s tunnel answered but Rustic there didn't (HTTP {status}) — check Rustic is running with sync on, or restart its tunnel"
+        ),
+        (_, Some(e)) => format!("{name} refused the pairing request: {e}"),
+        _ => format!("{name} refused the pairing request (HTTP {status})"),
+    }
+}
+
 /// Who to send a pairing request to: a discovered / manually added device,
 /// else (re-pairing) an already-paired one at an address that answers.
 async fn pair_target(host: &HostRef, lan: &LanState, device_id: &str) -> Result<super::Discovered, String> {
@@ -883,6 +905,15 @@ pub async fn pair(host: &HostRef, lan: &LanState, device_id: &str) -> Result<Str
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let theirs = body.get("version").and_then(|v| v.as_str()).map(str::to_string);
         return Err(super::version_mismatch_message(&target.name, theirs.as_deref()));
+    }
+    if !resp.status().is_success() {
+        // Before this, a locked machine, sync turned off there, or a dead
+        // tunnel all read as "declined" although no prompt was ever shown.
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let msg = pair_failure_message(&target.name, status.as_u16(), &body);
+        tracing::warn!(device = %target.device_id, status = status.as_u16(), "peer: pairing request refused: {msg}");
+        return Err(msg);
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     if !body
@@ -1044,8 +1075,26 @@ pub async fn list_projects(
     lan: &LanState,
     device_id: &str,
 ) -> Result<Vec<cs::RemoteProject>, String> {
-    let (client, base, token) = connect(host, lan, device_id).await?;
-    cs::list_projects_env(&client, &base, &token).await
+    // Through `peer_post_t` (→ `check_response`) so a 401 marks the device
+    // "needs re-pair" in the UI. `list_projects_env` only reported "HTTP 401",
+    // leaving the pairing looking healthy until both sides forgot it.
+    let rows: Vec<serde_json::Value> = peer_post_t(
+        host,
+        lan,
+        device_id,
+        "/api/list_projects",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(15),
+    )
+    .await?;
+    let s = |r: &serde_json::Value, k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.get("id")?.as_str()?.to_string();
+            Some(cs::RemoteProject { id, name: s(r, "name"), root_path: s(r, "root_path") })
+        })
+        .collect())
 }
 
 /// Metadata diff against a paired device.
@@ -1315,6 +1364,27 @@ pub fn stop_tunnel(lan: &LanState) {
     super::set_public_url(None);
 }
 
+/// Switch local-network (mDNS) advertising on/off, persisted. Browsing for
+/// other machines continues either way; restarts mDNS live when running.
+pub async fn set_local_reach(host: &HostRef, lan: &LanState, on: bool) -> Result<(), String> {
+    super::set_local_reach(&host.data_dir()?, on)?;
+    let running = {
+        let inner = lan.lock();
+        inner.identity.clone().filter(|_| inner.port != 0).map(|id| (id, inner.port))
+    };
+    if let Some((id, port)) = running {
+        if let Some(d) = lan.lock().mdns.take() {
+            let _ = d.shutdown();
+        }
+        match super::discovery::start(lan, &id, port, on) {
+            Ok(daemon) => lan.lock().mdns = Some(daemon),
+            Err(e) => tracing::warn!("LAN discovery restart failed: {e}"),
+        }
+    }
+    host.emitter().emit_json("lan-status-changed", serde_json::json!({}));
+    Ok(())
+}
+
 /// How other machines reach this one from outside the LAN: `"cloudflare"`,
 /// `"portforward"` or `"off"`. Remembered (see [`restore`]). Returns the
 /// tunnel URL in Cloudflare mode.
@@ -1361,12 +1431,25 @@ async fn peer_post<T: serde::de::DeserializeOwned>(
     path: &str,
     body: serde_json::Value,
 ) -> Result<T, String> {
+    peer_post_t(host, lan, device_id, path, body, std::time::Duration::from_secs(30)).await
+}
+
+/// [`peer_post`] with an explicit request timeout (folder listings use a
+/// short one so a dead route turns into a Retry instead of a long spinner).
+async fn peer_post_t<T: serde::de::DeserializeOwned>(
+    host: &HostRef,
+    lan: &LanState,
+    device_id: &str,
+    path: &str,
+    body: serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<T, String> {
     let peer = paired(host, device_id)?;
     let (client, base, token) = connect(host, lan, device_id).await?;
     let resp = client
         .post(format!("{base}{path}"))
         .bearer_auth(&token)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout)
         .json(&body)
         .send()
         .await
@@ -1389,7 +1472,15 @@ pub async fn list_files(
     project_id: &str,
     path: &str,
 ) -> Result<Vec<super::files::FsEntry>, String> {
-    peer_post(host, lan, device_id, "/api/fs/list", serde_json::json!({ "project_id": project_id, "path": path })).await
+    peer_post_t(
+        host,
+        lan,
+        device_id,
+        "/api/fs/list",
+        serde_json::json!({ "project_id": project_id, "path": path }),
+        std::time::Duration::from_secs(12),
+    )
+    .await
 }
 
 /// One file of a shared project, for the preview pane.
@@ -1520,7 +1611,9 @@ const STALL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Approval for `request`, cancellable from the tray.
 async fn approval_for(host: &HostRef, lan: &LanState, device_id: &str, request: &consent::TransferRequest, handle: &crate::transfers::Handle) -> Result<String, String> {
     let name = paired(host, device_id).map(|p| p.display_name()).unwrap_or_default();
-    handle.stage("waiting", "approval", &format!("Waiting for {name} to approve…"));
+    // File transfers into shared projects are approved without a prompt now, so
+    // this is just the handshake; a real prompt (or a "locked" refusal) still fits.
+    handle.stage("waiting", "approval", &format!("Connecting to {name}…"));
     let t = tokio::select! {
         t = request_approval(host, lan, device_id, request) => t,
         _ = handle.cancelled() => {
@@ -1613,11 +1706,17 @@ pub async fn pull_files(
     let total: u64 = entries.iter().map(|e| e.size).sum();
     let files = entries.iter().filter(|e| !e.is_dir).count() as u64;
     let handle = crate::transfers::begin(host.emitter(), "pull", &label, &peer.display_name(), total, files);
-    handle.set_can_pause();
+    let archive = total >= super::files::COMPRESS_MIN_BYTES;
+    if !archive {
+        handle.set_can_pause();
+    }
     let result = async {
         let request = consent::TransferRequest { kind: "pull".into(), files: items.clone(), total_bytes: Some(total), ..Default::default() };
         let mut ticket = approval_for(host, lan, device_id, &request, &handle).await?;
         let dest = std::path::PathBuf::from(&dest_dir);
+        if archive {
+            return pull_archive(host, lan, device_id, &peer, &ticket, &items, &dest, &opts, &handle).await;
+        }
         let mut tops: Vec<String> = Vec::new();
         for e in &entries {
             let top = e.rel.split('/').next().unwrap_or_default().to_string();
@@ -1684,6 +1783,8 @@ pub async fn push_files(
             Some((String::new(), abs.to_string_lossy().replace('\\', "/"), abs, name))
         })
         .collect();
+    let pack_items: Vec<super::files::PackItem> =
+        specs.iter().map(|s| super::files::PackItem { abs: s.2.clone(), name: s.3.clone() }).collect();
     let names: Vec<String> = specs.iter().map(|s| s.3.clone()).collect();
     let entries = tokio::task::spawn_blocking(move || super::files::manifest(&specs)).await.map_err(|e| e.to_string())?;
     let total: u64 = entries.iter().map(|e| e.size).sum();
@@ -1694,7 +1795,10 @@ pub async fn push_files(
         [] => "files".into(),
     };
     let handle = crate::transfers::begin(host.emitter(), "push", &label, &peer.display_name(), total, files);
-    handle.set_can_pause();
+    let archive = total >= super::files::COMPRESS_MIN_BYTES;
+    if !archive {
+        handle.set_can_pause();
+    }
     let result = async {
         let request = consent::TransferRequest {
             kind: "push".into(),
@@ -1703,6 +1807,13 @@ pub async fn push_files(
             ..Default::default()
         };
         let mut ticket = approval_for(host, lan, device_id, &request, &handle).await?;
+        if archive {
+            let dest = serde_json::json!({
+                "project_id": project_id, "dir": dir, "policy": opts.policy, "renames": opts.renames,
+                "total_bytes": total, "label": label,
+            });
+            return push_archive(host, lan, device_id, &peer, &ticket, pack_items, &dest, &handle).await;
+        }
         let wire: Vec<serde_json::Value> = entries
             .iter()
             .map(|e| serde_json::json!({ "rel": e.rel, "is_dir": e.is_dir, "size": e.size }))
@@ -1762,6 +1873,106 @@ pub async fn push_files(
     .await;
     handle.finish(result.as_ref().map(|_| None).map_err(|e| e.clone()));
     result
+}
+
+/// Human message for a non-resumable archive step that failed.
+fn fail_text(f: Fail) -> String {
+    match f {
+        Fail::Net(why) => format!("connection lost — large transfers restart from the beginning, send it again ({why})"),
+        Fail::Expired => "the approval expired — send it again".into(),
+        Fail::Interrupted => "cancelled".into(),
+        Fail::Fatal(e) => e,
+    }
+}
+
+/// JSON with every non-ASCII char `\u`-escaped, so it is a valid HTTP header value.
+fn ascii_json(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    for c in v.to_string().chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for u in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{:04x}", u));
+            }
+        }
+    }
+    out
+}
+
+/// Large pull: one compressed tar stream from `/api/fs/pull`, unpacked as it arrives (not resumable).
+#[allow(clippy::too_many_arguments)]
+async fn pull_archive(
+    host: &HostRef,
+    lan: &LanState,
+    device_id: &str,
+    peer: &Peer,
+    ticket: &str,
+    items: &[consent::RequestedFile],
+    dest: &std::path::Path,
+    opts: &FileTransferOpts,
+    handle: &std::sync::Arc<crate::transfers::Handle>,
+) -> Result<super::files::UnpackSummary, String> {
+    use futures_util::StreamExt;
+    let (c, b, t) = connect_with(host, lan, device_id, &[(super::TICKET_HEADER, ticket.to_string())]).await?;
+    let resp = classify(lan, peer, c.post(format!("{b}/api/fs/pull")).bearer_auth(&t).json(&serde_json::json!({ "items": items })).send().await)
+        .await
+        .map_err(fail_text)?;
+    let (reader, tx) = super::files::ChannelReader::new();
+    let (dest_c, policy, renames, h) = (dest.to_path_buf(), opts.policy, opts.renames.clone(), handle.clone());
+    let unpacker = tokio::task::spawn_blocking(move || {
+        super::files::unpack(reader, &dest_c, policy, &renames, &|| h.is_cancelled(), &|n| h.progress("downloading", n, 0))
+    });
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let item = chunk.map_err(|e| fail_text(Fail::Net(e.to_string())));
+        let failed = item.is_err();
+        if tx.send(item).await.is_err() || failed {
+            break;
+        }
+    }
+    drop(tx);
+    unpacker.await.map_err(|e| e.to_string())?
+}
+
+/// Large push: pack `items` into one zstd tar streamed to `/api/fs/push` (not resumable).
+#[allow(clippy::too_many_arguments)]
+async fn push_archive(
+    host: &HostRef,
+    lan: &LanState,
+    device_id: &str,
+    peer: &Peer,
+    ticket: &str,
+    items: Vec<super::files::PackItem>,
+    dest: &serde_json::Value,
+    handle: &std::sync::Arc<crate::transfers::Handle>,
+) -> Result<serde_json::Value, String> {
+    let (c, b, t) = connect_with(host, lan, device_id, &[(super::TICKET_HEADER, ticket.to_string())]).await?;
+    let (writer, rx) = super::files::ChannelWriter::new();
+    let h = handle.clone();
+    let packer = tokio::task::spawn_blocking(move || {
+        let mut writer = writer;
+        let res = super::files::pack(&items, &mut writer, true, &|| h.is_cancelled(), &|n| h.progress("uploading", n, 0));
+        if let Err(e) = &res {
+            writer.fail(e);
+        }
+        res
+    });
+    let resp = classify(
+        lan,
+        peer,
+        c.post(format!("{b}/api/fs/push"))
+            .bearer_auth(&t)
+            .header(super::listener::DEST_HEADER, ascii_json(dest))
+            .body(reqwest::Body::wrap_stream(super::files::channel_stream(rx)))
+            .send()
+            .await,
+    )
+    .await;
+    packer.await.map_err(|e| e.to_string())??;
+    let r = resp.map_err(fail_text)?;
+    r.json::<serde_json::Value>().await.map_err(|e| e.to_string())
 }
 
 /// Upload one local file from the offset the receiver reports.
@@ -1889,4 +2100,25 @@ pub fn set_meta_view(host: &HostRef, device_id: &str, allowed: bool) -> Result<(
     let p = peers.iter_mut().find(|p| p.device_id == device_id).ok_or("That device is not paired")?;
     p.meta_view = allowed;
     super::save_peers(&dir, &peers)
+}
+
+#[cfg(test)]
+mod pair_failure_tests {
+    use super::pair_failure_message;
+    use serde_json::json;
+
+    #[test]
+    fn pair_refusals_explain_why_no_prompt_appeared() {
+        let none = json!({});
+        assert_eq!(
+            pair_failure_message("Mac", 423, &json!({ "error": "Mac is locked — try again once it's unlocked" })),
+            "Mac is locked — try again once it's unlocked"
+        );
+        assert!(pair_failure_message("Mac", 423, &none).contains("locked"));
+        assert!(pair_failure_message("Mac", 503, &none).contains("sync turned off"));
+        assert!(pair_failure_message("Mac", 530, &none).contains("tunnel"));
+        assert!(pair_failure_message("Mac", 502, &none).contains("HTTP 502"));
+        assert!(pair_failure_message("Mac", 400, &json!({ "error": "bad" })).ends_with("bad"));
+        assert!(!pair_failure_message("Mac", 500, &none).contains("declined"));
+    }
 }

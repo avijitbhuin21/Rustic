@@ -27,6 +27,8 @@ import {
 } from '@/components/ui/context-menu';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
+import { copyText } from '@/lib/code-copy';
 import {
   deleteEntry,
   copyEntry,
@@ -197,7 +199,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
         toast.success(`Deleted ${node.data.name}`);
         tree?.props?.onRefresh?.(parentDir);
       } catch (e) {
-        toast.error(String(e), { action: { label: 'Retry', onClick: runDelete } });
+        toastError(null, e, { action: { label: 'Retry', onClick: runDelete } });
       }
     };
     await runDelete();
@@ -253,7 +255,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
         tree?.props?.onRefresh?.(parentDir);
         return;
       } catch (e) {
-        toast.error(String(e));
+        toastError(null, e);
         return;
       }
     }
@@ -314,7 +316,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   const handleCopyPath = async () => {
     contextMenuState.suppressActivate();
     try {
-      await navigator.clipboard.writeText(node.data.path);
+      await copyText(node.data.path);
     } catch {
       toast.error('Copy failed');
     }
@@ -325,7 +327,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
     try {
       await revealInFileManager(node.data.path);
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   };
 
@@ -337,7 +339,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
       const { useEditor } = await import('@/state/editor');
       useEditor.getState().openTerminal(info.id, info.label ?? node.data.name);
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   };
 
@@ -351,7 +353,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
       toast.dismiss(t);
       toast.success(isFolder ? `Downloaded "${node.data.name}.zip"` : `Downloaded "${node.data.name}"`);
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   };
 
@@ -368,7 +370,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
         tree?.props?.onRefresh?.(dstDir);
       }
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   };
 

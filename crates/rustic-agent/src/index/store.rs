@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Current state of the index build. Reported to callers so a tool result
 /// can flag "results are partial — still indexing" while the background
@@ -37,9 +37,35 @@ pub struct SymbolIndex {
     build_started: AtomicBool,
 }
 
+/// Compact stored form of a `SymbolEntry`. The file path lives once as the
+/// `by_file` key; the name is shared with the `by_name` key; scopes are
+/// interned per file. Public queries materialize `SymbolEntry` on demand.
+struct StoredEntry {
+    name: Arc<str>,
+    line: u32,
+    col: u32,
+    kind: SymbolKind,
+    scope: Option<Arc<str>>,
+}
+
+impl StoredEntry {
+    fn materialize(&self, file: &Path) -> SymbolEntry {
+        SymbolEntry {
+            name: self.name.to_string(),
+            file: file.to_path_buf(),
+            line: self.line,
+            col: self.col,
+            kind: self.kind,
+            scope: self.scope.as_deref().map(str::to_string),
+        }
+    }
+}
+
 struct SymbolIndexInner {
-    by_name: HashMap<String, Vec<SymbolEntry>>,
-    by_file: HashMap<PathBuf, Vec<SymbolEntry>>,
+    /// Owns every entry exactly once, grouped by file.
+    by_file: HashMap<Arc<Path>, Vec<StoredEntry>>,
+    /// Name → (file, index into that file's `by_file` vec), in insertion order.
+    by_name: HashMap<Arc<str>, Vec<(Arc<Path>, u32)>>,
     /// mtime recorded at the time the file was last indexed. Used by the
     /// `outline` tool (and any future caller) to decide whether to skip a
     /// refresh: if the on-disk mtime matches what's stored here, the
@@ -123,16 +149,7 @@ impl SymbolIndex {
             return;
         };
         // Step 1: drop any prior entries for this file from the by_name map.
-        if let Some(old) = inner.by_file.remove(&file) {
-            for entry in old {
-                if let Some(slot) = inner.by_name.get_mut(&entry.name) {
-                    slot.retain(|e| e.file != file);
-                    if slot.is_empty() {
-                        inner.by_name.remove(&entry.name);
-                    }
-                }
-            }
-        }
+        inner.remove_file_entries(&file);
         // Always update mtime so a file that legitimately indexed to "no
         // symbols" doesn't get re-parsed on every outline call. This is
         // separate from `by_file` so the freshness check works even when
@@ -140,20 +157,37 @@ impl SymbolIndex {
         if let Some(m) = mtime {
             inner.by_file_mtime.insert(file.clone(), m);
         }
-        // Step 2: insert the new entries. We keep one canonical copy in
-        // by_file and clone into by_name so multi-name lookups don't have
-        // to follow indirections.
+        // Step 2: insert the new entries once (in by_file); by_name holds
+        // (file, index) references. Names and scopes are interned so the
+        // by_name key and the stored entry share one allocation.
         if entries.is_empty() {
             return;
         }
-        inner.by_file.insert(file.clone(), entries.clone());
-        for entry in entries {
+        let file: Arc<Path> = Arc::from(file);
+        let mut scopes: HashMap<String, Arc<str>> = HashMap::new();
+        let mut stored = Vec::with_capacity(entries.len());
+        for (i, entry) in entries.into_iter().enumerate() {
+            let name: Arc<str> = match inner.by_name.get_key_value(entry.name.as_str()) {
+                Some((k, _)) => Arc::clone(k),
+                None => Arc::from(entry.name.as_str()),
+            };
+            let scope = entry.scope.map(|s| {
+                Arc::clone(scopes.entry(s).or_insert_with_key(|k| Arc::from(k.as_str())))
+            });
             inner
                 .by_name
-                .entry(entry.name.clone())
+                .entry(Arc::clone(&name))
                 .or_default()
-                .push(entry);
+                .push((Arc::clone(&file), i as u32));
+            stored.push(StoredEntry {
+                name,
+                line: entry.line,
+                col: entry.col,
+                kind: entry.kind,
+                scope,
+            });
         }
+        inner.by_file.insert(file, stored);
     }
 
     /// Returns true when the symbol index already reflects `file` at the
@@ -177,16 +211,7 @@ impl SymbolIndex {
         let Ok(mut inner) = self.inner.write() else {
             return;
         };
-        if let Some(old) = inner.by_file.remove(file) {
-            for entry in old {
-                if let Some(slot) = inner.by_name.get_mut(&entry.name) {
-                    slot.retain(|e| e.file != file);
-                    if slot.is_empty() {
-                        inner.by_name.remove(&entry.name);
-                    }
-                }
-            }
-        }
+        inner.remove_file_entries(file);
         // Drop the mtime entry too so a later re-creation of the file with
         // the same on-disk mtime (rare but possible) triggers a fresh index
         // pass rather than incorrectly short-circuiting.
@@ -199,14 +224,14 @@ impl SymbolIndex {
         let Ok(inner) = self.inner.read() else {
             return Vec::new();
         };
-        let Some(entries) = inner.by_name.get(name) else {
+        let Some(refs) = inner.by_name.get(name) else {
             return Vec::new();
         };
-        entries
-            .iter()
-            .filter(|e| kind.map(|k| e.kind == k).unwrap_or(true))
+        refs.iter()
+            .filter_map(|r| inner.resolve(r))
+            .filter(|(e, _)| kind.map(|k| e.kind == k).unwrap_or(true))
             .take(limit)
-            .cloned()
+            .map(|(e, f)| e.materialize(f))
             .collect()
     }
 
@@ -226,15 +251,15 @@ impl SymbolIndex {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for (name, entries) in inner.by_name.iter() {
+        for (name, refs) in inner.by_name.iter() {
             if !name.to_ascii_lowercase().contains(&needle_lower) {
                 continue;
             }
-            for entry in entries {
+            for (entry, file) in refs.iter().filter_map(|r| inner.resolve(r)) {
                 if kind.map(|k| entry.kind != k).unwrap_or(false) {
                     continue;
                 }
-                out.push(entry.clone());
+                out.push(entry.materialize(file));
                 if out.len() >= limit {
                     return out;
                 }
@@ -248,9 +273,35 @@ impl SymbolIndex {
         let Ok(inner) = self.inner.read() else {
             return Vec::new();
         };
-        let mut out = inner.by_file.get(file).cloned().unwrap_or_default();
+        let mut out: Vec<SymbolEntry> = match inner.by_file.get_key_value(file) {
+            Some((f, entries)) => entries.iter().map(|e| e.materialize(f)).collect(),
+            None => Vec::new(),
+        };
         out.sort_by_key(|e| (e.line, e.col));
         out
+    }
+}
+
+impl SymbolIndexInner {
+    fn resolve<'a>(&'a self, (file, idx): &'a (Arc<Path>, u32)) -> Option<(&'a StoredEntry, &'a Path)> {
+        self.by_file
+            .get(file)
+            .and_then(|v| v.get(*idx as usize))
+            .map(|e| (e, &**file))
+    }
+
+    fn remove_file_entries(&mut self, file: &Path) {
+        let Some(old) = self.by_file.remove(file) else {
+            return;
+        };
+        for entry in old {
+            if let Some(slot) = self.by_name.get_mut(&*entry.name) {
+                slot.retain(|(f, _)| &**f != file);
+                if slot.is_empty() {
+                    self.by_name.remove(&*entry.name);
+                }
+            }
+        }
     }
 }
 

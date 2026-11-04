@@ -201,6 +201,16 @@ pub async fn lan_sync_items(
     ops::sync_items(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, &direction, projects, meta).await
 }
 
+/// Advertise this machine on the local network (mDNS) or not — "internet only" when off.
+#[tauri::command]
+pub async fn lan_set_local_reach(
+    app: AppHandle,
+    lan: State<'_, LanState>,
+    enabled: bool,
+) -> Result<(), String> {
+    ops::set_local_reach(&DesktopPeerHost::arc(&app), lan.inner(), enabled).await
+}
+
 /// `"cloudflare"` | `"portforward"` | `"off"`; returns the tunnel URL in
 /// Cloudflare mode.
 #[tauri::command]

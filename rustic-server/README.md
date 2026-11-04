@@ -27,21 +27,23 @@ browser ──HTTP POST /api/<cmd>──▶ axum ──▶ ServerContext ──�
 
 ## Quick start (local)
 
-### Windows — one command
+### One command (Windows / macOS / Linux)
 
-The repo ships a runner that builds the web bundle + server, persists a session
-secret, sets the env, and starts the server (binds `127.0.0.1`, a secure context
-so clipboard/mic work):
+The repo ships a cross-platform Node runner that builds the web bundle + server,
+persists a session secret, sets the env, and starts the server (binds
+`127.0.0.1`, a secure context so clipboard/mic work):
 
-```powershell
-.\scripts\run-server.ps1                 # builds everything; password defaults to "rustic"
-.\scripts\run-server.ps1 -SkipWebBuild   # reuse an existing dist/ (skips the ~2 min web build)
-.\scripts\run-server.ps1 -Password hunter2 -Port 9000 -Release
+```bash
+node scripts/run-server.mjs                    # builds everything; password defaults to "rustic"
+node scripts/run-server.mjs --skip-web-build   # reuse an existing dist/ (skips the ~2 min web build)
+node scripts/run-server.mjs --password hunter2 --port 9000 --release
 ```
 
 Then open the URL it prints (e.g. `http://127.0.0.1:8787`) and log in. Stop with
-Ctrl-C. Flags: `-Password`, `-Port`, `-DataDir`, `-StaticDir`, `-Release`,
-`-SkipWebBuild`, `-BindAll`. Full help: `Get-Help .\scripts\run-server.ps1 -Detailed`.
+Ctrl-C. Flags: `--password`, `--port`, `--data-dir`, `--static-dir`, `--release`,
+`--skip-web-build`, `--bind-all`, `--allow-insecure-password` (the old
+PowerShell spellings like `-SkipWebBuild` still work). Full help:
+`node scripts/run-server.mjs --help`.
 
 ### Manual (any OS)
 

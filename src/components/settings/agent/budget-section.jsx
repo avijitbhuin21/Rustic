@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -73,7 +74,7 @@ export function BudgetSection() {
         softTurnLimit: softTurnEnabled ? Math.max(1, Number(softTurnLimit) || 50) : null,
       });
       toast.success('Budget saved');
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
   };
 
   return (

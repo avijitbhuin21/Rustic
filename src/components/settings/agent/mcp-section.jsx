@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -57,7 +58,7 @@ export function McpJsonDialog({ open, onClose }) {
       if (failed.length === 0) toast.success('MCP saved');
       else toast.error(`Saved, but ${failed.length} server(s) failed to connect`);
       onClose();
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
     finally { setSaving(false); }
   };
 
@@ -191,7 +192,7 @@ export function McpSection() {
 
   const remove = async (id) => {
     try { await invoke('remove_mcp_server', { id }); refresh(); }
-    catch (e) { toast.error(String(e)); }
+    catch (e) { toastError(null, e); }
   };
 
   return (

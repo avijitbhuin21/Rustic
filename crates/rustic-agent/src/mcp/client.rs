@@ -70,9 +70,7 @@ struct JsonRpcRequest {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct JsonRpcResponse {
-    jsonrpc: String,
     /// `Value` rather than `u64`: JSON-RPC allows string ids and some remote
     /// servers echo numeric ids back as strings. `id_matches` normalizes.
     id: Option<Value>,

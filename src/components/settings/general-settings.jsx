@@ -10,7 +10,14 @@ import { SettingsSection, SettingRow } from './setting-row';
 import { TunnelSettings } from './tunnel-settings';
 import { PowerSettings } from './power-settings';
 import { IS_WEB, IS_MAC_DESKTOP } from '@/lib/platform';
-import { readMacOptionIsMeta, setMacOptionIsMeta } from '@/components/terminal/terminal-instance';
+
+// Same key terminal-instance.js uses; read directly so settings doesn't pull xterm into its chunk.
+const OPTION_META_KEY = 'rustic.terminal.macOptionIsMeta';
+
+/** Reads the macOS Option-as-Meta terminal preference from localStorage. */
+function readOptionAsMeta() {
+  try { return localStorage.getItem(OPTION_META_KEY) === '1'; } catch { return false; }
+}
 
 export function GeneralSettings() {
   const s = useSettings((s) => s.settings);
@@ -18,7 +25,7 @@ export function GeneralSettings() {
   const [openWithRustic, setOpenWithRustic] = useState(false);
   const isWindows = !IS_WEB && navigator.userAgent.includes('Windows');
   const isMac = IS_MAC_DESKTOP;
-  const [optionAsMeta, setOptionAsMeta] = useState(() => readMacOptionIsMeta());
+  const [optionAsMeta, setOptionAsMeta] = useState(() => readOptionAsMeta());
 
   useEffect(() => {
     if (!isWindows) return;
@@ -139,7 +146,12 @@ export function GeneralSettings() {
             <Switch
               id="option-as-meta"
               checked={optionAsMeta}
-              onCheckedChange={(v) => { setMacOptionIsMeta(v); setOptionAsMeta(v); }}
+              onCheckedChange={(v) => {
+                setOptionAsMeta(v);
+                import('@/components/terminal/terminal-instance')
+                  .then((m) => m.setMacOptionIsMeta(v))
+                  .catch((e) => toast.error(`Could not apply setting: ${e?.message || e}`));
+              }}
             />
           </SettingRow>
         </SettingsSection>

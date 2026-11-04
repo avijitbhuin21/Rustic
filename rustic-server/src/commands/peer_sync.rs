@@ -183,6 +183,10 @@ async fn run(ctx: &ServerContext, command: &str, args: &Value) -> Result<Value, 
             let a: EnabledArg = parse(args)?;
             ok(set_enabled(ctx, a.enabled).await?)
         }
+        "lan_set_local_reach" => {
+            let a: EnabledArg = parse(args)?;
+            ok(ops::set_local_reach(&host, lan, a.enabled).await?)
+        }
         "lan_devices" => ok(ops::devices(&host, lan).await?),
         "lan_add_manual" => {
             let a: AddressArg = parse(args)?;

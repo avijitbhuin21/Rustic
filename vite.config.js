@@ -45,11 +45,11 @@ export default defineConfig(({ mode }) => {
     react(),
     tailwindcss(),
     // Bundle-size treemap, opt-in only: `ANALYZE=1 bun run build` writes
-    // stats.html at the repo root. Normal builds are unaffected.
+    // .rustic/tmp/stats.html (scratch, not tracked). Normal builds are unaffected.
     ...(process.env.ANALYZE
       ? [
           visualizer({
-            filename: path.resolve(__dirname, 'stats.html'),
+            filename: path.resolve(__dirname, '.rustic/tmp/stats.html'),
             gzipSize: true,
             brotliSize: true,
           }),

@@ -20,6 +20,8 @@ import {
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
+import { copyText } from '@/lib/code-copy';
+import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -119,7 +121,7 @@ export function ModelsDialog({ open, onClose, title, providerType, baseUrl }) {
                       size="icon-sm"
                       variant="ghost"
                       className="size-6 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-foreground touch-reveal"
-                      onClick={() => { navigator.clipboard.writeText(m); toast.success('Copied'); }}
+                      onClick={() => copyText(m).then(() => toast.success('Copied'), (e) => toastError('Copy failed', e))}
                       title="Copy"
                     >
                       <Copy className="size-3" />
@@ -487,7 +489,7 @@ export function CompatibleEntryCard({ entry, onChanged }) {
             try {
               await invoke('remove_ai_provider', { providerKey: key });
               onChanged?.();
-            } catch (e) { toast.error(String(e)); }
+            } catch (e) { toastError(null, e); }
           }}
           title="Remove"
         >

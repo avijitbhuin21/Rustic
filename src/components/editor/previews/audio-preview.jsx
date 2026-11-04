@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { Music, Play, Pause, SkipBack, Volume2, VolumeX } from 'lucide-react';
 import { useFileReloadVersion } from '@/lib/use-file-change';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -233,11 +233,14 @@ export default function AudioPreview({ tab }) {
       .catch((e) => {
         if (cancelled) return;
         const msg = String(e || '');
-        setError(
-          msg.includes('too large')
-            ? 'Audio file is larger than 100MB — preview unavailable.'
-            : msg,
-        );
+        if (msg.includes('too large')) {
+          // Too big to base64 + decode in memory: stream it from disk into the
+          // native player (Range requests, no waveform).
+          setFallbackSrc(convertFileSrc(tab.path, 'rustic-media'));
+          setError('Large file — streaming playback (waveform unavailable).');
+          return;
+        }
+        setError(msg);
       });
 
     return () => {

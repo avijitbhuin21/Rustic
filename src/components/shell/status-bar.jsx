@@ -3,10 +3,13 @@ import { getVersion } from '@tauri-apps/api/app';
 import { invoke } from '@tauri-apps/api/core';
 import { AlertCircle, Download, FileEdit, GitBranch, LogOut, Loader2, MemoryStick, HardDrive, PanelLeftOpen, PanelLeftClose, PanelRightOpen, PanelRightClose, Power, ListTree, Lock, X } from 'lucide-react';
 import { IS_WEB } from '@/lib/platform';
+import { formatBytes } from '@/lib/transfer-format';
+import { useVisiblePoll } from '@/lib/use-visible-poll';
 import { cn } from '@/lib/utils';
 import { GithubIcon } from '@/components/github/icon';
 import { IssueQueueDialog } from '@/components/github/issue-queue-dialog';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { confirm } from '@/components/confirm-dialog';
 import { getActiveEditor, getActiveTab } from '@/lib/active-editor';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
@@ -64,7 +67,7 @@ function GithubStatusItem() {
       });
       setAutoResolve(saved);
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   };
 
@@ -143,44 +146,18 @@ function GithubStatusItem() {
   );
 }
 
-/// Formats a byte count into a compact human-readable string (e.g. "512 MB").
-function formatBytes(bytes) {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 MB';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let value = bytes;
-  let i = 0;
-  while (value >= 1024 && i < units.length - 1) {
-    value /= 1024;
-    i += 1;
-  }
-  const digits = value >= 100 || i <= 1 ? 0 : 1;
-  return `${value.toFixed(digits)} ${units[i]}`;
-}
-
 /// Web-only status-bar widget polling the server's process RAM + data-volume
 /// disk usage every 5 seconds.
 function ResourceMonitor() {
   const [usage, setUsage] = useState(null);
 
-  useEffect(() => {
-    let active = true;
-    const poll = () => {
-      if (document.hidden) return;
-      invoke('get_resource_usage')
-        .then((u) => { if (active) setUsage(u); })
-        .catch(() => {});
-    };
-    poll();
-    // 2s cadence — the backend reads cgroup memory + filesystem usage (both
-    // O(1)), so this is cheap and feels live as Chromium/dev-servers spin up.
-    const id = setInterval(poll, 2000);
-    document.addEventListener('visibilitychange', poll);
-    return () => {
-      active = false;
-      clearInterval(id);
-      document.removeEventListener('visibilitychange', poll);
-    };
-  }, []);
+  // 2s cadence — the backend reads cgroup memory + filesystem usage (both
+  // O(1)), so this is cheap and feels live as Chromium/dev-servers spin up.
+  useVisiblePoll(() => {
+    invoke('get_resource_usage')
+      .then(setUsage)
+      .catch(() => { /* transient; next tick retries */ });
+  }, 2000);
 
   if (!usage) return null;
 
@@ -235,10 +212,8 @@ function ProcessManager() {
     if (!open) return;
     setErr('');
     setLoading(true);
-    refresh();
-    const id = setInterval(refresh, 2500);
-    return () => clearInterval(id);
-  }, [open, refresh]);
+  }, [open]);
+  useVisiblePoll(refresh, open ? 2500 : 0, [refresh]);
 
   const kill = useCallback(
     async (pid) => {

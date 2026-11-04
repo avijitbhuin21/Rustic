@@ -22,6 +22,10 @@ use std::sync::Arc;
 /// tokens; the parent's full chat usually dwarfs this, so we trim from the
 /// top.
 const PARENT_CONTEXT_CHAR_CAP: usize = 30_000;
+/// Smaller inherited-transcript cap for `model_tier: "fast"` children: they
+/// do narrow, mechanical work where the spawn prompt carries the task, so
+/// ~3K tokens of background is plenty.
+const FAST_PARENT_CONTEXT_CHAR_CAP: usize = 12_000;
 
 /// Truncate a UTF-8 string to at most `max_bytes` bytes without splitting a codepoint.
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
@@ -33,6 +37,53 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Word limit the orchestrator asked for in a spawn prompt, e.g.
+/// "under ~900 words", "(<400 words)", "at most 1,000 words".
+fn requested_word_limit(prompt: &str) -> Option<usize> {
+    const LEADS: &[&str] = &[
+        "under", "<", "≤", "<=", "max", "maximum", "below", "at most", "within", "less than",
+        "no more than", "up to",
+    ];
+    let lower = prompt.to_lowercase();
+    for (idx, _) in lower.match_indices("words") {
+        let before = lower[..idx].trim_end();
+        let num_start = before
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_ascii_digit() || *c == ',')
+            .last()
+            .map(|(i, _)| i);
+        let Some(ns) = num_start else { continue };
+        let Ok(n) = before[ns..].replace(',', "").parse::<usize>() else {
+            continue;
+        };
+        let lead = before[..ns].trim_end_matches(['~', ' ', '≈', '(']);
+        if n >= 20 && LEADS.iter().any(|l| lead.ends_with(l)) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Cut `text` after `max_words` words (whitespace-delimited), keeping the
+/// original formatting of what remains. Returns None when under budget.
+fn truncate_words(text: &str, max_words: usize) -> Option<&str> {
+    let mut words = 0usize;
+    let mut in_word = false;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            in_word = false;
+        } else if !in_word {
+            in_word = true;
+            words += 1;
+            if words > max_words {
+                return Some(text[..i].trim_end());
+            }
+        }
+    }
+    None
 }
 
 /// Build a sub-agent's provider from a provider-TYPE key (the same strings
@@ -82,7 +133,12 @@ pub(crate) fn provider_for_subagent(
 /// get a short ellipsis tail so a single huge file read doesn't bury the
 /// rest of the history — the cap-driven trimming below then drops oldest
 /// tool_results entirely when total length still exceeds PARENT_CONTEXT_CHAR_CAP.
+#[cfg(test)]
 fn render_parent_transcript(messages: &[Message]) -> String {
+    render_parent_transcript_capped(messages, PARENT_CONTEXT_CHAR_CAP)
+}
+
+fn render_parent_transcript_capped(messages: &[Message], char_cap: usize) -> String {
     fn shorten_tool_result(s: &str) -> String {
         const PER_RESULT_CAP: usize = 4_000;
         if s.chars().count() <= PER_RESULT_CAP {
@@ -176,7 +232,7 @@ fn render_parent_transcript(messages: &[Message]) -> String {
     };
 
     let mut dropped_count = 0;
-    while total(&chunks) > PARENT_CONTEXT_CHAR_CAP {
+    while total(&chunks) > char_cap {
         // Find the FIRST tool_result (oldest) and drop it.
         let idx = chunks
             .iter()
@@ -1260,6 +1316,12 @@ async fn spawn_subagent_inner(
         .unwrap_or("intelligent");
     let use_fast =
         model_tier.eq_ignore_ascii_case("fast") && context.subagent_provider_config.is_some();
+    let inherit_char_cap = if use_fast {
+        FAST_PARENT_CONTEXT_CHAR_CAP
+    } else {
+        PARENT_CONTEXT_CHAR_CAP
+    };
+    let report_word_limit = requested_word_limit(&prompt);
 
     let chosen_config = if use_fast {
         // unwrap is safe: `use_fast` checked is_some() above.
@@ -1505,6 +1567,7 @@ async fn spawn_subagent_inner(
                         fwd_registry.record_tool_call(
                             &fwd_registry_key,
                             &fwd_agent_id,
+                            &tool_use_id,
                             &tool_name,
                             &tool_input,
                         );
@@ -1525,6 +1588,7 @@ async fn spawn_subagent_inner(
                         fwd_registry.record_tool_result(
                             &fwd_registry_key,
                             &fwd_agent_id,
+                            &tool_use_id,
                             &output,
                             is_error,
                         );
@@ -1652,7 +1716,7 @@ async fn spawn_subagent_inner(
                 .map(|g| g.clone())
                 .unwrap_or_default();
             if !parent_snapshot.is_empty() {
-                let transcript = render_parent_transcript(&parent_snapshot);
+                let transcript = render_parent_transcript_capped(&parent_snapshot, inherit_char_cap);
                 if !transcript.trim().is_empty() {
                     let preface = format!(
                         "You are a sub-agent spawned by a parent agent that has been working \
@@ -1689,6 +1753,14 @@ async fn spawn_subagent_inner(
                 }
             }
         }
+        let prompt = match report_word_limit {
+            Some(n) => format!(
+                "{prompt}\n\n[Length budget: keep your final report under {n} words. \
+                 Text beyond ~{} words is cut off before the orchestrator sees it.]",
+                n + n / 2
+            ),
+            None => prompt,
+        };
         messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: prompt }],
@@ -1750,6 +1822,14 @@ async fn spawn_subagent_inner(
                         .to_string()
                 } else {
                     texts.join("\n\n")
+                };
+                let raw = match report_word_limit
+                    .and_then(|n| truncate_words(&raw, n + n / 2).map(|t| (n, t)))
+                {
+                    Some((n, cut)) => format!(
+                        "{cut}\n\n[…report truncated: exceeded the requested ~{n}-word budget]"
+                    ),
+                    None => raw,
                 };
                 const SUMMARY_CAP: usize = 32_000;
                 if raw.len() > SUMMARY_CAP {
@@ -2124,5 +2204,46 @@ mod parent_context_render_tests {
             "expected per-result truncation marker: {}",
             out
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn parses_requested_word_limits() {
+        assert_eq!(requested_word_limit("Keep the report under ~900 words."), Some(900));
+        assert_eq!(requested_word_limit("Final report (<400 words): per item"), Some(400));
+        assert_eq!(requested_word_limit("at most 1,000 words please"), Some(1000));
+        assert_eq!(requested_word_limit("Report (under 600 words)"), Some(600));
+        assert_eq!(requested_word_limit("list 5 words that rhyme"), None);
+        assert_eq!(requested_word_limit("no limit here"), None);
+    }
+
+    #[test]
+    fn truncates_at_word_budget() {
+        let text = "one two  three\nfour five";
+        assert_eq!(truncate_words(text, 3), Some("one two  three"));
+        assert_eq!(truncate_words(text, 5), None);
+    }
+
+    #[test]
+    fn fast_tier_cap_is_smaller() {
+        let big = "x".repeat(5_000);
+        let messages: Vec<Message> = (0..10)
+            .map(|i| Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("t{i}"),
+                    content: big.clone(),
+                    is_error: false,
+                }],
+            })
+            .collect();
+        let fast = render_parent_transcript_capped(&messages, FAST_PARENT_CONTEXT_CHAR_CAP);
+        let full = render_parent_transcript_capped(&messages, PARENT_CONTEXT_CHAR_CAP);
+        assert!(fast.len() < FAST_PARENT_CONTEXT_CHAR_CAP + 1_000, "{}", fast.len());
+        assert!(full.len() > fast.len());
     }
 }

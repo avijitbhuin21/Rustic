@@ -1,12 +1,13 @@
 import React, { useMemo } from 'react';
+import { ArrowUp } from 'lucide-react';
 import { useAgent } from '@/state/agent';
 import { useCustomModels } from '@/state/custom-models';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
+import { AgentMascot } from './agent-mascot';
 
-// ContextUsageCapsule — a pill next to the send button whose border is a
-// progress ring showing how much of the auto-condense budget the task's
-// context has consumed. 100% = the point where auto-condense triggers.
+// Context usage for the active task, drawn as a ring around the mascot send
+// button. 100% = the point where auto-condense triggers.
 //
 // Data source: the 'agent-request-usage' event (exact, from the last provider
 // call). For reopened tasks that haven't made a call yet this session, we fall
@@ -20,6 +21,10 @@ const CONDENSE_THRESHOLD_PCT = 0.93;
 // Rough allowance for the system prompt + tool schemas, which aren't part of
 // the visible transcript but do occupy context. Only used for the estimate.
 const ESTIMATE_OVERHEAD_TOKENS = 12_000;
+
+const RING_SIZE = 32;
+const RING_R = 14.5;
+const RING_C = 2 * Math.PI * RING_R;
 
 /** Formats a token count compactly: 950, 86.4k, 1.2M. */
 function fmtTokens(n) {
@@ -46,8 +51,15 @@ function estimateTranscriptTokens(messages) {
   return Math.round(chars / 4) + ESTIMATE_OVERHEAD_TOKENS;
 }
 
-export function ContextUsageCapsule({ className }) {
-  const activeTaskId = useAgent((s) => s.activeTaskId);
+/** Ring stroke colour for a fill percentage: neutral, then warning, then danger near auto-condense. */
+function ringColor(pct) {
+  if (pct >= 90) return 'var(--danger)';
+  if (pct >= 75) return 'var(--warning)';
+  return 'color-mix(in oklab, var(--foreground) 60%, transparent)';
+}
+
+/** Context usage of the active task: `{ pct, tokens, threshold, contextWindow, approx }` (`pct` null when unknown). */
+export function useContextUsage() {
   const live = useAgent((s) =>
     s.activeTaskId ? s.contextUsageByTask[s.activeTaskId] : null,
   );
@@ -71,7 +83,7 @@ export function ContextUsageCapsule({ className }) {
     return null;
   }, [builtinModels, customMap, selectedModel]);
 
-  const { pct, tokens, threshold, contextWindow, approx } = useMemo(() => {
+  return useMemo(() => {
     if (live?.threshold > 0) {
       const t = live.tokens || 0;
       return {
@@ -94,37 +106,93 @@ export function ContextUsageCapsule({ className }) {
       approx: messages.length > 0,
     };
   }, [live, spec, messages]);
+}
 
-  if (pct === null) return null;
-
-  const angle = Math.max(0, Math.min(360, pct * 3.6));
+/**
+ * Send button drawn as the agent mascot inside a context-usage ring. The ring
+ * is an indicator only (hover shows the numbers); clicking performs the
+ * button's action. `badge="send"` shows a small arrow when there is something
+ * to send; while running, the mascot's own animation signals work (no badge).
+ */
+export function MascotSendButton({
+  usage,
+  mascotState = 'idle',
+  subagents = 0,
+  petKey = 0,
+  badge = null,
+  label,
+  onClick,
+  inactive = false,
+  className,
+}) {
+  const pct = usage?.pct ?? null;
+  const fill = pct == null ? 0 : Math.max(0, Math.min(100, pct));
+  const ctxLine = pct == null
+    ? null
+    : `Context ${usage.approx ? '~' : ''}${pct}% · ${usage.approx ? '~' : ''}${fmtTokens(usage.tokens)} / ${fmtTokens(usage.threshold)} tokens`;
 
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <div
-          className={cn('rounded-full p-px', className)}
-          style={{
-            background: `conic-gradient(color-mix(in oklab, var(--foreground) 55%, transparent) ${angle}deg, var(--border) ${angle}deg)`,
-          }}
-          aria-label={`Context ${pct}% used`}
+        <button
+          type="button"
+          onClick={() => { if (!inactive) onClick?.(); }}
+          aria-label={ctxLine ? `${label}. ${ctxLine}` : label}
+          aria-disabled={inactive || undefined}
+          className={cn(
+            'relative shrink-0 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring',
+            inactive ? 'cursor-default' : 'cursor-pointer',
+            className,
+          )}
+          style={{ width: RING_SIZE, height: RING_SIZE }}
         >
-          <div className="flex h-[22px] min-w-[38px] select-none items-center justify-center rounded-full bg-background px-2 text-[10px] tabular-nums text-muted-foreground">
-            {approx ? '~' : ''}{pct}%
-          </div>
-        </div>
+          <svg viewBox={`0 0 ${RING_SIZE} ${RING_SIZE}`} className="absolute inset-0 -rotate-90" aria-hidden>
+            <circle cx={RING_SIZE / 2} cy={RING_SIZE / 2} r={RING_R} fill="var(--background)" stroke="var(--border)" strokeWidth="2" />
+            <circle
+              cx={RING_SIZE / 2}
+              cy={RING_SIZE / 2}
+              r={RING_R}
+              fill="none"
+              stroke={ringColor(fill)}
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeDasharray={RING_C}
+              strokeDashoffset={RING_C * (1 - fill / 100)}
+              style={{ transition: 'stroke-dashoffset 400ms ease, stroke 400ms ease' }}
+            />
+          </svg>
+          {/* Canvas is taller than the ring so the hop + heart can rise above it. */}
+          <AgentMascot
+            size="ring"
+            state={mascotState}
+            subagents={subagents}
+            petKey={petKey}
+            interactive={false}
+            className="absolute left-1/2 -translate-x-1/2"
+            style={{ top: -4 }}
+          />
+          {badge === 'send' && (
+            <span
+              aria-hidden
+              className="absolute -bottom-0.5 -right-0.5 flex size-3.5 items-center justify-center rounded-full bg-foreground text-background ring-2 ring-background"
+            >
+              <ArrowUp className="size-2.5" strokeWidth={3} />
+            </span>
+          )}
+        </button>
       </TooltipTrigger>
       <TooltipContent side="top" className="text-center">
-        <div>
-          {approx ? '~' : ''}{fmtTokens(tokens)} / {fmtTokens(threshold)} tokens ({pct}% of the auto-condense budget{approx ? ', estimated' : ''})
-        </div>
-        <div className="text-muted-foreground">
-          Auto-condenses at {fmtTokens(threshold)}
-          {contextWindow > 0 ? ` · context window ${fmtTokens(contextWindow)}` : ''}
-        </div>
+        <div>{label}</div>
+        {ctxLine && <div className="text-muted-foreground">{ctxLine}</div>}
+        {pct != null && usage.threshold > 0 && (
+          <div className="text-muted-foreground">
+            Auto-condenses at {fmtTokens(usage.threshold)}
+            {usage.contextWindow > 0 ? ` · context window ${fmtTokens(usage.contextWindow)}` : ''}
+          </div>
+        )}
       </TooltipContent>
     </Tooltip>
   );
 }
 
-export default ContextUsageCapsule;
+export default MascotSendButton;

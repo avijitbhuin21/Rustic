@@ -417,6 +417,9 @@ async fn pair(
     headers: HeaderMap,
     Json(req): Json<PairRequest>,
 ) -> Response {
+    if let Some(r) = refuse_if_locked(&ctx) {
+        return r;
+    }
     let caller = caller_addr(&headers, remote.map(|axum::Extension(r)| r));
     let (my, request_id, rx) = {
         let mut inner = ctx.lan.lock();
@@ -439,6 +442,7 @@ async fn pair(
         "lan-pair-request",
         json!({ "request_id": request_id, "device_id": req.device_id, "name": req.name, "code": code }),
     );
+    ctx.host.request_attention();
     let accepted = matches!(
         tokio::time::timeout(std::time::Duration::from_secs(90), rx).await,
         Ok(Ok(true))
@@ -524,6 +528,9 @@ async fn transfer_request(
         Ok(p) => p,
         Err(r) => return r,
     };
+    if let Some(r) = refuse_if_locked(&ctx) {
+        return r;
+    }
     if let Err(e) = consent::validate(&req) {
         return err(StatusCode::BAD_REQUEST, e);
     }
@@ -573,7 +580,20 @@ async fn transfer_request(
         "files": req.files,
         "meta_access": req.meta_access,
     });
-    let approved = if req.kind == "push" && ctx.host.auto_accept_push() {
+    // Files moving in or out of projects we already share with this peer don't
+    // need a second yes: sharing is the consent. Whole-project replaces,
+    // metadata and metadata access still prompt.
+    let shared_files_only = matches!(req.kind.as_str(), "push" | "pull")
+        && !req.files.is_empty()
+        && req.projects.is_empty()
+        && req.meta.is_empty()
+        && !req.meta_access
+        && req.files.iter().all(|f| peer.share.has_project(&f.project_id));
+    let approved = if shared_files_only {
+        tracing::info!(device = %peer.device_id, kind = %req.kind, "peer: auto-approved (shared project)");
+        ctx.emit("lan-transfer-auto-accepted", payload);
+        true
+    } else if req.kind == "push" && ctx.host.auto_accept_push() {
         ctx.emit("lan-transfer-auto-accepted", payload);
         true
     } else {
@@ -588,6 +608,7 @@ async fn transfer_request(
                 .push(request_id.clone());
         }
         ctx.emit("lan-transfer-request", payload);
+        ctx.host.request_attention();
         let ok = matches!(
             tokio::time::timeout(consent::PROMPT_TIMEOUT, rx).await,
             Ok(Ok(true))
@@ -657,6 +678,25 @@ fn my_name(ctx: &Ctx) -> String {
         .as_ref()
         .map(|i| i.device_name.clone())
         .unwrap_or_else(|| "the other machine".into())
+}
+
+/// 423 when this machine's screen is locked: nothing is approved or moved
+/// while nobody is at it (auto-approved shared transfers included).
+fn refuse_if_locked(ctx: &Ctx) -> Option<Response> {
+    if !ctx.host.is_locked() {
+        return None;
+    }
+    tracing::info!("peer: request refused — this machine is locked");
+    Some(
+        (
+            StatusCode::LOCKED,
+            Json(json!({
+                "error": format!("{} is locked — try again once it's unlocked", my_name(ctx)),
+                "code": "locked",
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// `GET /api/sync/state` — per-project sync fingerprints (skip unchanged trees).
@@ -1183,7 +1223,8 @@ async fn fs_exists(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsE
     Json(json!({ "existing": super::files::conflicts(&dir, &b.names) })).into_response()
 }
 
-/// `POST /api/fs/pull` — stream the approved selection as a zstd tar.
+/// `POST /api/fs/pull` — stream the approved selection as a tar (zstd above
+/// [`super::files::COMPRESS_MIN_BYTES`]).
 async fn fs_pull(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsItemsBody>) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
@@ -1210,7 +1251,8 @@ async fn fs_pull(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsIte
         let handle = crate::transfers::begin(host.emitter(), "push", &label, &peer_name, size.bytes, size.files);
         let mut writer = writer;
         let h = handle.clone();
-        let res = super::files::pack(&items, &mut writer, &|| h.is_cancelled(), &|n| h.progress("uploading", n, 0));
+        let compress = size.bytes >= super::files::COMPRESS_MIN_BYTES;
+        let res = super::files::pack(&items, &mut writer, compress, &|| h.is_cancelled(), &|n| h.progress("uploading", n, 0));
         if let Err(e) = &res {
             writer.fail(e);
         }
@@ -1219,7 +1261,7 @@ async fn fs_pull(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsIte
     let mut resp = Body::from_stream(super::files::channel_stream(rx)).into_response();
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/zstd"),
+        axum::http::HeaderValue::from_static("application/octet-stream"),
     );
     resp
 }
@@ -1583,6 +1625,9 @@ async fn upload_chunk(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) ->
         Ok(s) => s,
         Err(r) => return r,
     };
+    if s.handle.is_cancelled() {
+        return abort_upload(&ctx, &meta.id, &s);
+    }
     let (target, size) = match upload_target(&s, &meta.rel) {
         Ok(Some(t)) => t,
         Ok(None) => return Json(json!({ "received": 0, "skipped": true })).into_response(),
@@ -1595,11 +1640,16 @@ async fn upload_chunk(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) ->
     *s.last_chunk.lock().unwrap_or_else(|p| p.into_inner()) = std::time::Instant::now();
     s.handle.net_resume();
     let mut written = meta.offset;
+    let mut cancelled = false;
     {
         use futures_util::StreamExt;
         use std::io::Write;
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
+            if s.handle.is_cancelled() {
+                cancelled = true;
+                break;
+            }
             let Ok(chunk) = chunk else { break };
             if let Err(e) = file.write_all(&chunk) {
                 return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
@@ -1612,6 +1662,9 @@ async fn upload_chunk(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) ->
         let _ = file.flush();
     }
     drop(file);
+    if cancelled {
+        return abort_upload(&ctx, &meta.id, &s);
+    }
     if written >= size {
         if let Err(e) = super::files::finish_part(&target) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, e);
@@ -1626,6 +1679,17 @@ async fn upload_chunk(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) ->
 #[derive(Deserialize)]
 struct UploadIdBody {
     id: String,
+}
+
+/// The receiving user cancelled this upload: drop the session, mark it
+/// cancelled here, and answer 410 so the sender stops (and says why).
+fn abort_upload(ctx: &Ctx, id: &str, s: &UploadSession) -> Response {
+    ctx.uploads.lock().unwrap_or_else(|p| p.into_inner()).remove(id);
+    if !s.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        s.handle.finish(Err("Cancelled".into()));
+        tracing::info!(device = %s.device_id, "peer: upload cancelled by the receiver");
+    }
+    err(StatusCode::GONE, format!("{} cancelled this transfer", my_name(ctx)))
 }
 
 /// `POST /api/fs/upload/finish` — close the session and report what landed.

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Issues — Rustic</title>
+  <meta name="description" content="Report bugs, request features and follow what's being fixed in Rustic. No GitHub account needed." />
+  <link rel="canonical" href="https://rustic.avijitbhuin.com/issues/" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <meta property="og:title" content="Rustic Issues" />
+  <meta property="og:description" content="Report bugs and request features for Rustic — no GitHub account needed." />
+  <meta property="og:image" content="https://rustic.avijitbhuin.com/og-image.png" />
+  <link rel="icon" type="image/png" sizes="512x512" href="/rustic-icon.png" />
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/issues/issues.css" />
+</head>
+<body class="issues-page">
+  <header class="nav is-solid" id="nav">
+    <a class="brand" href="/">
+      <img src="/logo.png" alt="" width="28" height="28" />
+      <span>Rustic</span>
+    </a>
+    <nav class="nav-links" aria-label="Primary">
+      <a href="/#features">Features</a>
+      <a href="/#agents">Agents</a>
+      <a href="/#server">Server</a>
+      <a href="/issues/" aria-current="page">Issues</a>
+    </nav>
+    <div class="nav-cta">
+      <a class="btn btn-primary btn-sm" href="/#download"><span>Download</span></a>
+    </div>
+  </header>
+
+  <main class="container iss-main">
+    <section class="iss-hero">
+      <div>
+        <p class="iss-eyebrow mono">Public tracker</p>
+        <h1>Issues</h1>
+        <p class="iss-lede">Found a bug or want something new? File it here — no GitHub account needed. Rustic's agent can file issues for you too, straight from the IDE.</p>
+      </div>
+      <button class="btn btn-primary" type="button" id="new-issue-btn"><span>New issue</span></button>
+    </section>
+
+    <section class="iss-toolbar" aria-label="Filter issues">
+      <div class="iss-tabs" role="tablist">
+        <button role="tab" type="button" class="iss-tab" data-status="open" aria-selected="true">Open <span class="iss-count" id="count-open">0</span></button>
+        <button role="tab" type="button" class="iss-tab" data-status="closed" aria-selected="false">Closed <span class="iss-count" id="count-closed">0</span></button>
+      </div>
+      <label class="iss-search">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input type="search" id="search" placeholder="Search issues…" autocomplete="off" />
+      </label>
+    </section>
+
+    <section aria-live="polite">
+      <ul class="iss-list" id="list"></ul>
+      <p class="iss-empty" id="empty" hidden></p>
+      <div class="iss-pager">
+        <button class="btn btn-ghost btn-sm" type="button" id="more" hidden><span>Load more</span></button>
+      </div>
+    </section>
+  </main>
+
+  <dialog class="iss-dialog" id="detail" aria-labelledby="detail-title">
+    <div class="iss-dialog-head">
+      <span class="mono iss-num" id="detail-num"></span>
+      <button class="iss-x" type="button" data-close aria-label="Close">×</button>
+    </div>
+    <h2 id="detail-title"></h2>
+    <div class="iss-meta" id="detail-meta"></div>
+    <div class="iss-resolution" id="detail-resolution" hidden></div>
+    <div class="iss-body" id="detail-body"></div>
+    <div class="iss-attachments" id="detail-files"></div>
+  </dialog>
+
+  <dialog class="iss-dialog iss-form-dialog" id="composer" aria-labelledby="composer-title">
+    <form id="issue-form" novalidate>
+      <div class="iss-dialog-head">
+        <h2 id="composer-title">New issue</h2>
+        <button class="iss-x" type="button" data-close aria-label="Close">×</button>
+      </div>
+      <div class="iss-row">
+        <label class="iss-field iss-grow">Title
+          <input name="title" required minlength="4" maxlength="160" placeholder="Short summary of the problem or idea" />
+        </label>
+        <label class="iss-field">Type
+          <select name="kind">
+            <option value="bug">Bug</option>
+            <option value="feature">Feature</option>
+            <option value="question">Question</option>
+          </select>
+        </label>
+      </div>
+      <label class="iss-field">Details
+        <textarea name="body" rows="8" maxlength="20000" placeholder="What happened, what you expected, and steps to reproduce."></textarea>
+      </label>
+      <div class="iss-row">
+        <label class="iss-field iss-grow">Rustic version <input name="app_version" maxlength="40" placeholder="e.g. 0.7.9" /></label>
+        <label class="iss-field iss-grow">OS <input name="os" maxlength="60" id="os-field" /></label>
+      </div>
+      <label class="iss-field">Contact (optional, never shown publicly)
+        <input name="contact" maxlength="200" placeholder="Email if you'd like a reply" />
+      </label>
+      <label class="iss-field">Attachments <span class="iss-hint">up to 5 files · 10 MB each · png, jpg, gif, webp, pdf, txt, log, md, json, csv, yaml, toml</span>
+        <input type="file" name="files" id="files" multiple accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.log,.md,.json,.csv,.yaml,.yml,.toml" />
+      </label>
+      <div class="iss-hp" aria-hidden="true">
+        <label>Website <input name="website" tabindex="-1" autocomplete="off" /></label>
+      </div>
+      <p class="iss-note">Issues are public. Don't include passwords, API keys or private code.</p>
+      <p class="iss-error" id="form-error" role="alert" hidden></p>
+      <div class="iss-actions">
+        <button class="btn btn-ghost btn-sm" type="button" data-close><span>Cancel</span></button>
+        <button class="btn btn-primary btn-sm" type="submit" id="submit"><span>Submit issue</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/issues/issues.js" defer></script>
+</body>
+</html>

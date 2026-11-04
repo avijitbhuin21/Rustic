@@ -1,54 +1,38 @@
 // Cloud & Sync overlay, opened from the left island:
 // |machines|projects·metadata·sharing|files|preview (optional)|my explorer|
 // The Backends tab swaps the columns for one panel of machine cards.
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import {
   Plus, Link2, Pencil, Trash2, Monitor, Globe, CloudDownload, ExternalLink, LogOut, Loader2,
-  AlertTriangle, RefreshCw, Server, ChevronLeft,
+  AlertTriangle, RefreshCw, Server, Search, X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Switch } from '@/components/ui/switch';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '@/components/ui/resizable';
 import { cn } from '@/lib/utils';
 import { IS_WEB } from '@/lib/platform';
 import { useLayout } from '@/state/layout';
 import { useExplorer } from '@/state/explorer';
-import { MyMachine } from '@/components/settings/cloud-settings';
 import {
-  useSavedBackends, InlineRename, Slider, SearchBox, StatusPill, AddMachineDialog,
+  useSavedBackends, InlineRename, Slider, StatusPill, AddMachineDialog,
 } from '@/components/settings/cloud-machines';
 import { useLan, errText } from './use-lan';
 import { useConflictPrompt } from './conflict-dialog';
 import { Column, MachineColumn, RemoteFiles, PreviewColumn } from './remote-panels';
 import { LocalExplorer } from './local-explorer';
-
-/** Pick a local destination folder. */
-async function pickFolder(title) {
-  try {
-    const { open } = await import('@tauri-apps/plugin-dialog');
-    const r = await open({ directory: true, multiple: false, title });
-    return Array.isArray(r) ? r[0] : r;
-  } catch { return null; }
-}
-
-/** Pick local files or one folder to upload. */
-async function pickUpload(directory) {
-  try {
-    const { open } = await import('@tauri-apps/plugin-dialog');
-    const r = await open({ directory, multiple: !directory, title: directory ? 'Choose a folder to send' : 'Choose files to send' });
-    if (!r) return [];
-    return Array.isArray(r) ? r : [r];
-  } catch { return []; }
-}
+import { MyMachineDialog } from './my-machine-dialog';
+import { TransfersTray } from '@/components/transfers/transfers-tray';
 
 const baseName = (p) => String(p).replace(/[\\/]+$/, '').split(/[\\/]/).pop();
 
-/** One device row in the machines column. */
+/** One device card in the machines grid. */
 function DeviceRow({ d, selected, onClick, onPair, onRename, onForget, renaming, setRenaming }) {
-  const blocked = d.update_required || d.needs_repair;
   return (
     <div
       role="button"
@@ -56,57 +40,66 @@ function DeviceRow({ d, selected, onClick, onPair, onRename, onForget, renaming,
       onClick={onClick}
       onKeyDown={(e) => e.key === 'Enter' && onClick()}
       className={cn(
-        'group flex cursor-pointer flex-col gap-1 rounded-lg px-2 py-2 transition-colors hover:bg-ink/[0.05]',
-        selected && 'bg-primary/15',
+        'group flex min-h-[112px] cursor-pointer flex-col gap-2 rounded-xl border border-ink/[0.08] bg-ink/[0.03] p-3 transition-colors hover:bg-ink/[0.06]',
+        selected && 'border-primary/50 bg-primary/10',
       )}
     >
-      <div className="flex items-center gap-2">
-        <span className={cn('flex size-7 shrink-0 items-center justify-center rounded-md', d.paired ? 'bg-primary/15 text-primary' : 'bg-ink/[0.06] text-muted-foreground')}>
-          <Monitor className="size-3.5" />
+      <div className="flex items-start gap-2.5">
+        <span className={cn('flex size-9 shrink-0 items-center justify-center rounded-lg', d.paired ? 'bg-primary/15 text-primary' : 'bg-ink/[0.06] text-muted-foreground')}>
+          <Monitor className="size-4" />
         </span>
         <div className="min-w-0 flex-1">
           {renaming ? (
-            <InlineRename value={d.nickname ?? d.name} placeholder="Name" onCancel={() => setRenaming(null)} onSave={(n) => onRename(d, n)} />
+            <div onClick={(e) => e.stopPropagation()} role="presentation">
+              <InlineRename value={d.nickname ?? d.name} placeholder="Name" onCancel={() => setRenaming(null)} onSave={(n) => onRename(d, n)} />
+            </div>
           ) : (
             <>
-              <div className="truncate text-[12.5px] font-medium">{d.name}</div>
-              <div className="truncate text-[10.5px] text-muted-foreground" title={d.addr || ''}>{d.addr || '—'}</div>
+              <div className="truncate text-[13px] font-medium" title={d.name}>{d.name}</div>
+              <div className="truncate font-mono text-[10.5px] text-muted-foreground" title={d.addr || ''}>{d.addr || '—'}</div>
             </>
           )}
         </div>
         {!renaming && <StatusPill online={d.online} />}
       </div>
+
+      <div className="flex flex-wrap items-center gap-1.5 text-[10.5px] text-muted-foreground">
+        <span className="rounded-full border border-ink/[0.1] px-1.5 py-px">{d.paired ? 'Paired' : 'Not paired'}</span>
+        {d.version && <span className="rounded-full border border-ink/[0.1] px-1.5 py-px font-mono">v{d.version}</span>}
+        {d.manual && <span className="rounded-full border border-ink/[0.1] px-1.5 py-px">Added by address</span>}
+      </div>
+
       {d.update_required && (
-        <div className="flex items-center gap-1.5 rounded-md bg-warning/10 px-2 py-1 text-[10.5px] text-warning">
-          <AlertTriangle className="size-3 shrink-0" />
-          Update required — {d.version ? `it runs v${d.version}` : 'it runs an older version'}. Both must match.
+        <div className="flex items-start gap-1.5 rounded-md bg-warning/10 px-2 py-1 text-[10.5px] text-warning">
+          <AlertTriangle className="mt-px size-3 shrink-0" />
+          <span>Update required — {d.version ? `it runs v${d.version}` : 'it runs an older version'}. Both must match.</span>
         </div>
       )}
       {d.needs_repair && !d.update_required && (
-        <div className="flex items-center gap-1.5 rounded-md bg-warning/10 px-2 py-1 text-[10.5px] text-warning">
-          <AlertTriangle className="size-3 shrink-0" /> It forgot this machine — pair again.
+        <div className="flex items-start gap-1.5 rounded-md bg-warning/10 px-2 py-1 text-[10.5px] text-warning">
+          <AlertTriangle className="mt-px size-3 shrink-0" /> <span>It forgot this machine — pair again.</span>
         </div>
       )}
+
       {!renaming && (
-        <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()} role="presentation">
+        <div className="mt-auto flex items-center gap-1" onClick={(e) => e.stopPropagation()} role="presentation">
           {(!d.paired || d.needs_repair) && d.online && !d.update_required && (
             <Button size="sm" variant="outline" className="h-6 text-[11px]" onClick={() => onPair(d)}><Link2 className="size-3" /> {d.paired ? 'Pair again' : 'Pair'}</Button>
           )}
           {d.paired && (
-            <div className="ml-auto flex items-center opacity-0 transition-opacity group-hover:opacity-100">
+            <div className="touch-reveal ml-auto flex items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
               <Button size="icon-sm" variant="ghost" className="size-6 text-muted-foreground" title="Rename" onClick={() => setRenaming(d.device_id)}><Pencil className="size-3" /></Button>
               <Button size="icon-sm" variant="ghost" className="size-6 text-muted-foreground hover:text-destructive" title="Forget (both sides)" onClick={() => onForget(d)}><Trash2 className="size-3" /></Button>
             </div>
           )}
         </div>
       )}
-      {blocked && null}
     </div>
   );
 }
 
 /** Backends tab: saved rustic-server cards, rendered inside the machines column. */
-function BackendsPanel() {
+function BackendsPanel({ query = '' }) {
   const [backends, setBackends] = useSavedBackends();
   const [online, setOnline] = useState({});
   const [openOrigins, setOpenOrigins] = useState([]);
@@ -121,8 +114,8 @@ function BackendsPanel() {
     });
     const windows = () => invoke('remote_backend_open_urls').then((u) => alive && setOpenOrigins(Array.isArray(u) ? u : [])).catch(() => {});
     ping(); windows();
-    const t1 = setInterval(ping, 20000);
-    const t2 = setInterval(windows, 3000);
+    const t1 = setInterval(() => { if (!document.hidden) ping(); }, 20000);
+    const t2 = setInterval(() => { if (!document.hidden) windows(); }, 3000);
     return () => { alive = false; clearInterval(t1); clearInterval(t2); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [urls]);
@@ -133,13 +126,16 @@ function BackendsPanel() {
     await invoke('cloud_sync_remember', { password: '', url: b.url }).catch(() => {});
     setBackends((l) => l.filter((x) => x.id !== b.id));
   };
+  const shown = backends.filter((b) => !query || `${b.name} ${b.url}`.toLowerCase().includes(query));
   return (
     <div>
       {backends.length === 0 ? (
-        <p className="px-2 py-3 text-[11.5px] text-muted-foreground">No backends yet — use Add machine to save a remote rustic-server.</p>
+        <p className="px-2 py-3 text-[11.5px] text-muted-foreground">No backends yet — use + to save a remote rustic-server.</p>
+      ) : shown.length === 0 ? (
+        <p className="px-2 py-3 text-[11.5px] text-muted-foreground">No matches.</p>
       ) : (
         <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-2">
-          {backends.map((b) => {
+          {shown.map((b) => {
             const isOpen = openOrigins.includes(origin(b.url));
             return (
               <div key={b.id} className="group flex flex-col gap-2 rounded-xl border border-ink/[0.08] bg-ink/[0.03] p-3 transition-colors hover:bg-ink/[0.06]">
@@ -171,7 +167,6 @@ function BackendsPanel() {
 /** Cloud & Sync sidebar panel. Widens the sidebar while a machine is open. */
 export function SyncOverlay() {
   const active = useLayout((s) => s.activeSidebarPanel === 'sync' && s.sidebarVisible);
-  const setSyncWide = useLayout((s) => s.setSyncWide);
   const localProjects = useExplorer((s) => s.projects);
   const lan = useLan();
   const conflicts = useConflictPrompt();
@@ -186,6 +181,11 @@ export function SyncOverlay() {
   const [metaItem, setMetaItem] = useState(null);
   const [metaSel, setMetaSel] = useState(new Set());
   const [localMeta, setLocalMeta] = useState(null);
+  const [searchOpen, setSearchOpen] = useState(IS_WEB);
+  const [myMachineOpen, setMyMachineOpen] = useState(false);
+  const searchRef = useRef(null);
+  const closeSearch = () => { if (IS_WEB) return; setQuery(''); setSearchOpen(false); };
+  useEffect(() => { if (searchOpen && !IS_WEB) searchRef.current?.focus(); }, [searchOpen]);
 
   useEffect(() => {
     if (!active) return;
@@ -235,7 +235,7 @@ export function SyncOverlay() {
       }
     } catch { /* conflict check is best effort; backend still auto-renames */ }
     const name = lan.devices.find((d) => d.device_id === fromDevice)?.name || 'the other machine';
-    toast.info(`Asked ${name} to approve — track it in Transfers (top right)`);
+    toast.info(`Pulling from ${name}… — track it in Transfers`);
     try {
       const s = await invoke('lan_pull_files', { deviceId: fromDevice, items, destDir, opts });
       const renamed = Object.keys(s?.renamed || {}).length;
@@ -244,10 +244,6 @@ export function SyncOverlay() {
       const m = errText(e);
       if (m !== 'Cancelled' && m !== 'Request cancelled') toast.error(m, { duration: 9000 });
     }
-  };
-  const importSelected = async (items) => {
-    const dest = await pickFolder('Import to…');
-    if (dest) pullTo(device.device_id, items, dest);
   };
 
   /** Send local `paths` into `dir` of the open remote project. */
@@ -262,7 +258,7 @@ export function SyncOverlay() {
         opts = r;
       }
     } catch { /* best effort */ }
-    toast.info(`Asked ${device.name} to accept — track it in Transfers (top right)`);
+    toast.info(`Sending to ${device.name}… — track it in Transfers`);
     try {
       await invoke('lan_push_files', { deviceId: device.device_id, localPaths: paths, projectId: project.id, dir, opts });
       toast.success(`Sent ${paths.length} item${paths.length === 1 ? '' : 's'} to ${device.name}`);
@@ -270,10 +266,6 @@ export function SyncOverlay() {
       const m = errText(e);
       if (m !== 'Cancelled' && m !== 'Request cancelled') toast.error(m, { duration: 9000 });
     }
-  };
-  const upload = async (dir, directory) => {
-    const paths = await pickUpload(directory);
-    if (paths.length) sendTo(paths, dir);
   };
 
   const importMeta = async (items) => {
@@ -293,7 +285,6 @@ export function SyncOverlay() {
   };
 
   const showBackends = tab === 'backends' && !IS_WEB;
-  const wide = !!usable;
   const [refreshing, setRefreshing] = useState(false);
   const refreshAll = async () => {
     setRefreshing(true);
@@ -304,76 +295,129 @@ export function SyncOverlay() {
       setRefreshing(false);
     }
   };
-  useEffect(() => { setSyncWide(active && wide); }, [active, wide, setSyncWide]);
-  useEffect(() => () => setSyncWide(false), [setSyncWide]);
+
+  const searchRow = (
+    <div className="flex items-center gap-1.5">
+      {!IS_WEB && (
+        <Slider
+          compact={searchOpen}
+          className={cn('min-w-0 transition-[flex-grow] duration-200 ease-out', searchOpen ? 'grow-0' : 'grow')}
+          value={tab}
+          onChange={(v) => { setTab(v); setDeviceId(null); }}
+          options={[
+            { id: 'sync', label: 'Sync', icon: CloudDownload, count: lan.devices.length },
+            { id: 'backends', label: 'Backends', icon: Globe },
+          ]}
+        />
+      )}
+      <div className={cn('relative flex min-w-0 items-center transition-[flex-grow] duration-200 ease-out', searchOpen ? 'grow' : 'grow-0')}>
+        {searchOpen ? (
+          <>
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              ref={searchRef}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === 'Escape' && closeSearch()}
+              placeholder={tab === 'backends' ? 'Search backends…' : 'Search machines…'}
+              className="h-8 pl-8 pr-7 text-[12px]"
+            />
+            {!IS_WEB && (
+              <button
+                type="button"
+                title="Close search"
+                onClick={closeSearch}
+                className="absolute right-1.5 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:text-foreground"
+              >
+                <X className="size-3" />
+              </button>
+            )}
+          </>
+        ) : (
+          <Button size="icon-sm" variant="ghost" className="size-8 shrink-0 text-muted-foreground" title="Search" onClick={() => setSearchOpen(true)}>
+            <Search className="size-3.5" />
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+
+  const machineList = (
+    <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-2">
+      {visible.length === 0 && (
+        <div className="col-span-full flex items-center gap-2 px-2 py-3 text-[11.5px] text-muted-foreground">
+          {q ? 'No matches.' : lan.enabled
+            ? <><Loader2 className="size-3 animate-spin" /> Looking for machines — or add one with +.</>
+            : 'Turn on Discoverable in the header, or add a machine with +.'}
+        </div>
+      )}
+      {visible.map((d) => (
+        <DeviceRow
+          key={d.device_id}
+          d={d}
+          selected={deviceId === d.device_id}
+          onClick={() => selectDevice(d)}
+          onPair={async (x) => { if (await lan.pair(x)) setDeviceId(x.device_id); }}
+          onRename={renameDevice}
+          onForget={forget}
+          renaming={renaming === d.device_id}
+          setRenaming={setRenaming}
+        />
+      ))}
+    </div>
+  );
+
+  const cols = !showBackends && usable;
+  const showFiles = cols && subTab === 'projects' && project;
+  const showPreview = cols && ((subTab === 'projects' && file && project) || (subTab === 'meta' && metaItem));
+  // Default widths per open-column combination (machine · files · preview · my machine).
+  const layoutKey = !cols ? 'list' : `cols-${showFiles ? 'f' : ''}${showPreview ? 'p' : ''}`;
+  const sizes = {
+    'cols-': { machine: '25%', local: '75%' },
+    'cols-f': { machine: '18%', files: '42%', local: '40%' },
+    'cols-fp': { machine: '15%', files: '16%', preview: '50%', local: '19%' },
+    'cols-p': { machine: '18%', preview: '60%', local: '22%' },
+  }[layoutKey] || {};
 
   return (
     <>
-          <div className="flex h-full w-full overflow-hidden bg-sidebar">
-            {/* Machines */}
-            <Column
-              className={wide ? 'w-80 shrink-0' : 'w-full'}
-              title="Cloud & Sync"
-              actions={(
-                <>
-                  {wide && (
-                    <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="Back to the machine list" onClick={() => setDeviceId(null)}><ChevronLeft className="size-4" /></Button>
-                  )}
-                  <Button size="sm" variant="ghost" className="h-7 gap-1 px-2 text-[11.5px] text-muted-foreground hover:text-foreground" title={tab === 'backends' ? 'Add a remote backend' : 'Add a machine by address'} onClick={() => setAdd(tab === 'backends' ? 'backend' : 'sync')}>
-                    <Plus className="size-3.5" /> Add machine
-                  </Button>
-                  <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="Refresh" disabled={refreshing} onClick={refreshAll}><RefreshCw className={cn('size-3.5', refreshing && 'animate-spin')} /></Button>
-                </>
-              )}
-            >
-              <div className="space-y-2 p-2">
-                {!IS_WEB && (
-                  <Slider
-                    value={tab}
-                    onChange={(v) => { setTab(v); setDeviceId(null); }}
-                    options={[
-                      { id: 'sync', label: 'Sync', icon: CloudDownload, count: lan.devices.length },
-                      { id: 'backends', label: 'Backends', icon: Globe },
-                    ]}
-                  />
-                )}
-                <div className="[&_section]:mb-2">
-                  <MyMachine status={lan.status} busy={lan.busy} onToggleLan={lan.toggle} onRename={lan.rename} onRefresh={lan.refreshStatus} defaultOpen={!wide} />
-                </div>
-                {tab === 'backends' && !IS_WEB && <BackendsPanel />}
-                {tab === 'sync' && (
-                  <>
-                    <SearchBox value={query} onChange={setQuery} placeholder="Search machines…" />
-                    <div className="space-y-0.5">
-                      {visible.length === 0 && (
-                        <div className="flex items-center gap-2 px-2 py-3 text-[11.5px] text-muted-foreground">
-                          {q ? 'No matches.' : lan.enabled
-                            ? <><Loader2 className="size-3 animate-spin" /> Looking for machines — or Add machine.</>
-                            : 'Turn on sync under My machine, or Add machine.'}
-                        </div>
-                      )}
-                      {visible.map((d) => (
-                        <DeviceRow
-                          key={d.device_id}
-                          d={d}
-                          selected={deviceId === d.device_id}
-                          onClick={() => selectDevice(d)}
-                          onPair={async (x) => { if (await lan.pair(x)) setDeviceId(x.device_id); }}
-                          onRename={renameDevice}
-                          onForget={forget}
-                          renaming={renaming === d.device_id}
-                          setRenaming={setRenaming}
-                        />
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-            </Column>
+      <ResizablePanelGroup key={layoutKey} orientation="horizontal" className="overflow-hidden bg-sidebar">
+        {!cols && (
+        <ResizablePanel id="sync-machines" defaultSize="100%" minSize="220px">
+          <Column
+            className="w-full"
+            title="Cloud & Sync"
+            actions={(
+              <>
+                <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title={tab === 'backends' ? 'Add a remote backend' : 'Add a machine by address'} onClick={() => setAdd(tab === 'backends' ? 'backend' : 'sync')}>
+                  <Plus className="size-3.5" />
+                </Button>
+                <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="My machine" onClick={() => setMyMachineOpen(true)}>
+                  <Monitor className="size-3.5" />
+                </Button>
+                <span className="flex items-center px-0.5" title={lan.enabled ? 'Discoverable — other machines can find this one' : 'Not discoverable — turn on to let other machines find this one'}>
+                  <Switch checked={lan.enabled} disabled={lan.busy} onCheckedChange={lan.toggle} aria-label="Discoverable" />
+                </span>
+                <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" title="Refresh" disabled={refreshing} onClick={refreshAll}><RefreshCw className={cn('size-3.5', refreshing && 'animate-spin')} /></Button>
+                <TransfersTray alwaysVisible />
+              </>
+            )}
+          >
+            <div className="space-y-2 p-2">
+              {searchRow}
+              {tab === 'backends' && !IS_WEB && <BackendsPanel query={q} />}
+              {tab === 'sync' && machineList}
+            </div>
+          </Column>
+        </ResizablePanel>
+        )}
 
-            {!showBackends && usable && (
+        {cols && (
+          <>
+            <ResizablePanel id="sync-machine" defaultSize={sizes.machine} minSize="220px">
               <MachineColumn
                 device={device}
+                onBack={() => setDeviceId(null)}
                 tab={subTab}
                 setTab={setSubTab}
                 project={project}
@@ -386,20 +430,28 @@ export function SyncOverlay() {
                 localMeta={localMeta}
                 onImportMeta={importMeta}
               />
-            )}
-            {!showBackends && usable && subTab === 'projects' && project && (
+            </ResizablePanel>
+          </>
+        )}
+        {showFiles && (
+          <>
+            <ResizableHandle />
+            <ResizablePanel id="sync-files" defaultSize={sizes.files} minSize="180px">
               <RemoteFiles
                 key={`${device.device_id}:${project.id}`}
                 device={device}
                 project={project}
                 previewPath={file?.path}
                 onPreview={setFile}
-                onImport={importSelected}
-                onUpload={upload}
                 onDropLocal={sendTo}
               />
-            )}
-            {!showBackends && usable && ((subTab === 'projects' && file && project) || (subTab === 'meta' && metaItem)) && (
+            </ResizablePanel>
+          </>
+        )}
+        {showPreview && (
+          <>
+            <ResizableHandle />
+            <ResizablePanel id="sync-preview" defaultSize={sizes.preview} minSize="240px">
               <PreviewColumn
                 device={device}
                 project={project}
@@ -407,18 +459,27 @@ export function SyncOverlay() {
                 metaItem={subTab === 'meta' ? metaItem : null}
                 onClose={() => { setFile(null); setMetaItem(null); }}
               />
-            )}
-            {!showBackends && usable && (
-              <>
-                <div className="flex-1" />
-                <LocalExplorer
-                  canSend={!!(usable && project)}
-                  onSend={(paths) => sendTo(paths, '')}
-                  onDropRemote={(payload, dest) => pullTo(payload.deviceId, payload.items, dest)}
-                />
-              </>
-            )}
-          </div>
+            </ResizablePanel>
+          </>
+        )}
+        {cols && (
+          <>
+            <ResizableHandle />
+            <ResizablePanel id="sync-local" defaultSize={sizes.local} minSize="200px">
+              <LocalExplorer
+                onDropRemote={(payload, dest) => pullTo(payload.deviceId, payload.items, dest)}
+              />
+            </ResizablePanel>
+          </>
+        )}
+      </ResizablePanelGroup>
+
+      <MyMachineDialog
+        open={myMachineOpen}
+        onOpenChange={setMyMachineOpen}
+        status={lan.status}
+        onSaved={lan.refreshStatus}
+      />
 
       <AddMachineDialog
         open={!!add}

@@ -62,6 +62,15 @@ pub trait PeerHost: Send + Sync + 'static {
     fn auto_accept_push(&self) -> bool {
         false
     }
+    /// Whether this machine's screen is locked. Incoming transfer and pairing
+    /// requests are refused while it is (nobody is there to own the result).
+    fn is_locked(&self) -> bool {
+        false
+    }
+    /// Bring this machine's UI to the user's attention (an incoming pairing
+    /// or approval prompt was just raised). Desktop restores/flashes the
+    /// window; headless hosts do nothing.
+    fn request_attention(&self) {}
     /// Machine name used when the user hasn't set one.
     fn default_device_name(&self) -> String {
         hostname()
@@ -522,6 +531,28 @@ pub fn set_internet_mode(data_dir: &Path, mode: Option<&str>) -> Result<(), Stri
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.to_string()),
         },
+    }
+}
+
+/// Whether this machine advertises itself over mDNS on the local network.
+/// Default on; `<data>/lan/no-local` marks "internet only".
+pub fn is_local_reach(data_dir: &Path) -> bool {
+    !lan_dir(data_dir).join("no-local").exists()
+}
+
+/// Persist the local-network advertising switch.
+pub fn set_local_reach(data_dir: &Path, on: bool) -> Result<(), String> {
+    let dir = lan_dir(data_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("no-local");
+    if on {
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    } else {
+        std::fs::write(&path, b"1").map_err(|e| e.to_string())
     }
 }
 

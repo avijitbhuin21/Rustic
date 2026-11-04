@@ -19,6 +19,7 @@ import {
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -102,7 +103,7 @@ export function AudioInputSection() {
       // Tell the prompt-box(es) to re-read the audio flag so the mic toggles
       // immediately — Settings is an in-app panel, so no window focus fires.
       window.dispatchEvent(new Event('audio-input-changed'));
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
   };
 
   const clearChoice = async () => {
@@ -111,7 +112,7 @@ export function AudioInputSection() {
       setProviderKey(''); setModel('');
       refreshAiConfig();
       window.dispatchEvent(new Event('audio-input-changed'));
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
   };
 
   return (

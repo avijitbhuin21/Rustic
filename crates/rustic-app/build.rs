@@ -1,4 +1,4 @@
-//! Embeds the product version (root `package.json`, which `scripts/bump-version.ps1`
+//! Embeds the product version (root `package.json`, which `scripts/bump-version.mjs`
 //! keeps in sync with the desktop app) as `RUSTIC_APP_VERSION`, so the desktop app and
 //! rustic-server report the same version to peers regardless of crate versions.
 

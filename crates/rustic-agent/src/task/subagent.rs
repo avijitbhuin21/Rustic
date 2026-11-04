@@ -249,6 +249,11 @@ pub struct SubagentEntry {
     /// structured metadata in the completion block so the orchestrator can
     /// trust-but-verify without re-deriving the change set.
     pub files_written: std::collections::BTreeSet<String>,
+    /// Write paths of tool calls still awaiting their result, keyed by
+    /// tool_use_id. Promoted into `files_written` only on a successful result,
+    /// so a blocked (WRITE_SCOPE_VIOLATION) or failed write is never reported
+    /// as "Files written".
+    pub pending_writes: std::collections::HashMap<String, Vec<String>>,
     /// Unflushed assistant-text deltas being coalesced into a single entry.
     /// Flushed to `activity` when a non-text event arrives (tool call,
     /// orchestrator message, completion) or appended as a tail entry on read.
@@ -361,6 +366,7 @@ impl SubagentRegistry {
                 last_action: None,
                 activity: VecDeque::new(),
                 files_written: std::collections::BTreeSet::new(),
+            pending_writes: std::collections::HashMap::new(),
                 text_buffer: String::new(),
             },
         );
@@ -599,6 +605,7 @@ impl SubagentRegistry {
         &self,
         parent_task_id: &str,
         agent_id: &str,
+        tool_use_id: &str,
         tool_name: &str,
         input: &serde_json::Value,
     ) {
@@ -610,8 +617,9 @@ impl SubagentRegistry {
             return;
         };
         Self::flush_text_buffer_locked(entry);
-        for p in extract_write_paths(tool_name, input) {
-            entry.files_written.insert(p);
+        let paths = extract_write_paths(tool_name, input);
+        if !paths.is_empty() {
+            entry.pending_writes.insert(tool_use_id.to_string(), paths);
         }
         let input_str = serde_json::to_string(input).unwrap_or_else(|_| "<unprintable>".into());
         let content = format!("{}({})", tool_name, truncate_for_activity(&input_str));
@@ -631,6 +639,7 @@ impl SubagentRegistry {
         &self,
         parent_task_id: &str,
         agent_id: &str,
+        tool_use_id: &str,
         content: &str,
         is_error: bool,
     ) {
@@ -641,6 +650,11 @@ impl SubagentRegistry {
         let Some(entry) = task_agents.get_mut(agent_id) else {
             return;
         };
+        if let Some(paths) = entry.pending_writes.remove(tool_use_id) {
+            if !is_error {
+                entry.files_written.extend(paths);
+            }
+        }
         let prefix = if is_error { "[error]" } else { "[ok]" };
         let body = truncate_for_activity(content);
         entry.activity.push_back(SubagentActivity {

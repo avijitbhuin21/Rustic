@@ -18,8 +18,11 @@ import {
 import {
   Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup, SelectLabel,
 } from '@/components/ui/select';
-import { ScrollArea } from '@/components/ui/scroll-area';
+import { renderMarkdown } from '@/lib/markdown-render';
+import { notifyExtensionsChanged } from '@/lib/extensions-events';
 import { toast } from 'sonner';
+import { copyText } from '@/lib/code-copy';
+import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -40,33 +43,33 @@ export function MarkdownEditDialog({ open, title, name: initialName, body: initi
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent aria-describedby={undefined} className="w-[640px] sm:max-w-[640px] p-0 gap-0">
-        <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">{title}</DialogTitle>
+      <DialogContent aria-describedby={undefined} className="flex max-h-[90vh] w-[720px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[720px]">
+        <DialogHeader className="shrink-0 border-b border-border/60 px-5 pb-3 pt-5">
+          <DialogTitle className="truncate text-[14px]">{title}</DialogTitle>
         </DialogHeader>
-        <div className="px-5 py-4 space-y-3">
+        <div className="flex min-h-0 flex-1 flex-col space-y-3 px-5 py-4">
           {allowRename && (
-            <div>
+            <div className="shrink-0">
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Name</div>
               <Input value={name} onChange={(e) => setName(e.target.value)} className="h-8 text-xs" />
             </div>
           )}
-          <div>
+          <div className="flex min-h-0 flex-1 flex-col">
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Body</div>
             <Textarea
               value={body}
               onChange={(e) => setBody(e.target.value)}
-              className="min-h-[280px] font-mono text-[11px] resize-none"
+              className="h-[55vh] min-h-[200px] resize-none overflow-y-auto font-mono text-[11px] [field-sizing:fixed]"
               spellCheck={false}
             />
           </div>
         </div>
-        <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
+        <DialogFooter className="mx-0 mb-0 shrink-0 border-t border-border/60 px-5 py-3">
           <Button variant="outline" size="sm" className="text-xs" onClick={onClose}>Cancel</Button>
           <Button size="sm" className="text-xs" disabled={saving || !name.trim()} onClick={async () => {
             setSaving(true);
             try { await onSave({ name: name.trim(), body }); onClose(); }
-            catch (e) { toast.error(String(e)); }
+            catch (e) { toastError(null, e); }
             finally { setSaving(false); }
           }}>
             {saving ? 'Saving…' : 'Save'}
@@ -112,16 +115,25 @@ export function MarkdownEntryRow({ entry, onPreview, onEdit, onCopy, onDelete, b
 }
 
 export function PreviewDialog({ open, title, body, onClose }) {
+  const html = useMemo(() => renderMarkdown((body || '').trim()), [body]);
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent aria-describedby={undefined} className="w-[640px] sm:max-w-[640px] p-0 gap-0">
-        <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">{title}</DialogTitle>
+      <DialogContent aria-describedby={undefined} className="flex max-h-[85vh] w-[720px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[720px]">
+        <DialogHeader className="shrink-0 border-b border-border/60 px-5 pb-3 pt-5">
+          <DialogTitle className="truncate text-[14px]">{title}</DialogTitle>
         </DialogHeader>
-        <ScrollArea className="max-h-[60vh]">
-          <pre className="whitespace-pre-wrap px-5 py-4 text-[12px] font-mono">{body || '(empty)'}</pre>
-        </ScrollArea>
-        <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {(body || '').trim() ? (
+            <div
+              className="rustic-markdown min-w-0 break-words px-5 py-4 text-[13px] [&_pre]:overflow-x-auto"
+              // Sanitized by DOMPurify inside renderMarkdown.
+              dangerouslySetInnerHTML={{ __html: html }}
+            />
+          ) : (
+            <p className="px-5 py-4 text-[12px] text-muted-foreground">(empty)</p>
+          )}
+        </div>
+        <DialogFooter className="mx-0 mb-0 shrink-0 border-t border-border/60 px-5 py-3">
           <Button size="sm" className="text-xs" onClick={onClose}>Close</Button>
         </DialogFooter>
       </DialogContent>
@@ -149,13 +161,13 @@ export function SkillsSection() {
     try {
       const body = await invoke('get_skill_body', { name });
       setPreview({ title: name, body });
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
   };
   const openEdit = async (name) => {
     try {
       const body = await invoke('get_skill_body', { name });
       setEdit({ originalName: name, name, body });
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
   };
 
   const save = async ({ name, body }) => {
@@ -164,12 +176,12 @@ export function SkillsSection() {
     } else {
       await invoke('create_skill', { name, body });
     }
-    refresh();
+    notifyExtensionsChanged({ kind: 'skill' });
   };
 
   const remove = async (name) => {
-    try { await invoke('delete_skill', { name }); refresh(); }
-    catch (e) { toast.error(String(e)); }
+    try { await invoke('delete_skill', { name }); notifyExtensionsChanged({ kind: 'skill' }); }
+    catch (e) { toastError(null, e); }
   };
 
   return (
@@ -197,7 +209,7 @@ export function SkillsSection() {
               entry={s}
               onPreview={() => openPreview(s.name)}
               onEdit={() => openEdit(s.name)}
-              onCopy={() => { navigator.clipboard.writeText(s.name); toast.success('Copied'); }}
+              onCopy={() => copyText(s.name).then(() => toast.success('Copied'), (e) => toastError('Copy failed', e))}
               onDelete={() => remove(s.name)}
             />
           ))}
@@ -245,20 +257,20 @@ export function WorkflowsSection() {
 
   const openPreview = async (name) => {
     try { const body = await invoke('get_workflow_body', { name }); setPreview({ title: name, body }); }
-    catch (e) { toast.error(String(e)); }
+    catch (e) { toastError(null, e); }
   };
   const openEdit = async (name) => {
     try { const body = await invoke('get_workflow_body', { name }); setEdit({ originalName: name, name, body }); }
-    catch (e) { toast.error(String(e)); }
+    catch (e) { toastError(null, e); }
   };
   const save = async ({ name, body }) => {
     if (edit?.originalName) await invoke('update_workflow', { originalName: edit.originalName, name, body });
     else await invoke('create_workflow', { name, body });
-    refresh();
+    notifyExtensionsChanged({ kind: 'workflow' });
   };
   const remove = async (name) => {
-    try { await invoke('delete_workflow', { name }); refresh(); }
-    catch (e) { toast.error(String(e)); }
+    try { await invoke('delete_workflow', { name }); notifyExtensionsChanged({ kind: 'workflow' }); }
+    catch (e) { toastError(null, e); }
   };
 
   return (
@@ -286,7 +298,7 @@ export function WorkflowsSection() {
               entry={w}
               onPreview={() => openPreview(w.name)}
               onEdit={() => openEdit(w.name)}
-              onCopy={() => { navigator.clipboard.writeText(w.name); toast.success('Copied'); }}
+              onCopy={() => copyText(w.name).then(() => toast.success('Copied'), (e) => toastError('Copy failed', e))}
               onDelete={() => remove(w.name)}
             />
           ))}
@@ -402,7 +414,7 @@ export function RuleProjectPickerDialog({ open, onClose, ruleName, initialSelect
       await invoke('set_rule_projects', { name: ruleName, projectRoots: picked });
       onSaved?.();
       onClose();
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
     finally { setSaving(false); }
   };
 
@@ -505,20 +517,20 @@ export function RulesSection() {
 
   const openPreview = async (name) => {
     try { const body = await invoke('get_rule_body', { name }); setPreview({ title: name, body }); }
-    catch (e) { toast.error(String(e)); }
+    catch (e) { toastError(null, e); }
   };
   const openEdit = async (name) => {
     try { const body = await invoke('get_rule_body', { name }); setEdit({ originalName: name, name, body }); }
-    catch (e) { toast.error(String(e)); }
+    catch (e) { toastError(null, e); }
   };
   const save = async ({ name, body }) => {
     if (edit?.originalName) await invoke('update_rule', { originalName: edit.originalName, name, body });
     else await invoke('create_rule', { name, body });
-    refresh();
+    notifyExtensionsChanged({ kind: 'rule' });
   };
   const remove = async (name) => {
-    try { await invoke('delete_rule', { name }); refresh(); }
-    catch (e) { toast.error(String(e)); }
+    try { await invoke('delete_rule', { name }); notifyExtensionsChanged({ kind: 'rule' }); }
+    catch (e) { toastError(null, e); }
   };
   // Off / Global flip directly; Project pops the multi-select dialog so the
   // user can choose which projects this rule applies to.
@@ -528,8 +540,8 @@ export function RulesSection() {
       return;
     }
     invoke('set_rule_activation', { name: rule.name, state: next, projectRoot: projectRoot || null })
-      .then(refresh)
-      .catch((e) => toast.error(String(e)));
+      .then(() => notifyExtensionsChanged({ kind: 'rule' }))
+      .catch((e) => toastError(null, e));
   };
 
   return (
@@ -598,7 +610,7 @@ export function RulesSection() {
         ruleName={projectPicker?.name || ''}
         initialSelected={projectPicker?.initial || []}
         onClose={() => setProjectPicker(null)}
-        onSaved={refresh}
+        onSaved={() => notifyExtensionsChanged({ kind: 'rule' })}
       />
       <Dialog open={info} onOpenChange={(v) => !v && setInfo(false)}>
         <DialogContent aria-describedby={undefined} className="w-[480px] sm:max-w-[480px]">

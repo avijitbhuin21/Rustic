@@ -37,6 +37,7 @@ import {
 import { open as openFolderDialog } from '@tauri-apps/plugin-dialog';
 import { toast } from 'sonner';
 import { exportChatAsJson } from '@/lib/export-chat';
+import { useTurns } from '@/lib/turn-builder';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExternalAgents, selectActiveCliSession } from '@/state/external-agents';
@@ -44,7 +45,21 @@ import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
 import { ChatTurn, ChatImageGalleryProvider } from './chat-turn';
 import { CostIndicator } from './cost-indicator';
-import { AgentToolsSheet } from './agent-tools-sheet';
+const AgentToolsSheetImpl = React.lazy(() => import('./agent-tools-sheet'));
+
+/** Mounts the tools sheet (and its markdown/highlight deps) only after it is first opened. */
+function AgentToolsSheet(props) {
+  const [mounted, setMounted] = useState(!!props.open);
+  useEffect(() => {
+    if (props.open) setMounted(true);
+  }, [props.open]);
+  if (!mounted) return null;
+  return (
+    <React.Suspense fallback={null}>
+      <AgentToolsSheetImpl {...props} />
+    </React.Suspense>
+  );
+}
 import { PromptBox } from './prompt-box';
 import { AgentToolDock } from './agent-tool-dock';
 import { StreamRetryBanner } from './stream-retry-banner';
@@ -54,6 +69,7 @@ import { ModelChangeDivider } from './model-change-divider';
 import { parseSpawnedAgentIds } from './tool-call-card';
 import { EmptyState } from './empty-state';
 import { CliChatView } from './cli-chat-view';
+import { AgentMascot } from './agent-mascot';
 
 const EMPTY_MESSAGES = [];
 const EMPTY_MARKERS = [];
@@ -102,75 +118,6 @@ const PROMPT_LAYOUT_ID = 'agent-prompt-box';
 // the panel's slide and the prompt's slide are choreographed (same easing,
 // same duration) instead of feeling like two unrelated motions.
 export const PROMPT_SPRING = { type: 'spring', stiffness: 260, damping: 30, mass: 0.7 };
-
-// Animated agent mark shown on the empty chat screen. Layered motions:
-//   - the whole mark floats gently up/down
-//   - a soft halo behind it breathes (scale + opacity pulse)
-//   - a dashed conic ring orbits clockwise
-//   - the two "eyes" blink in unison every ~5s
-// Built from divs + framer-motion so we don't need an SVG library. Sized to
-// roughly match the previous icon's footprint so the surrounding layout
-// doesn't shift.
-function AnimatedAgentMark() {
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.45, ease: [0.2, 0.65, 0.3, 0.9] }}
-      className="relative grid size-20 place-items-center"
-    >
-      {/* Breathing halo */}
-      <motion.div
-        aria-hidden
-        className="absolute inset-0 rounded-full bg-primary/15 blur-2xl"
-        animate={{ scale: [1, 1.18, 1], opacity: [0.5, 0.85, 0.5] }}
-        transition={{ duration: 3.2, repeat: Infinity, ease: 'easeInOut' }}
-      />
-      {/* Orbiting dashed ring */}
-      <motion.div
-        aria-hidden
-        className="absolute inset-1 rounded-full border border-dashed border-primary/30"
-        animate={{ rotate: 360 }}
-        transition={{ duration: 22, repeat: Infinity, ease: 'linear' }}
-      />
-      {/* Floating robot head */}
-      <motion.div
-        animate={{ y: [0, -3, 0] }}
-        transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
-        className="relative"
-      >
-        {/* Head */}
-        <div className="flex size-12 items-center justify-center gap-1.5 rounded-2xl bg-gradient-to-br from-primary/85 via-primary/65 to-primary/30 shadow-lg shadow-primary/20 ring-1 ring-primary/40 backdrop-blur">
-          {/* Eyes — coordinated blink. Two motion.divs share the same
-              transition so they blink together; the `times` array shapes
-              the blink as a quick downward squish then back. */}
-          <motion.div
-            aria-hidden
-            className="size-1.5 rounded-full bg-primary-foreground"
-            animate={{ scaleY: [1, 0.1, 1, 1] }}
-            transition={{
-              duration: 5,
-              repeat: Infinity,
-              times: [0, 0.06, 0.12, 1],
-              ease: 'easeInOut',
-            }}
-          />
-          <motion.div
-            aria-hidden
-            className="size-1.5 rounded-full bg-primary-foreground"
-            animate={{ scaleY: [1, 0.1, 1, 1] }}
-            transition={{
-              duration: 5,
-              repeat: Infinity,
-              times: [0, 0.06, 0.12, 1],
-              ease: 'easeInOut',
-            }}
-          />
-        </div>
-      </motion.div>
-    </motion.div>
-  );
-}
 
 // Top-of-chat project picker. Surfaces the active project alongside the cost
 // so it's the first thing the user sees, and lets them switch project at any
@@ -233,64 +180,6 @@ function ProjectHeaderPicker() {
       </DropdownMenuContent>
     </DropdownMenu>
   );
-}
-
-function groupToolResults(messages) {
-  const map = {};
-  for (const m of messages || []) {
-    for (const block of m.content || []) {
-      if (block.type === 'tool_result') {
-        map[block.tool_use_id] = {
-          output: block.output,
-          is_error: block.is_error,
-          // Present when the transcript shipped a cut-down output; the card
-          // fetches the rest on expand.
-          truncated: block.truncated,
-          truncatedTaskId: block.truncatedTaskId,
-          truncatedSortOrder: block.truncatedSortOrder,
-          blockIndex: block.block_index,
-        };
-      }
-    }
-  }
-  return map;
-}
-
-// Group flat message stream into turns. A turn = one user message + all the
-// assistant blocks (text, thinking, tool_use) that follow it before the next
-// user message. tool_result blocks are skipped here — they're folded into
-// the tool_use card via the toolResults map. Returning a stable shape so
-// ChatTurn can render each turn with its own sticky user header.
-function buildTurns(messages) {
-  const turns = [];
-  let current = null;
-  for (const m of messages || []) {
-    if (m.role === 'tool') continue;
-    if (m.role === 'user') {
-      current = { user: m, blocks: [] };
-      turns.push(current);
-      continue;
-    }
-    if (m.role === 'assistant') {
-      if (!current) {
-        // Assistant content with no preceding user message — rare, but render
-        // it in its own headerless turn rather than dropping it.
-        current = { user: null, blocks: [] };
-        turns.push(current);
-      }
-      for (const block of m.content || []) {
-        current.blocks.push({
-          block,
-          messageId: m.id,
-          streaming: !!m.streaming,
-          // Forward the message's wall-clock timestamp so per-block timestamps
-          // (e.g. "5s ago" on a tool-call card) can render in the chat.
-          timestamp: m.timestamp || 0,
-        });
-      }
-    }
-  }
-  return turns;
 }
 
 /** Virtualized transcript: only rows near the viewport are mounted (PERF-01). Rows are absolutely positioned via `top` (not transform) so the sticky user headers inside ChatTurn keep working. */
@@ -402,8 +291,7 @@ function SubagentInlineView({ sub, agentId, name, onBack, projectRoot, fontStyle
 
   const messages = sub?.messages || EMPTY_MESSAGES;
   const hasMessages = messages.length > 0;
-  const turns = useMemo(() => buildTurns(messages), [messages]);
-  const toolResults = useMemo(() => groupToolResults(messages), [messages]);
+  const { turns, toolResults } = useTurns(messages);
   const rows = useMemo(
     () =>
       turns.map((turn, idx) => ({
@@ -623,7 +511,7 @@ export function ChatView() {
     };
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
-  }, [activeTaskId, hasMessages]);
+  }, [activeTaskId, hasMessages, openSubagent]);
 
   // Snap to bottom only when the user is already pinned there. Unconditional
   // snapping would break scroll-up during streaming.
@@ -633,14 +521,25 @@ export function ChatView() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, isStreaming]);
 
-  // Switching tasks (or first mount of the scroll container): jump to bottom
-  // and reset pin so the new transcript starts in follow-mode.
+  // Switching tasks, first mount of the scroll container, or returning from a
+  // sub-agent view (which unmounts the container): jump to bottom and reset
+  // pin so the transcript starts in follow-mode.
   useEffect(() => {
+    if (openSubagent) return;
     stickToBottomRef.current = true;
     setPinned(true);
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [activeTaskId, hasMessages]);
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    // The virtualizer re-measures rows over the next frames; snap again once
+    // layout settles so we land on the true bottom, not an estimate.
+    const raf = requestAnimationFrame(() => {
+      if (stickToBottomRef.current && scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [activeTaskId, hasMessages, openSubagent]);
 
   const jumpToBottom = () => {
     stickToBottomRef.current = true;
@@ -649,8 +548,7 @@ export function ChatView() {
     if (el) el.scrollTop = el.scrollHeight;
   };
 
-  const toolResults = useMemo(() => groupToolResults(messages), [messages]);
-  const turns = useMemo(() => buildTurns(messages), [messages]);
+  const { turns, toolResults } = useTurns(messages);
 
   // agentId → human name, recovered from spawn_subagent tool calls: the
   // model's `agents` input carries the names, the tool output carries the
@@ -975,7 +873,7 @@ export function ChatView() {
                   exit={{ opacity: 0, y: -16, transition: { duration: 0.18 } }}
                   className="flex flex-col items-center gap-4 text-center"
                 >
-                  <AnimatedAgentMark />
+                  <AgentMascot size="hero" />
                   <div className="text-lg font-medium tracking-tight text-foreground">
                     Start a conversation
                   </div>

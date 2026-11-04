@@ -21,6 +21,7 @@ import {
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { SearchableSelect } from '@/components/ui/searchable-select';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -121,14 +122,14 @@ export function SubAgentSection() {
       await invoke('set_subagent_concurrency_cap', { cap: capEnabled ? Number(cap) : null });
       toast.success('Sub-agent saved');
       refresh();
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
   };
 
   const clearChoice = async () => {
     try {
       await invoke('clear_subagent_config');
       refresh();
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { toastError(null, e); }
   };
 
   return (

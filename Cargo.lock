@@ -5646,7 +5646,7 @@ dependencies = [
 
 [[package]]
 name = "rustic"
-version = "0.7.8"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5756,6 +5756,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "zip 2.4.2",
  "zstd",
 ]
 

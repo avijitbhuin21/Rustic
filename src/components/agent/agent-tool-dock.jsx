@@ -3,7 +3,10 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import {
+  Bot,
   CheckCircle2,
+  ChevronRight,
+  XCircle,
   Circle,
   CircleDotDashed,
   Clock,
@@ -168,6 +171,53 @@ function TerminalsContent({ terminals, onOpenTerminal, onCloseTerminal }) {
           </button>
         </li>
       ))}
+    </ul>
+  );
+}
+
+/** Lists the task's sub-agents; clicking a row opens its transcript. */
+function SubagentsContent({ subagents, onOpen }) {
+  return (
+    <ul className="flex flex-col">
+      {subagents.map((sub) => {
+        const label =
+          sub.name || sub.prompt?.split('\n')[0]?.trim() || sub.agentId.slice(0, 12);
+        return (
+          <li key={sub.agentId} className="border-b border-border/20 last:border-b-0">
+            <button
+              type="button"
+              onClick={() => onOpen(sub.agentId)}
+              className={cn(
+                'group flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs',
+                'transition-colors hover:bg-foreground/[0.04] focus:bg-foreground/[0.04]',
+                'focus:outline-none',
+              )}
+              title="Open sub-agent transcript"
+            >
+              {sub.status === 'running' ? (
+                <Loader2 className="size-3.5 shrink-0 animate-spin text-primary" />
+              ) : sub.status === 'failed' ? (
+                <XCircle className="size-3.5 shrink-0 text-danger" />
+              ) : (
+                <CheckCircle2 className="size-3.5 shrink-0 text-success" />
+              )}
+              <Bot className="size-3.5 shrink-0 text-muted-foreground/60" />
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground/90">
+                {label}
+              </span>
+              {sub.model && (
+                <span className="hidden max-w-[40%] shrink-0 truncate text-[10px] text-muted-foreground sm:inline">
+                  {sub.model}
+                </span>
+              )}
+              <span className="shrink-0 rounded bg-muted px-1.5 py-px text-[10px] font-medium text-muted-foreground">
+                {sub.status === 'running' ? 'running' : sub.status === 'failed' ? 'failed' : 'done'}
+              </span>
+              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground/50 transition-colors group-hover:text-foreground" />
+            </button>
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -491,6 +541,24 @@ export function AgentToolDock() {
   );
   const sendQueuedNow = useAgent((s) => s.sendQueuedNow);
   const discardQueued = useAgent((s) => s.discardQueued);
+  const subagentMap = useAgent((s) =>
+    activeTaskId ? s.subagentsByTask?.[activeTaskId] || null : null,
+  );
+  const openSubagentView = useAgent((s) => s.openSubagentView);
+  const subagents = useMemo(() => {
+    if (!subagentMap) return EMPTY;
+    return Object.values(subagentMap)
+      .filter(Boolean)
+      .sort((a, b) => {
+        const ar = a.status === 'running' ? 0 : 1;
+        const br = b.status === 'running' ? 0 : 1;
+        return ar - br || (b.createdAt || 0) - (a.createdAt || 0);
+      });
+  }, [subagentMap]);
+  const runningSubagents = useMemo(
+    () => subagents.filter((x) => x.status === 'running').length,
+    [subagents],
+  );
   const todos = useAgent((s) =>
     activeTaskId ? s.todosByTask[activeTaskId] || EMPTY : EMPTY,
   );
@@ -822,7 +890,11 @@ export function AgentToolDock() {
   const activeTabRaw = activeTaskId ? activeByTask[activeTaskId] || null : null;
   // The Queued tab disappears once its last message is sent or discarded;
   // collapse rather than render an orphaned panel.
-  const activeTab = activeTabRaw === 'queued' && queuedItems.length === 0 ? null : activeTabRaw;
+  const activeTab =
+    (activeTabRaw === 'queued' && queuedItems.length === 0) ||
+    (activeTabRaw === 'subagents' && runningSubagents === 0)
+      ? null
+      : activeTabRaw;
   const setActiveTab = (val) => setDockActiveTab(activeTaskId, val);
 
   // Auto-open the Plan tab the first time todos appear for a task — same
@@ -886,6 +958,19 @@ export function AgentToolDock() {
       label: 'Terminals',
       badge: agentTerminals.length > 0 ? String(agentTerminals.length) : null,
     },
+    ...(runningSubagents > 0
+      ? [
+          {
+            id: 'subagents',
+            icon: Bot,
+            label: 'Sub-agents',
+            badge:
+              runningSubagents === subagents.length
+                ? String(runningSubagents)
+                : `${runningSubagents}/${subagents.length}`,
+          },
+        ]
+      : []),
     ...(queuedItems.length > 0
       ? [{ id: 'queued', icon: Clock, label: 'Queued', badge: String(queuedItems.length) }]
       : []),
@@ -964,6 +1049,12 @@ export function AgentToolDock() {
                     terminals={agentTerminals}
                     onOpenTerminal={handleOpenTerminal}
                     onCloseTerminal={handleCloseTerminal}
+                  />
+                )}
+                {activeTab === 'subagents' && (
+                  <SubagentsContent
+                    subagents={subagents}
+                    onOpen={(agentId) => openSubagentView(activeTaskId, agentId)}
                   />
                 )}
                 {activeTab === 'queued' && (

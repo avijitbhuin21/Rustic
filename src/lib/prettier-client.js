@@ -58,14 +58,3 @@ export function formatWithPrettier(language, source, options) {
   });
 }
 
-// Allow the UI to release worker memory on demand (e.g. when toggling
-// format-on-save off, or via an "Unload bundled formatters" action).
-export function terminatePrettierWorker() {
-  if (!worker) return;
-  try { worker.terminate(); } catch {}
-  worker = null;
-  for (const { reject } of pending.values()) {
-    reject(new Error('prettier worker terminated'));
-  }
-  pending.clear();
-}

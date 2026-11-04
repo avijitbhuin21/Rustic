@@ -20,7 +20,7 @@ use rustic_app::sync_ext::MutexExt;
 
 use crate::api::{ok, parse, ApiError};
 use crate::commands::terminal::{
-    emit_terminal_list_changed, preferred_agent_shell, spawn_output_reader, spawn_session_monitor,
+    emit_terminal_list_changed, default_terminal_shell, spawn_output_reader, spawn_session_monitor,
     wait_for_shell_output,
 };
 use crate::context::ServerContext;
@@ -168,7 +168,7 @@ async fn launch(ctx: &ServerContext, target: SpawnTarget) -> Result<Value, ApiEr
 
 fn launch_blocking(ctx: &ServerContext, target: SpawnTarget) -> Result<SpawnedAgent, String> {
     let data_dir = ctx.data_dir();
-    let shell = preferred_agent_shell();
+    let shell = default_terminal_shell();
     let shell_kind = ShellKind::from_program(shell.as_deref());
 
     let prep = {

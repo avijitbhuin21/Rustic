@@ -19,7 +19,7 @@ import {
   Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup, SelectLabel,
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -287,7 +287,7 @@ export function ToolsSection() {
     const next = { ...tool, ...patch };
     setTool(next);
     try { await invoke('set_tool_config', { config: next }); }
-    catch (e) { toast.error(String(e)); refreshTool(); }
+    catch (e) { toastError(null, e); refreshTool(); }
   };
 
   if (!tool) return (

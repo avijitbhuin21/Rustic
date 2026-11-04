@@ -1,0 +1,4 @@
+{
+  "_help": "Moderation for the public issue tracker, applied on every deploy. Each action runs once (tracked by its unique id; never reuse one). op: close | reopen | delete. Example: { \"id\": \"2026-11-05-close-12\", \"op\": \"close\", \"issue\": 12, \"resolution\": \"Fixed in v0.7.9\" }",
+  "actions": []
+}

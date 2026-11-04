@@ -19,7 +19,3 @@ export function useCoarsePointer() {
   return useSyncExternalStore(subscribe, snapshot, () => false);
 }
 
-/** Non-reactive read of the coarse-pointer state, for event handlers and imperative code. */
-export function isCoarsePointer() {
-  return snapshot();
-}

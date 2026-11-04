@@ -16,6 +16,7 @@ import {
   ContextMenuItem, ContextMenuSeparator,
 } from '@/components/ui/context-menu';
 import { toast } from 'sonner';
+import { copyText } from '@/lib/code-copy';
 import { TransfersTray } from '@/components/transfers/transfers-tray';
 
 function trimPath(raw) {
@@ -263,7 +264,7 @@ export function TabBar({ groupId }) {
   };
 
   const handleCopyPath = (path) => {
-    navigator.clipboard.writeText(path).catch(() => toast.error('Could not copy path'));
+    copyText(path).catch(() => toast.error('Could not copy path'));
   };
 
   const handleCopyRelativePath = projectRoot

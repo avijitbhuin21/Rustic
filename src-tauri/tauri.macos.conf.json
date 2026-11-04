@@ -1,6 +1,8 @@
 {
   "bundle": {
     "macOS": {
+      "signingIdentity": "-",
+      "hardenedRuntime": false,
       "entitlements": "./Entitlements.plist"
     }
   }

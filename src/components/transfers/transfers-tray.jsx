@@ -124,8 +124,8 @@ function TransferRow({ t }) {
   );
 }
 
-/** Mounted in the top bar; renders nothing until the first transfer. */
-export function TransfersTray() {
+/** Transfers icon + popover; hidden until the first transfer unless `alwaysVisible`. */
+export function TransfersTray({ alwaysVisible = false, align = 'end' }) {
   const [list, setList] = useState([]);
   const [open, setOpen] = useState(false);
 
@@ -159,7 +159,7 @@ export function TransfersTray() {
     return total ? done / total : null;
   }, [running]);
 
-  if (!list.length) return null;
+  if (!list.length && !alwaysVisible) return null;
   const sorted = [...running, ...list.filter((t) => !RUNNING.has(t.state)).reverse()];
   const clearAll = () => invoke('lan_transfer_clear', {}).then(() => invoke('lan_transfers')).then((l) => Array.isArray(l) && setList(l)).catch(() => {});
 
@@ -179,7 +179,7 @@ export function TransfersTray() {
           )}
         </button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="w-[360px] p-0">
+      <PopoverContent align={align} className="w-[360px] p-0">
         <div className="flex items-center justify-between border-b border-border/50 px-3 py-2">
           <span className="text-[12px] font-semibold">Transfers</span>
           {list.some((t) => !RUNNING.has(t.state)) && (
@@ -189,6 +189,9 @@ export function TransfersTray() {
           )}
         </div>
         <div className="max-h-[420px] overflow-y-auto">
+          {sorted.length === 0 && (
+            <p className="px-3 py-4 text-[11.5px] text-muted-foreground">Nothing sent or received yet. Drag files between machines to start a transfer.</p>
+          )}
           {sorted.map((t) => <TransferRow key={t.id} t={t} />)}
         </div>
       </PopoverContent>

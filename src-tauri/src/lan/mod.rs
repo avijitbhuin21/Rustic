@@ -28,6 +28,26 @@ impl DesktopPeerHost {
 }
 
 impl PeerHost for DesktopPeerHost {
+    fn is_locked(&self) -> bool {
+        crate::screen_lock::is_locked()
+    }
+
+    fn request_attention(&self) {
+        // A minimized / hidden window means the Accept prompt is never seen
+        // (the requester just times out) — restore it and flash the taskbar/dock.
+        if let Some(window) = self.app.get_webview_window("main") {
+            if window.is_minimized().unwrap_or(false) {
+                let _ = window.unminimize();
+            }
+            if !window.is_visible().unwrap_or(true) {
+                let _ = window.show();
+            }
+            if !window.is_focused().unwrap_or(false) {
+                let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+            }
+        }
+    }
+
     fn state(&self) -> &crate::state::AppState {
         self.app.state::<crate::state::AppState>().inner()
     }

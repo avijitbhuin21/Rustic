@@ -220,35 +220,61 @@ fn append_path<W: Write>(tar: &mut tar::Builder<W>, abs: &Path, name: &Path, can
     Ok(())
 }
 
-/// Write `items` as a zstd-compressed tar into `sink`. `cancel` is polled
-/// between files; `progress` gets the cumulative uncompressed bytes written
-/// (≈ file bytes, comparable with [`measure`]).
+/// Selections at or above this size travel as one zstd-compressed tar; smaller
+/// ones go file by file (resumable) or, when archived, as a plain tar.
+pub const COMPRESS_MIN_BYTES: u64 = 50 * 1024 * 1024;
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Write `items` as a tar into `sink`, zstd-compressed when `compress`.
+/// `cancel` is polled between files; `progress` gets the cumulative
+/// uncompressed bytes written (≈ file bytes, comparable with [`measure`]).
 pub fn pack(
     items: &[PackItem],
     sink: impl Write,
+    compress: bool,
     cancel: &dyn Fn() -> bool,
     progress: &dyn Fn(u64),
 ) -> Result<(), String> {
-    let enc = zstd::stream::write::Encoder::new(sink, 1).map_err(|e| e.to_string())?;
-    let counted = Counting { inner: enc, n: 0, progress };
+    if compress {
+        let enc = zstd::stream::write::Encoder::new(sink, 1).map_err(|e| e.to_string())?;
+        let enc = write_tar(items, enc, cancel, progress)?;
+        enc.finish().map_err(|e| e.to_string())?.flush().map_err(|e| e.to_string())
+    } else {
+        write_tar(items, sink, cancel, progress)?.flush().map_err(|e| e.to_string())
+    }
+}
+
+/// Append `items` as tar entries to `w`, returning the writer once the archive is closed.
+fn write_tar<W: Write>(items: &[PackItem], w: W, cancel: &dyn Fn() -> bool, progress: &dyn Fn(u64)) -> Result<W, String> {
+    let counted = Counting { inner: w, n: 0, progress, cancel };
     let mut tar = tar::Builder::new(counted);
     tar.follow_symlinks(false);
     for it in items {
         append_path(&mut tar, &it.abs, Path::new(&it.name), cancel)?;
     }
-    let counted = tar.into_inner().map_err(|e| e.to_string())?;
-    counted.inner.finish().map_err(|e| e.to_string())?.flush().map_err(|e| e.to_string())
+    Ok(tar.into_inner().map_err(|e| e.to_string())?.inner)
 }
 
-/// Reader / writer wrapper reporting cumulative bytes.
+/// Reader / writer wrapper reporting cumulative bytes. `cancel` is polled on
+/// every read/write so one large file can be cancelled mid-stream (not just
+/// between files).
 struct Counting<'a, T> {
     inner: T,
     n: u64,
     progress: &'a dyn Fn(u64),
+    cancel: &'a dyn Fn() -> bool,
+}
+
+fn cancelled_io() -> std::io::Error {
+    std::io::Error::other("cancelled")
 }
 
 impl<T: Write> Write for Counting<'_, T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if (self.cancel)() {
+            return Err(cancelled_io());
+        }
         let k = self.inner.write(buf)?;
         self.n += k as u64;
         (self.progress)(self.n);
@@ -261,6 +287,9 @@ impl<T: Write> Write for Counting<'_, T> {
 
 impl<T: Read> Read for Counting<'_, T> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if (self.cancel)() {
+            return Err(cancelled_io());
+        }
         let k = self.inner.read(buf)?;
         self.n += k as u64;
         (self.progress)(self.n);
@@ -396,10 +425,11 @@ pub struct UnpackSummary {
     pub replaced: Vec<String>,
 }
 
-/// Extract a [`pack`] stream into `dest_dir`. Top-level names that already
-/// exist follow `renames` (explicit, from the user) else `policy`.
+/// Extract a [`pack`] stream (zstd or plain tar, sniffed from the magic bytes)
+/// into `dest_dir`. Top-level names that already exist follow `renames`
+/// (explicit, from the user) else `policy`.
 pub fn unpack(
-    source: impl Read,
+    mut source: impl Read,
     dest_dir: &Path,
     policy: ConflictPolicy,
     renames: &HashMap<String, String>,
@@ -407,8 +437,22 @@ pub fn unpack(
     progress: &dyn Fn(u64),
 ) -> Result<UnpackSummary, String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
-    let dec = zstd::stream::read::Decoder::new(source).map_err(|e| e.to_string())?;
-    let mut archive = tar::Archive::new(Counting { inner: dec, n: 0, progress });
+    let mut head = [0u8; 4];
+    let mut got = 0;
+    while got < head.len() {
+        let k = source.read(&mut head[got..]).map_err(|e| e.to_string())?;
+        if k == 0 {
+            break;
+        }
+        got += k;
+    }
+    let chained = (&head[..got]).chain(source);
+    let dec: Box<dyn Read + '_> = if head[..got] == ZSTD_MAGIC {
+        Box::new(zstd::stream::read::Decoder::new(chained).map_err(|e| e.to_string())?)
+    } else {
+        Box::new(chained)
+    };
+    let mut archive = tar::Archive::new(Counting { inner: dec, n: 0, progress, cancel });
     let mut summary = UnpackSummary::default();
     let mut mapped: HashMap<String, Option<String>> = HashMap::new();
     for entry in archive.entries().map_err(|e| e.to_string())? {
@@ -715,6 +759,23 @@ mod tests {
     }
 
     #[test]
+    fn cancel_stops_packing_inside_one_large_file() {
+        let src = tmp("cancel-src");
+        std::fs::write(src.join("big.bin"), vec![7u8; 4 * 1024 * 1024]).unwrap();
+        let items = vec![PackItem { abs: src.join("big.bin"), name: "big.bin".into() }];
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let mut out = Vec::new();
+        let res = pack(&items, &mut out, false, &|| flag.load(std::sync::atomic::Ordering::SeqCst), &|n| {
+            if n > 64 * 1024 {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        assert!(res.is_err(), "pack must stop when cancelled mid-file");
+        assert!(out.len() < 4 * 1024 * 1024, "stopped before writing the whole file ({} bytes)", out.len());
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
     fn safe_rel_rejects_escapes() {
         assert!(safe_rel("../x").is_err());
         assert!(safe_rel("a/../../x").is_err());
@@ -747,7 +808,15 @@ mod tests {
         ];
         assert_eq!(measure(&items.iter().map(|i| i.abs.clone()).collect::<Vec<_>>()).files, 2);
         let mut buf = Vec::new();
-        pack(&items, &mut buf, &|| false, &|_| {}).unwrap();
+        pack(&items, &mut buf, true, &|| false, &|_| {}).unwrap();
+        assert_eq!(buf[..4], ZSTD_MAGIC);
+        let mut plain = Vec::new();
+        pack(&items, &mut plain, false, &|| false, &|_| {}).unwrap();
+        assert_ne!(plain[..4], ZSTD_MAGIC);
+        let plain_dst = tmp("plain-dst");
+        unpack(&plain[..], &plain_dst, ConflictPolicy::AutoRename, &HashMap::new(), &|| false, &|_| {}).unwrap();
+        assert_eq!(std::fs::read_to_string(plain_dst.join("lib/inner/a.rs")).unwrap(), "fn a() {}");
+        let _ = std::fs::remove_dir_all(&plain_dst);
 
         let dst = tmp("dst");
         std::fs::write(dst.join("readme.md"), "mine").unwrap();

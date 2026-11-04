@@ -79,10 +79,6 @@ export const useLayout = create((set) => ({
   toggleSidebar: () => set((state) => ({ sidebarVisible: !state.sidebarVisible })),
   setIslandOpen: (v) => set({ islandOpen: v }),
   toggleIsland: () => set((state) => ({ islandOpen: !state.islandOpen })),
-  // Cloud & Sync lives in the sidebar; it widens the sidebar while a machine's
-  // columns (projects, files, preview, my explorer) are open.
-  syncWide: false,
-  setSyncWide: (v) => set({ syncWide: v }),
   openSync: () => set({ activeSidebarPanel: SIDEBAR_PANELS.SYNC, sidebarVisible: true }),
   setRightIslandOpen: (v) => set({ rightIslandOpen: v }),
   toggleRightIsland: () => set((state) => ({ rightIslandOpen: !state.rightIslandOpen })),

@@ -20,7 +20,9 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=build /build/target/release/rustic-website /usr/local/bin/rustic-website
 COPY static /app/static
+COPY issue-actions.json /app/issue-actions.json
 ENV WEBSITE_STATIC_DIR=/app/static \
+    ISSUE_ACTIONS_FILE=/app/issue-actions.json \
     PORT=8080
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

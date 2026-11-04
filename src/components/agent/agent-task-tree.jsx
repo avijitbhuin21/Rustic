@@ -47,6 +47,9 @@ function isRunning(task, streamingByTask, statusByTask) {
   if (!task) return false;
   if (streamingByTask[task.id]) return true;
   const status = statusByTask[task.id] ?? task.status;
+  // A task parked on sub-agents has ended its own turn but is still doing
+  // work through its children; keep it in the running state.
+  if (String(status || '').toLowerCase().replace(/_/g, '') === 'waitingonsubagents') return true;
   return status === 'streaming' || status === 'running' || status === 'working' || status === 'preparing';
 }
 

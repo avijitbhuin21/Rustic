@@ -21,7 +21,7 @@ const CHECK_ICON =
 // Best-effort clipboard write. Prefers the async Clipboard API but falls back
 // to a hidden textarea + execCommand for older WebView2 builds / non-secure
 // contexts where navigator.clipboard is unavailable.
-function copyText(text) {
+export function copyText(text) {
   if (navigator.clipboard?.writeText) {
     return navigator.clipboard.writeText(text);
   }

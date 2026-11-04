@@ -15,8 +15,99 @@ import { cn } from '@/lib/utils';
 import { useAgent, fetchMessageBlock } from '@/state/agent';
 import { useRelativeTime } from '@/lib/relative-time';
 import { MediaGallery, parseMediaOutput, stripMediaBlock } from './media-gallery';
+import { activeChatRoot, findPathsInText, joinPath, openFileLink, parsePathCandidate } from '@/lib/file-links';
 
 const MEDIA_TOOLS = new Set(['image_create', 'video_create', 'animate']);
+
+// Above this size the output renders as plain text — scanning multi-MB
+// results for paths on every render isn't worth it.
+const LINKIFY_MAX_CHARS = 200_000;
+
+// Tools whose output lists bare names relative to a directory input.
+const DIR_LISTING_TOOLS = new Set(['list_directory']);
+
+function linkBaseFor(name, input) {
+  const root = activeChatRoot();
+  if (DIR_LISTING_TOOLS.has(name) && input && typeof input.path === 'string') {
+    return joinPath(root, input.path) || root;
+  }
+  return root;
+}
+
+function openPathLink(e, hit, baseDir) {
+  e.preventDefault();
+  e.stopPropagation();
+  openFileLink(hit, { baseDir });
+}
+
+// <pre> body whose file paths (incl. :line:col) are clickable.
+function LinkifiedText({ text, baseDir, allowBare = false }) {
+  const parts = useMemo(() => {
+    if (!text || text.length > LINKIFY_MAX_CHARS) return null;
+    const hits = findPathsInText(text, { allowBare });
+    if (!hits.length) return null;
+    const out = [];
+    let last = 0;
+    hits.forEach((h, i) => {
+      if (h.start > last) out.push(text.slice(last, h.start));
+      out.push(
+        <span
+          key={i}
+          role="link"
+          tabIndex={0}
+          title="Open in editor"
+          className="cursor-pointer underline decoration-dotted underline-offset-2 hover:text-primary"
+          onClick={(e) => openPathLink(e, h, baseDir)}
+          onKeyDown={(e) => { if (e.key === 'Enter') openPathLink(e, h, baseDir); }}
+        >
+          {h.text}
+        </span>,
+      );
+      last = h.end;
+    });
+    if (last < text.length) out.push(text.slice(last));
+    return out;
+  }, [text, baseDir, allowBare]);
+  return parts ?? text;
+}
+
+// The primary file a tool call touched, shown as a clickable chip in the row.
+const PATH_INPUT_KEYS = ['path', 'file_path', 'notebook_path', 'image_path', 'target'];
+function primaryPathOf(name, input) {
+  if (!input || typeof input !== 'object' || DIR_LISTING_TOOLS.has(name)) return null;
+  if (name === 'move_file' && typeof input.new_path === 'string') {
+    return parsePathCandidate(input.new_path);
+  }
+  for (const k of PATH_INPUT_KEYS) {
+    if (typeof input[k] === 'string' && input[k]) {
+      const c = parsePathCandidate(input[k]);
+      if (c) return c;
+    }
+  }
+  return null;
+}
+
+function PathChip({ candidate }) {
+  const base = candidate.path.split(/[\\/]/).pop();
+  const open = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openFileLink(candidate, { baseDir: activeChatRoot() });
+  };
+  return (
+    <span
+      role="link"
+      tabIndex={0}
+      title={`Open ${candidate.path} in editor`}
+      onClick={open}
+      onKeyDown={(e) => { if (e.key === 'Enter') open(e); }}
+      className="min-w-0 shrink truncate font-mono text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-primary"
+    >
+      {base}
+      {candidate.line ? `:${candidate.line}` : ''}
+    </span>
+  );
+}
 
 function formatValue(v) {
   if (v === undefined || v === null) return '';
@@ -630,6 +721,9 @@ function ToolCallCardInner({
     const { description, ...rest } = input;
     return rest;
   }, [input]);
+  const primaryPath = useMemo(() => primaryPathOf(name, input), [name, input]);
+  const linkBase = open ? linkBaseFor(name, input) : null;
+  const allowBare = DIR_LISTING_TOOLS.has(name);
 
   return (
     <div className="flex flex-col">
@@ -657,6 +751,7 @@ function ToolCallCardInner({
               </span>
             )}
           </span>
+          {primaryPath && <PathChip candidate={primaryPath} />}
           {sleepLeft != null ? (
             <span className="min-w-0 truncate font-sans text-muted-foreground tabular-nums">
               Sleeping… {fmtRemaining(sleepLeft)} left
@@ -770,7 +865,7 @@ function ToolCallCardInner({
                           isError ? 'text-destructive' : 'text-foreground/90',
                         )}
                       >
-                        {formatValue(output)}
+                        <LinkifiedText text={formatValue(output)} baseDir={linkBase} />
                       </pre>
                     </div>
                   )}
@@ -789,7 +884,7 @@ function ToolCallCardInner({
                           Input
                         </div>
                         <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-1.5 font-mono text-[11px] text-foreground/90">
-                          {formatValue(displayedInput)}
+                          <LinkifiedText text={formatValue(displayedInput)} baseDir={linkBase} />
                         </pre>
                       </div>
                     )}
@@ -812,7 +907,7 @@ function ToolCallCardInner({
                           isError ? 'text-destructive' : 'text-foreground/90',
                         )}
                       >
-                        {formatValue(displayedOutput)}
+                        <LinkifiedText text={formatValue(displayedOutput)} baseDir={linkBase} allowBare={allowBare} />
                       </pre>
                     </div>
                   )}

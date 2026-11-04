@@ -12,7 +12,7 @@ use crate::commands::terminal::{
 use crate::state::AppState;
 use rustic_agent::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -50,24 +50,28 @@ pub(crate) fn wait_for_shell_output(buffer: &Arc<Mutex<VecDeque<u8>>>, timeout: 
 ///
 /// Returns `None` to let portable-pty use its platform default.
 #[cfg(target_os = "windows")]
-pub(crate) fn preferred_agent_shell() -> Option<String> {
+pub(crate) fn default_terminal_shell() -> Option<String> {
     // pwsh (PowerShell 7+) if installed
     if let Some(p) = find_in_path("pwsh.exe") {
         return Some(p);
     }
     // Windows PowerShell 5.1 ships with every supported Windows version
     let legacy = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
-    if Path::new(legacy).exists() {
+    if std::path::Path::new(legacy).exists() {
         return Some(legacy.to_string());
     }
     None
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn preferred_agent_shell() -> Option<String> {
+pub(crate) fn default_terminal_shell() -> Option<String> {
     // On Unix, $SHELL / portable-pty's default is already the user's shell.
+    // Agent terminals pick their own via `rustic_agent::agent_shell`.
     None
 }
+
+/// Env for agent shells (shared with the server host).
+const AGENT_SHELL_ENV: &[(&str, &str)] = rustic_agent::agent_shell::AGENT_SHELL_ENV;
 
 /// Map a user-supplied `shell` value (short name or full path) to an
 /// executable `portable_pty` can spawn. Returns `None` when the input is
@@ -94,17 +98,7 @@ fn resolve_shell_name(raw: &str) -> Option<String> {
                 }
             }
             "pwsh" => find_in_path("pwsh.exe"),
-            "bash" => {
-                for candidate in [
-                    r"C:\Program Files\Git\bin\bash.exe",
-                    r"C:\Program Files (x86)\Git\bin\bash.exe",
-                ] {
-                    if std::path::Path::new(candidate).exists() {
-                        return Some(candidate.to_string());
-                    }
-                }
-                find_in_path("bash.exe").filter(|p| !p.to_ascii_lowercase().contains("system32"))
-            }
+            "bash" => rustic_agent::agent_shell::git_bash_path(),
             "zsh" => find_in_path("zsh.exe"),
             "sh" => find_in_path("sh.exe"),
             "fish" => find_in_path("fish.exe"),
@@ -167,14 +161,13 @@ impl AgentTerminals for TauriAgentTerminals {
             .terminal_manager
             .lock()
             .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
-        // Agent-specified shell takes priority; fall back to the platform
-        // auto-pick. Short names (`pwsh`, `bash`, …) are resolved to full
-        // paths on Windows because `portable_pty` doesn't always walk PATH
-        // for non-default shells.
+        // Agent-specified shell takes priority; fall back to the shared agent
+        // default (zsh on macOS/Linux, Git Bash on Windows — see
+        // `rustic_agent::agent_shell`, which also feeds the system prompt).
         let shell = shell_override
             .as_deref()
             .and_then(resolve_shell_name)
-            .or_else(preferred_agent_shell);
+            .or_else(rustic_agent::agent_shell::agent_shell_path);
         let is_powershell = shell
             .as_ref()
             .map(|p| {
@@ -185,8 +178,12 @@ impl AgentTerminals for TauriAgentTerminals {
                     || low == "pwsh"
             })
             .unwrap_or(false);
+        let agent_env: Vec<(String, String)> = AGENT_SHELL_ENV
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let (info, reader, buffer, emulator, child) = manager
-            .create_session(cwd, label, true, shell.clone(), None, &[])
+            .create_session(cwd, label, true, shell.clone(), None, &agent_env)
             .map_err(|e| e.to_string())?;
         let id = info.id;
         let pid = info.pid;
@@ -372,13 +369,9 @@ impl AgentTerminals for TauriAgentTerminals {
 
     fn available_shells(&self) -> Vec<String> {
         // Order matters: the first item is what the model will pick by
-        // default when it wants "a shell." Put the most capable one first.
-        #[cfg(target_os = "windows")]
-        let candidates: &[&str] = &["pwsh", "powershell", "cmd", "bash", "zsh", "sh", "fish"];
-        #[cfg(not(target_os = "windows"))]
-        let candidates: &[&str] = &["bash", "zsh", "sh", "fish"];
-
-        candidates
+        // default when it wants "a shell" — keep it in sync with the shell
+        // the system prompt advertises.
+        rustic_agent::agent_shell::preferred_shell_order()
             .iter()
             .filter(|name| resolve_shell_name(name).is_some())
             .map(|s| s.to_string())

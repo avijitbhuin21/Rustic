@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { isTauriAvailable as isTauri } from '@/lib/platform';
 import { Button } from '@/components/ui/button';
@@ -6,39 +6,79 @@ import { Textarea } from '@/components/ui/textarea';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
+import { Skeleton } from '@/components/ui/skeleton';
 import { Save, RefreshCw, Check, X, Play, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
+import { toastError } from '@/lib/toast-error';
 import { useAgent } from '@/state/agent';
+import { cn } from '@/lib/utils';
 
+// Last-loaded panel data per project, so reopening the panel renders instantly
+// while a background refresh runs (list_mcp_servers connects servers and is slow).
+const panelCache = new Map();
+
+/** Merge fresh panel data into the per-project cache. */
+function cachePatch(projectId, patch) {
+  panelCache.set(projectId, { ...panelCache.get(projectId), ...patch });
+}
 
 export function McpPanel() {
   const projectId = useAgent((s) => s.activeProject.id);
-  const [json, setJson] = useState('{\n  "mcpServers": {}\n}');
-  const [servers, setServers] = useState([]);
+  const cached = panelCache.get(projectId);
+  // `null` = not loaded yet (renders a skeleton instead of misleading defaults).
+  const [json, setJson] = useState(cached?.json ?? null);
+  const [servers, setServers] = useState(cached?.servers ?? null);
   // `pending` is the single pending-consent object (or null) returned by
   // `get_pending_mcp_consent` — it carries the contentHash the user is
   // approving so we can pass it back unchanged.
-  const [pending, setPending] = useState(null);
+  const [pending, setPending] = useState(cached?.pending ?? null);
   const [loading, setLoading] = useState(false);
+  const projectRef = useRef(projectId);
+  // Unsaved edits in the textarea must survive a background refresh.
+  const jsonDirty = useRef(false);
+
+  useEffect(() => {
+    projectRef.current = projectId;
+    jsonDirty.current = false;
+    const c = panelCache.get(projectId);
+    setJson(c?.json ?? null);
+    setServers(c?.servers ?? null);
+    setPending(c?.pending ?? null);
+  }, [projectId]);
 
   const load = useCallback(async () => {
     if (!isTauri()) return;
+    const pid = projectId;
+    const current = () => projectRef.current === pid;
     setLoading(true);
-    try {
-      const raw = await invoke('read_mcp_json', { scope: 'project', projectId });
-      if (typeof raw === 'string') setJson(raw);
-    } catch (e) {}
-    try {
-      const list = await invoke('list_mcp_servers', { projectId });
-      setServers(Array.isArray(list) ? list : []);
-    } catch (e) {}
-    try {
-      const pend = await invoke('get_pending_mcp_consent', { projectId });
-      setPending(pend ?? null);
-    } catch (e) {
-      setPending(null);
-    }
-    setLoading(false);
+    const jsonTask = invoke('read_mcp_json', { scope: 'project', projectId: pid })
+      .then((raw) => {
+        if (typeof raw !== 'string') return;
+        cachePatch(pid, { json: raw });
+        if (current() && !jsonDirty.current) setJson(raw);
+      })
+      .catch(() => {
+        if (current()) setJson((j) => j ?? '{\n  "mcpServers": {}\n}');
+      });
+    const listTask = invoke('list_mcp_servers', { projectId: pid })
+      .then((list) => {
+        const next = Array.isArray(list) ? list : [];
+        cachePatch(pid, { servers: next });
+        if (current()) setServers(next);
+      })
+      .catch(() => {
+        if (current()) setServers((s) => s ?? []);
+      });
+    const pendingTask = invoke('get_pending_mcp_consent', { projectId: pid })
+      .then((pend) => {
+        cachePatch(pid, { pending: pend ?? null });
+        if (current()) setPending(pend ?? null);
+      })
+      .catch(() => {
+        if (current()) setPending(null);
+      });
+    await Promise.allSettled([jsonTask, listTask, pendingTask]);
+    if (current()) setLoading(false);
   }, [projectId]);
 
   useEffect(() => {
@@ -63,7 +103,7 @@ export function McpPanel() {
   }, [load]);
 
   const save = async () => {
-    if (!isTauri()) return;
+    if (!isTauri() || json === null) return;
     try {
       JSON.parse(json);
     } catch (e) {
@@ -72,6 +112,8 @@ export function McpPanel() {
     }
     try {
       await invoke('save_mcp_json', { scope: 'project', projectId, content: json });
+      jsonDirty.current = false;
+      cachePatch(projectId, { json });
       toast.success('MCP config saved');
       load();
     } catch (e) {
@@ -90,7 +132,7 @@ export function McpPanel() {
       await invoke('approve_mcp_project_consent', { projectId, contentHash });
       load();
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   };
 
@@ -100,7 +142,7 @@ export function McpPanel() {
       await invoke('revoke_mcp_project_consent', { projectId });
       load();
     } catch (e) {
-      toast.error(String(e));
+      toastError(null, e);
     }
   };
 
@@ -119,22 +161,45 @@ export function McpPanel() {
     try {
       await invoke('remove_mcp_server', { id: serverId });
       load();
-    } catch (e) {}
+    } catch (e) { toastError('Remove failed', e); }
   };
 
   return (
-    <ScrollArea className="h-full">
+    <ScrollArea className="h-full min-h-0 flex-1">
       <div className="space-y-4 p-3">
         <section>
           <div className="mb-1.5 flex items-center justify-between">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               MCP Servers
             </h3>
-            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-xs" onClick={load}>
-              <RefreshCw className="size-3" />
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-1.5 text-xs"
+              onClick={load}
+              disabled={loading}
+              title="Refresh"
+            >
+              <RefreshCw className={cn('size-3', loading && 'animate-spin')} />
             </Button>
           </div>
-          {servers.length === 0 ? (
+          {servers === null ? (
+            <ul className="space-y-1" aria-busy="true" aria-label="Loading MCP servers">
+              {[0, 1, 2].map((i) => (
+                <li
+                  key={i}
+                  className="flex items-center gap-1.5 rounded border border-border bg-muted/30 px-2 py-1.5"
+                >
+                  <Skeleton className="h-3.5 w-28" />
+                  <Skeleton className="h-3.5 w-14" />
+                  <div className="ml-auto flex items-center gap-1">
+                    <Skeleton className="size-5" />
+                    <Skeleton className="size-5" />
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : servers.length === 0 ? (
             <div className="text-xs text-muted-foreground">No servers configured.</div>
           ) : (
             <ul className="space-y-1">
@@ -226,16 +291,29 @@ export function McpPanel() {
             <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               mcp.json
             </h3>
-            <Button size="sm" variant="default" className="h-6 px-2 text-xs" onClick={save} disabled={loading}>
+            <Button
+              size="sm"
+              variant="default"
+              className="h-6 px-2 text-xs"
+              onClick={save}
+              disabled={json === null}
+            >
               <Save className="mr-1 size-3" /> Save
             </Button>
           </div>
-          <Textarea
-            value={json}
-            onChange={(e) => setJson(e.target.value)}
-            className="min-h-[220px] font-mono text-[11px]"
-            spellCheck={false}
-          />
+          {json === null ? (
+            <Skeleton className="h-[220px] w-full" aria-busy="true" aria-label="Loading mcp.json" />
+          ) : (
+            <Textarea
+              value={json}
+              onChange={(e) => {
+                jsonDirty.current = true;
+                setJson(e.target.value);
+              }}
+              className="min-h-[220px] font-mono text-[11px]"
+              spellCheck={false}
+            />
+          )}
         </section>
       </div>
     </ScrollArea>

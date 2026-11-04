@@ -1,15 +1,16 @@
-// Widens the sidebar while Cloud & Sync shows a machine's columns, and puts
-// it back to the user's own width afterwards.
+// Cloud & Sync takes the whole work area (editor + chat pushed to zero width,
+// still mounted) while it's open, and puts the sidebar back to the user's own
+// width afterwards.
 import { useEffect, useRef } from 'react';
 import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
 
-const WIDE = 78;
+const WIDE = 100;
 
 /** `{ panelRef, wide }` for the sidebar `ResizablePanel`. */
 export function useSyncSidebarWidth() {
   const panelRef = useRef(null);
   const savedPct = useRef(null);
-  const wide = useLayout((s) => s.sidebarVisible && s.activeSidebarPanel === SIDEBAR_PANELS.SYNC && s.syncWide);
+  const wide = useLayout((s) => s.sidebarVisible && s.activeSidebarPanel === SIDEBAR_PANELS.SYNC);
 
   useEffect(() => {
     const panel = panelRef.current;

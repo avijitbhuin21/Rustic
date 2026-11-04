@@ -193,6 +193,19 @@ impl PtySession {
         self.child.take()
     }
 
+    /// The pty's foreground process group (`tcgetpgrp` on the master); `None`
+    /// where unsupported (Windows) or on error.
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        #[cfg(unix)]
+        {
+            self.master.process_group_leader().filter(|p| *p > 0)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
         self.writer.write_all(data)?;
         self.writer.flush()?;
@@ -277,10 +290,17 @@ pub fn process_has_children(pid: u32) -> Option<bool> {
 
 #[cfg(target_os = "linux")]
 pub fn process_has_children(pid: u32) -> Option<bool> {
+    child_pids(pid).map(|c| !c.is_empty())
+}
+
+/// Every process whose parent is `pid` (scans `/proc/<n>/stat`).
+#[cfg(target_os = "linux")]
+fn child_pids(pid: u32) -> Option<Vec<u32>> {
     // Scan /proc/<pid>/stat for any process whose PPID is `pid`. Without this
     // the server build (Linux) fell into the "undetermined" branch, so agent
     // terminals never reported command-completion and never auto-closed.
     let entries = std::fs::read_dir("/proc").ok()?;
+    let mut out = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -297,15 +317,91 @@ pub fn process_has_children(pid: u32) -> Option<bool> {
         };
         let mut fields = rest.split_whitespace();
         let _state = fields.next();
-        match fields.next().and_then(|v| v.parse::<u32>().ok()) {
-            Some(ppid) if ppid == pid => return Some(true),
-            _ => continue,
+        if fields.next().and_then(|v| v.parse::<u32>().ok()) == Some(pid) {
+            if let Ok(child) = name.parse::<u32>() {
+                out.push(child);
+            }
         }
     }
-    Some(false)
+    Some(out)
 }
 
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+pub fn process_has_children(pid: u32) -> Option<bool> {
+    child_pids(pid).map(|c| !c.is_empty())
+}
+
+/// Child pids of `pid` via libproc (part of libSystem, always linked).
+#[cfg(target_os = "macos")]
+fn child_pids(pid: u32) -> Option<Vec<u32>> {
+    // Returns the number of child pids written into the buffer, or -1 on
+    // error. A NULL-buffer size probe is only an estimate, so pass a real buffer.
+    extern "C" {
+        fn proc_listchildpids(
+            ppid: i32,
+            buffer: *mut std::ffi::c_void,
+            buffersize: i32,
+        ) -> i32;
+    }
+    let ppid = i32::try_from(pid).ok()?;
+    let mut pids = [0i32; 64];
+    // SAFETY: the buffer is a stack array and we pass its exact byte length.
+    let n = unsafe {
+        proc_listchildpids(
+            ppid,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as i32,
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    Some(
+        pids.iter()
+            .take(n as usize)
+            .filter(|&&p| p > 0)
+            .map(|&p| p as u32)
+            .collect(),
+    )
+}
+
+/// Is the shell `shell_pid` busy with a FOREGROUND command (the agent's
+/// "is my command done?" signal)? `foreground_pgid` is the pty's foreground
+/// process group (`tcgetpgrp`). Busy when another group owns the terminal, or —
+/// for shells without job control — when a child still shares the shell's own
+/// group. Background `cmd &` jobs run in their own group, so a shell sitting at
+/// its prompt with live background jobs reads as NOT busy (it accepts input).
+/// Falls back to "has any child" when the foreground group is unknown.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn shell_command_busy(shell_pid: u32, foreground_pgid: Option<i32>) -> Option<bool> {
+    extern "C" {
+        fn getpgid(pid: i32) -> i32;
+    }
+    let children = child_pids(shell_pid)?;
+    let Some(fg) = foreground_pgid.filter(|g| *g > 0) else {
+        return Some(!children.is_empty());
+    };
+    let shell = i32::try_from(shell_pid).ok()?;
+    // SAFETY: getpgid only reads process metadata; -1 on error is handled.
+    let shell_pgid = unsafe { getpgid(shell) };
+    let shell_pgid = if shell_pgid > 0 { shell_pgid } else { shell };
+    if fg != shell_pgid {
+        return Some(true);
+    }
+    let same_group = children.iter().any(|&c| {
+        // SAFETY: as above.
+        i32::try_from(c).map(|c| unsafe { getpgid(c) } == shell_pgid).unwrap_or(false)
+    });
+    Some(same_group)
+}
+
+/// Platforms without process groups (Windows): any child counts as busy.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn shell_command_busy(shell_pid: u32, _foreground_pgid: Option<i32>) -> Option<bool> {
+    process_has_children(shell_pid)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 pub fn process_has_children(_pid: u32) -> Option<bool> {
     // Not implemented on this platform: returning None makes the idle-close
     // heuristic treat the shell as busy, so it never auto-closes. The
@@ -329,4 +425,130 @@ pub fn read_tail(buffer: &Arc<Mutex<VecDeque<u8>>>, max_bytes: usize) -> String 
         bytes.extend_from_slice(&back[start - front.len()..]);
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+    use super::process_has_children;
+
+    #[test]
+    fn detects_live_child_and_childless_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        assert_eq!(process_has_children(std::process::id()), Some(true));
+        assert_eq!(process_has_children(child.id()), Some(false));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The session monitor's command-completion signal, end to end through a
+    /// real pty: for each installed shell, a running command shows a child,
+    /// and the shell drops back to childless once it finishes.
+    #[test]
+    fn pty_shell_child_state_tracks_command_lifecycle() {
+        use super::PtySession;
+        use std::time::{Duration, Instant};
+        let wait_for = |pid: u32, want: bool, within: Duration| -> bool {
+            let start = Instant::now();
+            while start.elapsed() < within {
+                if process_has_children(pid) == Some(want) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        for shell in ["/bin/bash", "/bin/zsh", "/bin/sh"] {
+            if !std::path::Path::new(shell).is_file() {
+                continue;
+            }
+            let mut s = PtySession::new(
+                std::env::temp_dir(),
+                "t".into(),
+                true,
+                Some(shell.to_string()),
+                None,
+                &[],
+            )
+            .expect("spawn pty shell");
+            // Drain output so the shell never blocks on a full pty.
+            let mut reader = s.take_reader().expect("reader");
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while matches!(std::io::Read::read(&mut reader, &mut buf), Ok(n) if n > 0) {}
+            });
+            let pid = s.pid.expect("shell pid");
+            assert!(
+                wait_for(pid, false, Duration::from_secs(5)),
+                "{shell}: idle shell should be childless"
+            );
+            s.write(b"sleep 2\r").expect("write");
+            assert!(
+                wait_for(pid, true, Duration::from_secs(5)),
+                "{shell}: running command should be visible as a child"
+            );
+            assert!(
+                wait_for(pid, false, Duration::from_secs(6)),
+                "{shell}: finished command should leave the shell childless"
+            );
+            let _ = s.write(b"exit\r");
+            if let Some(mut c) = s.take_child() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    /// A `cmd &` background job keeps the shell's child alive but must not
+    /// count as a busy foreground command; a foreground command must.
+    #[test]
+    fn background_job_is_not_a_busy_command() {
+        use super::{shell_command_busy, PtySession};
+        use std::time::{Duration, Instant};
+        for shell in ["/bin/bash", "/bin/zsh"] {
+            if !std::path::Path::new(shell).is_file() {
+                continue;
+            }
+            let mut s = PtySession::new(std::env::temp_dir(), "t".into(), true, Some(shell.to_string()), None, &[])
+                .expect("spawn pty shell");
+            let mut reader = s.take_reader().expect("reader");
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while matches!(std::io::Read::read(&mut reader, &mut buf), Ok(n) if n > 0) {}
+            });
+            let pid = s.pid.expect("shell pid");
+            let poll = |s: &PtySession, want: bool, within: Duration| {
+                let start = Instant::now();
+                while start.elapsed() < within {
+                    if shell_command_busy(pid, s.foreground_pgid()) == Some(want) {
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                false
+            };
+            assert!(poll(&s, false, Duration::from_secs(5)), "{shell}: idle shell is not busy");
+            s.write(b"sleep 3 &\r").expect("write");
+            assert!(
+                super::process_has_children(pid) == Some(true)
+                    || {
+                        std::thread::sleep(Duration::from_millis(500));
+                        super::process_has_children(pid) == Some(true)
+                    },
+                "{shell}: background job is a child"
+            );
+            std::thread::sleep(Duration::from_millis(400));
+            assert_eq!(shell_command_busy(pid, s.foreground_pgid()), Some(false), "{shell}: background job is not busy");
+            s.write(b"sleep 2\r").expect("write");
+            assert!(poll(&s, true, Duration::from_secs(5)), "{shell}: foreground command is busy");
+            assert!(poll(&s, false, Duration::from_secs(6)), "{shell}: finished foreground command is not busy");
+            let _ = s.write(b"exit\r");
+            if let Some(mut c) = s.take_child() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
 }

@@ -440,6 +440,17 @@ pub(crate) async fn check_sensitive_path(
     None // allow
 }
 
+/// True for paths inside the project's `.rustic/tmp/` scratch directory
+/// (relative or absolute under `project_root`), with no `..` escapes.
+pub(crate) fn is_scratch_path(project_root: &std::path::Path, rel_path: &str) -> bool {
+    let mut normalized = rel_path.replace('\\', "/");
+    if let Ok(rel) = std::path::Path::new(rel_path).strip_prefix(project_root) {
+        normalized = rel.to_string_lossy().replace('\\', "/");
+    }
+    let normalized = normalized.trim_start_matches("./");
+    normalized.starts_with(".rustic/tmp/") && !normalized.split('/').any(|seg| seg == "..")
+}
+
 /// Returns `Some(error)` when `rel_path` is outside the sub-agent's declared write scope.
 pub(crate) fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option<ToolOutput> {
     let scope = match &context.write_scope {
@@ -447,6 +458,11 @@ pub(crate) fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option
         Some(s) => s,
     };
 
+    // Scratch space is always writable — the prompt tells every agent to put
+    // throwaway files under `.rustic/tmp/`, read-only sub-agents included.
+    if is_scratch_path(&context.project_root, rel_path) {
+        return None;
+    }
     let normalized = rel_path.replace('\\', "/");
     let in_scope = scope
         .iter()
@@ -484,10 +500,13 @@ pub(crate) fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option
 
 const DEFAULT_READ_LIMIT: usize = 500;
 
-// Two-layer read cap: 256 KB byte gate (pre-read stat) + 25K token estimate (post-read).
-// Both are overridable via env var for power users.
+// Two-layer read cap: 256 KB byte gate (pre-read stat) + 10K token estimate (post-read).
+// Both are overridable via env var for power users. The token cap only
+// truncates default-window reads; explicit offset/limit ranges may go up to
+// `P1_11_MAX_EXPLICIT_TOKEN_ESTIMATE`.
 const P1_11_MAX_READ_BYTES: u64 = 256 * 1024;
-const P1_11_MAX_TOKEN_ESTIMATE: usize = 25_000;
+const P1_11_MAX_TOKEN_ESTIMATE: usize = 10_000;
+const P1_11_MAX_EXPLICIT_TOKEN_ESTIMATE: usize = 25_000;
 
 const CONTEXT_LINES: usize = 150;
 const MAX_CONTEXT_LINES: usize = 300;
@@ -517,10 +536,11 @@ pub fn definitions() -> Vec<ToolDef> {
                             sheet, first 500 rows.\n\
                           • Legacy binary OLE (`.doc` / `.xls`): not supported — convert to \
                             the modern .docx / .xlsx first.\n\
-                          • Files are capped pre-read at 256 KB (text) and post-read at an \
-                            estimated 25K tokens. Passing an explicit range that exceeds \
-                            either cap returns an error pointing at a smaller range — \
-                            preferred over silent truncation.\n\
+                          • Files are capped pre-read at 256 KB (text). A read without \
+                            `offset` / `limit` returns at most ~10K tokens (truncated with a \
+                            notice); pass an explicit `offset` / `limit` to read further — \
+                            explicit ranges may return up to ~25K tokens, beyond which an \
+                            error points at a smaller range.\n\
                           • Do NOT re-read a file you've already read in this task unless it \
                             was modified since. If you try anyway, the tool returns a \
                             FILE_UNCHANGED stub instead of the bytes — refer to the earlier \
@@ -1001,13 +1021,18 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
                     (start + 1, end.max(start + 1), selected.join("\n"))
                 };
 
-            let token_cap: usize = std::env::var("RUSTIC_FILE_READ_MAX_OUTPUT_TOKENS")
+            let env_cap: Option<usize> = std::env::var("RUSTIC_FILE_READ_MAX_OUTPUT_TOKENS")
                 .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(P1_11_MAX_TOKEN_ESTIMATE);
+                .and_then(|s| s.parse::<usize>().ok());
+            let explicit_range = start_line.is_some() || end_line.is_some();
+            let token_cap: usize = env_cap.unwrap_or(if explicit_range {
+                P1_11_MAX_EXPLICIT_TOKEN_ESTIMATE
+            } else {
+                P1_11_MAX_TOKEN_ESTIMATE
+            });
             let estimated_tokens = output.len() / 4;
             if estimated_tokens > token_cap {
-                if start_line.is_some() || end_line.is_some() {
+                if explicit_range {
                     return Ok(ToolOutput {
                         content: format!(
                             "READ_TOO_LARGE: '{}' range ≈{} tokens (cap = {}). Even with \
@@ -3777,5 +3802,23 @@ mod concurrent_write_tests {
         );
         let text = std::fs::read_to_string(dir.path().join("new.txt")).unwrap();
         assert!(text == "from A" || text == "from B", "got: {}", text);
+    }
+}
+
+#[cfg(test)]
+mod scratch_scope_tests {
+    use super::is_scratch_path;
+    use std::path::Path;
+
+    #[test]
+    fn rustic_tmp_is_scratch() {
+        let root = Path::new("/proj");
+        assert!(is_scratch_path(root, ".rustic/tmp/a.mjs"));
+        assert!(is_scratch_path(root, "./.rustic/tmp/x/y.txt"));
+        assert!(is_scratch_path(root, "/proj/.rustic/tmp/a.txt"));
+        assert!(is_scratch_path(root, ".rustic\\tmp\\a.txt"));
+        assert!(!is_scratch_path(root, ".rustic/tmp/../memory/MEMORY.md"));
+        assert!(!is_scratch_path(root, ".rustic/memory/MEMORY.md"));
+        assert!(!is_scratch_path(root, "src/.rustic/tmp/a"));
     }
 }
