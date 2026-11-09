@@ -82,25 +82,56 @@ pub async fn start(port: u16, bin: &std::path::Path) -> Result<Tunnel, String> {
     }
 }
 
-/// Official release asset for this platform, and whether it's a `.tgz`.
-/// Source: Cloudflare's GitHub releases (linked from their downloads page).
-fn release_asset() -> Option<(&'static str, bool)> {
+/// Official release asset for this platform, whether it's a `.tgz`, and its
+/// SHA-256 (from the GitHub release API `digest` of [`CLOUDFLARED_VERSION`]).
+fn release_asset() -> Option<(&'static str, bool, &'static str)> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Some(("cloudflared-windows-amd64.exe", false)),
-        ("windows", "x86") => Some(("cloudflared-windows-386.exe", false)),
-        ("linux", "x86_64") => Some(("cloudflared-linux-amd64", false)),
-        ("linux", "aarch64") => Some(("cloudflared-linux-arm64", false)),
-        ("macos", "x86_64") => Some(("cloudflared-darwin-amd64.tgz", true)),
-        ("macos", "aarch64") => Some(("cloudflared-darwin-arm64.tgz", true)),
+        ("windows", "x86_64") => Some((
+            "cloudflared-windows-amd64.exe",
+            false,
+            "5253e66f1f493c4e13539749f1aa86fd0c61e3072900fec29a44ba046a6d97e2",
+        )),
+        ("windows", "x86") => Some((
+            "cloudflared-windows-386.exe",
+            false,
+            "52f63fb7055e5797e79585b0e1dbfb397046b1ed5edee29901d433dc16b94042",
+        )),
+        ("linux", "x86_64") => Some((
+            "cloudflared-linux-amd64",
+            false,
+            "5861a10a438fe8ddcfebb3b830f83966cbf193edafce0fe2eeb198fbae1f7a22",
+        )),
+        ("linux", "aarch64") => Some((
+            "cloudflared-linux-arm64",
+            false,
+            "59816ce9b16db71f5bc2a86d59b3632a96c8c3ee934bde2bc8641ee83a6070eb",
+        )),
+        ("macos", "x86_64") => Some((
+            "cloudflared-darwin-amd64.tgz",
+            true,
+            "d7a66b525fe76820da6e5406611b61e48b40de682368ac00454d9158f085be4b",
+        )),
+        ("macos", "aarch64") => Some((
+            "cloudflared-darwin-arm64.tgz",
+            true,
+            "f6d4c439c6c782b83264951d327989ce5e23373acc5942b872411601fedb020d",
+        )),
         _ => None,
     }
 }
 
-const RELEASE_BASE: &str = "https://github.com/cloudflare/cloudflared/releases/latest/download";
+/// Pinned cloudflared release; keep in sync with `CLOUDFLARED_VERSION` in the Dockerfile.
+const CLOUDFLARED_VERSION: &str = "2026.6.1";
+
+const RELEASE_BASE: &str = "https://github.com/cloudflare/cloudflared/releases/download";
 
 /// Where Rustic keeps its own copy of cloudflared.
 pub fn managed_path(data_dir: &std::path::Path) -> std::path::PathBuf {
-    let name = if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" };
+    let name = if cfg!(windows) {
+        "cloudflared.exe"
+    } else {
+        "cloudflared"
+    };
     data_dir.join("bin").join(name)
 }
 
@@ -147,7 +178,7 @@ pub async fn ensure_binary(
     if let Some(p) = find_binary(data_dir).await {
         return Ok(p);
     }
-    let (asset, tgz) = release_asset().ok_or_else(|| {
+    let (asset, tgz, expected_sha) = release_asset().ok_or_else(|| {
         format!(
             "No cloudflared build for {}/{} — install it manually or use port forwarding.",
             std::env::consts::OS,
@@ -156,7 +187,9 @@ pub async fn ensure_binary(
     })?;
     let dest = managed_path(data_dir);
     let dir = dest.parent().ok_or("bad data dir")?.to_path_buf();
-    tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
     let tmp = dir.join(format!("{asset}.part"));
 
     let client = reqwest::Client::builder()
@@ -164,27 +197,47 @@ pub async fn ensure_binary(
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
-        .get(format!("{RELEASE_BASE}/{asset}"))
+        .get(format!("{RELEASE_BASE}/{CLOUDFLARED_VERSION}/{asset}"))
         .send()
         .await
         .map_err(|e| format!("Downloading cloudflared failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("Downloading cloudflared failed (HTTP {})", resp.status()));
+        return Err(format!(
+            "Downloading cloudflared failed (HTTP {})",
+            resp.status()
+        ));
     }
     let total = resp.content_length().unwrap_or(0);
     {
         use futures_util::StreamExt;
+        use sha2::{Digest, Sha256};
         use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut hasher = Sha256::new();
         let mut stream = resp.bytes_stream();
         let mut done: u64 = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("Downloading cloudflared failed: {e}"))?;
+            hasher.update(&chunk);
             file.write_all(&chunk).await.map_err(|e| e.to_string())?;
             done += chunk.len() as u64;
             progress(done, total);
         }
         file.flush().await.map_err(|e| e.to_string())?;
+        drop(file);
+        let actual: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if !actual.eq_ignore_ascii_case(expected_sha) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(format!(
+                "Downloaded cloudflared failed its checksum (expected {expected_sha}, got {actual}) — not installing it."
+            ));
+        }
     }
 
     if tgz {
@@ -196,7 +249,9 @@ pub async fn ensure_binary(
         let _ = tokio::fs::remove_file(&tmp).await;
     } else {
         let _ = tokio::fs::remove_file(&dest).await;
-        tokio::fs::rename(&tmp, &dest).await.map_err(|e| e.to_string())?;
+        tokio::fs::rename(&tmp, &dest)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(unix)]
     {
@@ -204,7 +259,9 @@ pub async fn ensure_binary(
         let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
     }
     if !runs(&dest).await {
-        return Err("Downloaded cloudflared but it won't run — your antivirus may have blocked it.".into());
+        return Err(
+            "Downloaded cloudflared but it won't run — your antivirus may have blocked it.".into(),
+        );
     }
     Ok(dest)
 }
@@ -247,16 +304,33 @@ mod tests {
     #[test]
     fn this_platform_has_a_release_asset() {
         if cfg!(all(windows, target_arch = "x86_64")) {
-            assert_eq!(release_asset(), Some(("cloudflared-windows-amd64.exe", false)));
+            assert_eq!(
+                release_asset().map(|(name, tgz, _)| (name, tgz)),
+                Some(("cloudflared-windows-amd64.exe", false))
+            );
+        }
+        if let Some((_, _, sha)) = release_asset() {
+            assert_eq!(sha.len(), 64);
+            assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
         }
         let p = managed_path(std::path::Path::new("data"));
-        assert!(p.ends_with(if cfg!(windows) { "bin/cloudflared.exe" } else { "bin/cloudflared" }));
+        assert!(p.ends_with(if cfg!(windows) {
+            "bin/cloudflared.exe"
+        } else {
+            "bin/cloudflared"
+        }));
     }
 
     #[test]
     fn extracts_trycloudflare_url() {
         let line = "2026-10-01 INF |  https://brave-fox-123.trycloudflare.com                  |";
-        assert_eq!(extract_url(line).as_deref(), Some("https://brave-fox-123.trycloudflare.com"));
-        assert_eq!(extract_url("INF Starting metrics server on 127.0.0.1:20241/metrics"), None);
+        assert_eq!(
+            extract_url(line).as_deref(),
+            Some("https://brave-fox-123.trycloudflare.com")
+        );
+        assert_eq!(
+            extract_url("INF Starting metrics server on 127.0.0.1:20241/metrics"),
+            None
+        );
     }
 }

@@ -226,7 +226,7 @@ fn proxy_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("proxy reqwest client")
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
@@ -317,10 +317,10 @@ async fn ws_pipe(client: WebSocket, upstream_url: String, port: u16, proto: Opti
     let c2u = async {
         while let Some(Ok(msg)) = client_rx.next().await {
             let out = match msg {
-                AxMessage::Text(t) => TMessage::Text(t.into()),
-                AxMessage::Binary(b) => TMessage::Binary(b.into()),
-                AxMessage::Ping(b) => TMessage::Ping(b.into()),
-                AxMessage::Pong(b) => TMessage::Pong(b.into()),
+                AxMessage::Text(t) => TMessage::Text(t),
+                AxMessage::Binary(b) => TMessage::Binary(b),
+                AxMessage::Ping(b) => TMessage::Ping(b),
+                AxMessage::Pong(b) => TMessage::Pong(b),
                 AxMessage::Close(_) => break,
             };
             if up_tx.send(out).await.is_err() {

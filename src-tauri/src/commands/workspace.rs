@@ -342,7 +342,7 @@ pub async fn list_project_worktrees(
         workspace
             .list_projects()
             .into_iter()
-            .find(|p| p.id.to_string() == project_id)
+            .find(|p| p.id == project_id)
             .map(|p| p.root_path)
             .ok_or_else(|| format!("Project not found: {}", project_id))?
     };

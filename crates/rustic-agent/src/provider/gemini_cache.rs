@@ -30,8 +30,13 @@ pub const PREFIX_FIELDS: [&str; 3] = ["systemInstruction", "tools", "toolConfig"
 enum Entry {
     /// Prefix seen once; create on the next sighting.
     Seen,
-    Ready { name: String, expires: Instant },
-    Failed { until: Instant },
+    Ready {
+        name: String,
+        expires: Instant,
+    },
+    Failed {
+        until: Instant,
+    },
 }
 
 static CACHES: LazyLock<Mutex<HashMap<String, Entry>>> =
@@ -55,7 +60,12 @@ pub fn prefix_of(body: &Value) -> Option<serde_json::Map<String, Value>> {
     (size / 4 >= MIN_CACHE_TOKENS).then_some(prefix)
 }
 
-pub fn cache_key(base: &str, model: &str, api_key: &str, prefix: &serde_json::Map<String, Value>) -> String {
+pub fn cache_key(
+    base: &str,
+    model: &str,
+    api_key: &str,
+    prefix: &serde_json::Map<String, Value>,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for part in [base, model, api_key] {
@@ -95,7 +105,12 @@ fn store(key: &str, entry: Entry) {
 
 /// Mark the cache for `key` unusable (request using it was rejected).
 pub fn invalidate(key: &str) {
-    store(key, Entry::Failed { until: Instant::now() + FAILURE_BACKOFF });
+    store(
+        key,
+        Entry::Failed {
+            until: Instant::now() + FAILURE_BACKOFF,
+        },
+    );
 }
 
 /// Returns a `cachedContents/...` name to use for this request, creating the
@@ -195,7 +210,8 @@ mod tests {
 
     #[test]
     fn small_prefix_is_not_cached() {
-        let body = json!({ "systemInstruction": { "parts": [{ "text": "short" }] }, "contents": [] });
+        let body =
+            json!({ "systemInstruction": { "parts": [{ "text": "short" }] }, "contents": [] });
         assert!(prefix_of(&body).is_none());
     }
 
@@ -227,10 +243,19 @@ mod tests {
         assert!(matches!(decide(key), Action::Skip)); // parked
         store(
             key,
-            Entry::Ready { name: "cachedContents/n".into(), expires: Instant::now() + Duration::from_secs(5) },
+            Entry::Ready {
+                name: "cachedContents/n".into(),
+                expires: Instant::now() + Duration::from_secs(5),
+            },
         );
         assert!(matches!(decide(key), Action::Use(n) if n == "cachedContents/n"));
-        store(key, Entry::Ready { name: "cachedContents/old".into(), expires: Instant::now() });
+        store(
+            key,
+            Entry::Ready {
+                name: "cachedContents/old".into(),
+                expires: Instant::now(),
+            },
+        );
         assert!(matches!(decide(key), Action::Create)); // expired → recreate
     }
 }

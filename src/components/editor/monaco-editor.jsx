@@ -9,6 +9,8 @@ import { useSettings } from '@/state/settings';
 import { formatWithPrettier, isPrettierLanguage } from '@/lib/prettier-client';
 import { useFileChangeEffect } from '@/lib/use-file-change';
 import { resolveSaveConflict } from './save-conflict-dialog';
+import { getUnsavedBuffer, setUnsavedBuffer, dropUnsavedBuffer } from '@/lib/unsaved-buffers';
+import { UnsupportedFileView } from './unsupported-file-view';
 import { watchMonacoTheme } from '@/lib/monaco-theme';
 import {
   setActiveEditor,
@@ -273,8 +275,15 @@ export default function MonacoEditor({ tab }) {
 
   // Apply content to the editor and remove the loading overlay.
   const applyContent = useCallback((editor, text) => {
-    originalRef.current = text;
-    editor.setValue(text);
+    const cached = getUnsavedBuffer(tab.id);
+    if (cached) {
+      originalRef.current = cached.original;
+      editor.setValue(cached.value);
+      setDirty(tab.id, true);
+    } else {
+      originalRef.current = text;
+      editor.setValue(text);
+    }
     setLoading(false);
 
     const { pendingNav, clearPendingNav } = useEditor.getState();
@@ -294,7 +303,7 @@ export default function MonacoEditor({ tab }) {
     }
     const pos = editor.getPosition();
     if (pos) setCursor(pos.lineNumber, pos.column);
-  }, [setCursor, tab.id, applySearchHighlight]);
+  }, [setCursor, setDirty, tab.id, applySearchHighlight]);
 
   // Handle the case where the target file is already the active tab.
   // applyContent only fires on content load (remount), so if the user clicks
@@ -524,6 +533,7 @@ export default function MonacoEditor({ tab }) {
         if (choice.action === 'take-disk') {
           originalRef.current = disk;
           applyFormattedContent(editor, disk);
+          dropUnsavedBuffer(tab.id);
           setDirty(tab.id, false);
           return;
         }
@@ -535,6 +545,7 @@ export default function MonacoEditor({ tab }) {
       }
       await writeTextFileScoped(tab.path, toWrite);
       originalRef.current = toWrite;
+      dropUnsavedBuffer(tab.id);
       setDirty(tab.id, false);
       toast.success(`Saved ${tab.title}`);
       try {
@@ -551,13 +562,18 @@ export default function MonacoEditor({ tab }) {
 
   const handleChange = useCallback(
     (value) => {
-      const dirty = (value ?? '') !== originalRef.current;
+      const v = value ?? '';
+      const dirty = v !== originalRef.current;
+      setUnsavedBuffer(tab.id, v, originalRef.current);
       setDirty(tab.id, dirty);
     },
     [tab.id, setDirty]
   );
 
   if (error) {
+    if (/utf-?8|invalid (unicode|byte)|binary/i.test(error)) {
+      return <UnsupportedFileView tab={tab} />;
+    }
     return (
       <div className="flex h-full w-full items-center justify-center p-4 text-sm text-destructive">
         Failed to open: {error}

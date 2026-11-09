@@ -232,7 +232,9 @@ fn set_path(body: &mut Value, path: &str, value: Value) {
         if !cur.is_object() {
             *cur = json!({});
         }
-        let obj = cur.as_object_mut().unwrap();
+        let Some(obj) = cur.as_object_mut() else {
+            return;
+        };
         if parts.peek().is_none() {
             obj.insert(part.to_string(), value);
             return;

@@ -41,7 +41,8 @@ fn load(db: &Database) -> Result<UserSettings, String> {
 
 fn save(db: &Database, settings: &UserSettings) -> Result<(), String> {
     let json = serde_json::to_string(settings).map_err(|e| e.to_string())?;
-    db.set_setting("user_settings", &json).map_err(|e| e.to_string())
+    db.set_setting("user_settings", &json)
+        .map_err(|e| e.to_string())
 }
 
 pub fn get_settings(state: &AppState) -> Result<UserSettings, String> {
@@ -78,12 +79,21 @@ pub fn list_themes(state: &AppState) -> Result<Vec<ThemeInfo>, String> {
         .into_iter()
         .map(|name| ThemeInfo {
             name: name.to_string(),
-            kind: if name.contains("Light") { "light" } else { "dark" }.to_string(),
+            kind: if name.contains("Light") {
+                "light"
+            } else {
+                "dark"
+            }
+            .to_string(),
             is_builtin: true,
         })
         .collect();
     for name in load(&db)?.theme.custom_themes {
-        themes.push(ThemeInfo { name, kind: "dark".to_string(), is_builtin: false });
+        themes.push(ThemeInfo {
+            name,
+            kind: "dark".to_string(),
+            is_builtin: false,
+        });
     }
     Ok(themes)
 }
@@ -92,7 +102,8 @@ pub fn list_themes(state: &AppState) -> Result<Vec<ThemeInfo>, String> {
 fn store_theme(state: &AppState, theme: &Theme) -> Result<(), String> {
     let db = state.db.lock_safe();
     let json = serde_json::to_string(theme).map_err(|e| e.to_string())?;
-    db.set_setting(&format!("theme:{}", theme.name), &json).map_err(|e| e.to_string())?;
+    db.set_setting(&format!("theme:{}", theme.name), &json)
+        .map_err(|e| e.to_string())?;
     let mut settings = load(&db)?;
     if !settings.theme.custom_themes.contains(&theme.name) {
         settings.theme.custom_themes.push(theme.name.clone());
@@ -103,7 +114,8 @@ fn store_theme(state: &AppState, theme: &Theme) -> Result<(), String> {
 
 /// Import a theme from a file path (TOML or JSON).
 pub fn import_theme(state: &AppState, path: &str) -> Result<Theme, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to read theme file: {}", e))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read theme file: {}", e))?;
     let theme = if path.ends_with(".toml") {
         Theme::from_toml(&content)?
     } else {
@@ -125,7 +137,10 @@ pub fn get_theme(state: &AppState, name: &str) -> Result<Theme, String> {
         return Ok(theme);
     }
     let db = state.db.lock_safe();
-    match db.get_setting(&format!("theme:{}", name)).map_err(|e| e.to_string())? {
+    match db
+        .get_setting(&format!("theme:{}", name))
+        .map_err(|e| e.to_string())?
+    {
         Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string()),
         None => Err(format!("Theme '{}' not found", name)),
     }
@@ -133,7 +148,8 @@ pub fn get_theme(state: &AppState, name: &str) -> Result<Theme, String> {
 
 pub fn delete_theme(state: &AppState, name: &str) -> Result<(), String> {
     let db = state.db.lock_safe();
-    db.delete_setting(&format!("theme:{}", name)).map_err(|e| e.to_string())?;
+    db.delete_setting(&format!("theme:{}", name))
+        .map_err(|e| e.to_string())?;
     let mut settings = load(&db)?;
     settings.theme.custom_themes.retain(|n| n != name);
     if settings.theme.active_theme == name {
@@ -144,7 +160,8 @@ pub fn delete_theme(state: &AppState, name: &str) -> Result<(), String> {
 
 /// Import keybindings from a VS Code-compatible JSON file.
 pub fn import_keybindings(state: &AppState, path: &str) -> Result<Vec<Keybinding>, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to read keybindings file: {}", e))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read keybindings file: {}", e))?;
     let keybinding_set = KeybindingSet::from_vscode_json(&content)?;
     let db = state.db.lock_safe();
     let mut settings = load(&db)?;
@@ -176,8 +193,12 @@ pub fn detect_vscode_keybindings() -> VsCodeDetection {
                 detected_without_overrides.push((*display).to_string());
                 break;
             }
-            let Ok(content) = std::fs::read_to_string(&path) else { continue };
-            let Ok(set) = KeybindingSet::from_vscode_json(&content) else { continue };
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(set) = KeybindingSet::from_vscode_json(&content) else {
+                continue;
+            };
             importable.push(VsCodeVariant {
                 name: (*display).to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -186,7 +207,10 @@ pub fn detect_vscode_keybindings() -> VsCodeDetection {
             break; // first matching base wins
         }
     }
-    VsCodeDetection { importable, detected_without_overrides }
+    VsCodeDetection {
+        importable,
+        detected_without_overrides,
+    }
 }
 
 /// All candidate config roots (Linux snap/flatpak vs apt differ).

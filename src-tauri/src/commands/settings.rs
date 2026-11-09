@@ -49,7 +49,10 @@ pub fn delete_theme(state: State<'_, AppState>, name: String) -> Result<(), Stri
 }
 
 #[tauri::command(async)]
-pub fn import_keybindings(state: State<'_, AppState>, path: String) -> Result<Vec<Keybinding>, String> {
+pub fn import_keybindings(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<Keybinding>, String> {
     ops::import_keybindings(&state, &path)
 }
 
@@ -66,37 +69,62 @@ fn theme_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
 
 /// Built-in + installed themes.
 #[tauri::command]
-pub fn theme_list(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Vec<rustic_app::themes::Entry>, String> {
+pub fn theme_list(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<rustic_app::themes::Entry>, String> {
     Ok(rustic_app::themes::list(&state, &theme_dir(&app)?))
 }
 
 /// One theme with its file text, hash and scan report.
 #[tauri::command]
-pub fn theme_get(app: tauri::AppHandle, state: State<'_, AppState>, id: String) -> Result<rustic_app::themes::Detail, String> {
+pub fn theme_get(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<rustic_app::themes::Detail, String> {
     rustic_app::themes::get(&state, &theme_dir(&app)?, &id)
 }
 
 /// Install a theme from a file (untrusted until the user trusts it).
 #[tauri::command]
-pub fn theme_import_file(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> Result<rustic_app::themes::Detail, String> {
+pub fn theme_import_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<rustic_app::themes::Detail, String> {
     rustic_app::themes::import_path(&state, &theme_dir(&app)?, &path)
 }
 
 /// Install a theme from its text (paste / browser upload).
 #[tauri::command]
-pub fn theme_import_text(app: tauri::AppHandle, state: State<'_, AppState>, text: String) -> Result<rustic_app::themes::Detail, String> {
+pub fn theme_import_text(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    text: String,
+) -> Result<rustic_app::themes::Detail, String> {
     rustic_app::themes::import_text(&state, &theme_dir(&app)?, &text)
 }
 
 /// Replace an installed theme's file (drops its trust).
 #[tauri::command]
-pub fn theme_write(app: tauri::AppHandle, state: State<'_, AppState>, id: String, text: String) -> Result<rustic_app::themes::Detail, String> {
+pub fn theme_write(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    text: String,
+) -> Result<rustic_app::themes::Detail, String> {
     rustic_app::themes::write(&state, &theme_dir(&app)?, &id, &text)
 }
 
 /// Save a theme's file to `path`.
 #[tauri::command]
-pub fn theme_export(app: tauri::AppHandle, state: State<'_, AppState>, id: String, path: String) -> Result<(), String> {
+pub fn theme_export(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+) -> Result<(), String> {
     let d = rustic_app::themes::get(&state, &theme_dir(&app)?, &id)?;
     std::fs::write(&path, d.text).map_err(|e| format!("Couldn't save {path}: {e}"))
 }
@@ -113,19 +141,32 @@ pub fn theme_template(path: Option<String>) -> Result<String, String> {
 
 /// Delete an installed theme.
 #[tauri::command]
-pub fn theme_delete(app: tauri::AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn theme_delete(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     rustic_app::themes::delete(&state, &theme_dir(&app)?, &id)
 }
 
 /// Trust the exact theme file the user reviewed (`hash`).
 #[tauri::command]
-pub fn theme_trust(app: tauri::AppHandle, state: State<'_, AppState>, id: String, hash: String) -> Result<(), String> {
+pub fn theme_trust(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    hash: String,
+) -> Result<(), String> {
     rustic_app::themes::trust(&state, &theme_dir(&app)?, &id, &hash)
 }
 
 /// Make a built-in / trusted theme active.
 #[tauri::command]
-pub fn theme_apply(app: tauri::AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn theme_apply(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     rustic_app::themes::apply(&state, &theme_dir(&app)?, &id)
 }
 
@@ -137,7 +178,10 @@ pub fn theme_set_mode(state: State<'_, AppState>, mode: String) -> Result<(), St
 
 /// The active theme, resolved for painting.
 #[tauri::command]
-pub fn theme_active(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<rustic_app::themes::Active, String> {
+pub fn theme_active(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<rustic_app::themes::Active, String> {
     Ok(rustic_app::themes::active(&state, &theme_dir(&app)?))
 }
 

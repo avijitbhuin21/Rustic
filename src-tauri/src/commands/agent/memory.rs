@@ -54,7 +54,7 @@ fn project_root_for(state: &State<'_, AppState>, project_id: &str) -> Result<Pat
     let project = workspace
         .list_projects()
         .into_iter()
-        .find(|p| p.id.to_string() == project_id)
+        .find(|p| p.id == project_id)
         .ok_or_else(|| "Project not found".to_string())?;
     Ok(project.root_path.clone())
 }

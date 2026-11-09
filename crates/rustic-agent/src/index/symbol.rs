@@ -44,6 +44,7 @@ impl SymbolKind {
     /// Parse a user-supplied filter string into a kind. Case-insensitive;
     /// accepts both the canonical name and a few common synonyms ("fn" → function,
     /// "ty" → type, etc.).
+    #[allow(clippy::should_implement_trait)] // lenient Option parser, not a FromStr impl
     pub fn from_str(s: &str) -> Option<Self> {
         let s = s.trim().to_ascii_lowercase();
         Some(match s.as_str() {

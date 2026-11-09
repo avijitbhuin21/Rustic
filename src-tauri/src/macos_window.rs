@@ -17,7 +17,9 @@ const MAX_X_MAX_Y: usize = 8;
 
 /// Clip the window's top-left/top-right corners to `radius` (0 squares them again).
 pub fn set_top_corner_radius<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>, radius: f64) {
-    let Ok(ns_window) = window.ns_window() else { return };
+    let Ok(ns_window) = window.ns_window() else {
+        return;
+    };
     let ns_window = ns_window as *mut AnyObject;
     if ns_window.is_null() {
         return;

@@ -57,7 +57,7 @@ impl AskUserBroker {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.insert(request_id.clone(), tx);
         }
         let _ = event_tx.try_send(TaskEvent::AskUserRequest {
@@ -91,7 +91,7 @@ impl AskUserBroker {
     /// timed out, or unknown) so the host can tell the user.
     pub fn respond(&self, request_id: &str, response: AskUserResponse) -> bool {
         let sender = {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.remove(request_id)
         };
         match sender {
@@ -102,7 +102,7 @@ impl AskUserBroker {
 
     /// Number of requests still waiting for an answer.
     pub fn pending_count(&self) -> usize {
-        self.pending.lock().unwrap().len()
+        self.pending.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 

@@ -7,6 +7,8 @@ import {
 import { readDir, useExplorer } from '@/state/explorer';
 import { useEditor } from '@/state/editor';
 import { cn } from '@/lib/utils';
+import { IS_WEB } from '@/lib/platform';
+import { RevealButton } from './reveal-button';
 
 const MAX_MENU_ENTRIES = 300;
 
@@ -170,6 +172,9 @@ export function Breadcrumb({ tab }) {
           </React.Fragment>
         );
       })}
+      {!IS_WEB && !tab.scratch && (
+        <RevealButton path={tab.path} showLabel className="ml-auto pl-2" />
+      )}
     </div>
   );
 }

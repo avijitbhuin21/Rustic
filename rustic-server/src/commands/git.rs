@@ -621,9 +621,9 @@ fn validate_git_url(url: &str) -> Result<(), String> {
 
     let looks_scp = !trimmed.contains("://")
         && trimmed.contains('@')
-        && trimmed.find(':').map_or(false, |colon| {
-            trimmed[..colon].contains('@') && !trimmed[..colon].contains('/')
-        });
+        && trimmed
+            .find(':')
+            .is_some_and(|colon| trimmed[..colon].contains('@') && !trimmed[..colon].contains('/'));
 
     if looks_scp {
         return Ok(());

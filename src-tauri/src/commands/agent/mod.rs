@@ -25,22 +25,20 @@ use rustic_agent::provider::gemini::GeminiProvider;
 use rustic_agent::provider::openai::OpenAiProvider;
 use rustic_agent::{
     build_skills_system_section, build_user_rules_system_section, build_workflows_system_section,
-    calculate_cost_breakdown, discover_skills, discover_workflows, skill_body, workflow_body,
-    AiConfig, AiProvider, ContentBlock, Message, PermissionLevel, ProviderConfig, ProviderType,
-    Role, SharedPermissions, TaskCost, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, TodoItem,
-    TokenUsage, ToolConfig, ToolContext,
+    discover_skills, discover_workflows, skill_body, workflow_body, AiConfig, AiProvider,
+    ContentBlock, Message, PermissionLevel, ProviderConfig, ProviderType, Role, SharedPermissions,
+    TaskCost, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, TodoItem, ToolConfig, ToolContext,
 };
+use rustic_app::host_ops::agent_history::{
+    aggregate_subagent_cost, build_mcp_system_section, DbConversationArchive,
+};
+pub use rustic_app::host_ops::agent_history::{MessageDto, TurnUsage};
 use rustic_db::{MessageRow, TaskRow};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
-use rustic_app::host_ops::agent_history::{
-    aggregate_subagent_cost, archived_history_dtos, build_mcp_system_section,
-    merge_archived_history, strip_synthetic_blocks, DbConversationArchive,
-};
-pub use rustic_app::host_ops::agent_history::{MessageDto, TurnUsage};
 
 #[derive(Clone, Serialize)]
 pub(super) struct AgentStreamEvent {
@@ -385,6 +383,7 @@ pub struct ImageAttachment {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -436,7 +435,7 @@ pub async fn send_message(
         workspace
             .list_projects()
             .into_iter()
-            .find(|p| p.id.to_string() == task_project_id)
+            .find(|p| p.id == task_project_id)
             .ok_or_else(|| "Project not found".to_string())?
             .root_path
             .clone()
@@ -655,7 +654,7 @@ pub async fn send_message(
             let proj = workspace
                 .list_projects()
                 .into_iter()
-                .find(|p| p.id.to_string() == task_project_id)
+                .find(|p| p.id == task_project_id)
                 .ok_or_else(|| "Project not found".to_string())?;
             (proj.name.clone(), proj.root_path.clone())
         };
@@ -1148,6 +1147,7 @@ pub async fn send_message(
             system_prompt: Some(system_prompt),
             thinking_budget: thinking_budget_val,
             context_window,
+            condense_threshold: agent.ai_config.condense_threshold,
             web_search_enabled: web_search_for_provider,
             web_fetch_enabled: web_fetch_for_provider,
             supports_temperature: model_caps.supports_temperature,
@@ -1329,12 +1329,9 @@ pub async fn send_message(
             // tracker handle (`fh_handle_opt`) stays available immediately — only
             // the snapshot ROW is produced asynchronously.
             let baseline_gate: rustic_agent::BaselineGate =
-                if task_is_plan_mode || fh_handle_opt.is_none() {
-                    // Plan mode never mutates files; nothing to wait for.
-                    rustic_agent::BaselineGate::ready_now()
-                } else {
+                if let (false, Some(fh_gate)) = (task_is_plan_mode, fh_handle_opt.as_ref()) {
                     let (gate_tx, gate) = rustic_agent::BaselineGate::new();
-                    let history_arc = Arc::clone(&fh_handle_opt.as_ref().unwrap().history);
+                    let history_arc = Arc::clone(&fh_gate.history);
                     let db_arc_snap = Arc::clone(&db_arc);
                     let app_clone_snap = app_clone.clone();
                     let tid = task_id_clone.clone();
@@ -1384,6 +1381,9 @@ pub async fn send_message(
                         }
                     });
                     gate
+                } else {
+                    // Plan mode never mutates files; nothing to wait for.
+                    rustic_agent::BaselineGate::ready_now()
                 };
 
             // Tracking is active for this turn iff we have a handle and aren't in
@@ -1496,6 +1496,7 @@ pub async fn send_message(
                         system_prompt: None,
                         thinking_budget: 0,
                         context_window: ctx_for_sub,
+                        condense_threshold: ai_config.condense_threshold,
                         web_search_enabled: false,
                         web_fetch_enabled: false,
                         supports_temperature: caps.supports_temperature,
@@ -2158,7 +2159,7 @@ pub async fn send_message(
                                 "result": serde_json::Value::Null,
                                 "is_error": false,
                             });
-                            let calls = subagent_tool_calls.entry(key.clone()).or_insert_with(Vec::new);
+                            let calls = subagent_tool_calls.entry(key.clone()).or_default();
                             calls.push(entry);
                             if let Ok(s) = serde_json::to_string(calls) {
                                 if let Ok(db) = cost_db.lock() {
@@ -2337,7 +2338,7 @@ pub async fn send_message(
                 if let Err(e) = tokio::task::spawn_blocking(move || h.record_final_state(&tid))
                     .await
                     .unwrap_or_else(|e| Err(rustic_agent::FileHistoryError::Io(
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                        std::io::Error::other(e.to_string())
                     )))
                 {
                     tracing::warn!(task = %task_id_clone, ?e, "record_final_state failed; Changed Files may show external edits");
@@ -2411,7 +2412,7 @@ pub async fn send_message(
                 // Also update the in-memory task info so live UI state matches.
                 if let Ok(mut agent) = agent_arc.lock() {
                     if let Some(t) = agent.tasks.get_mut(&task_id_clone) {
-                        t.info.status = final_status.clone();
+                        t.info.status = final_status;
                     }
                 }
             }
@@ -2578,189 +2579,7 @@ pub fn list_tasks(
     state: State<'_, AppState>,
     project_id: Option<String>,
 ) -> Result<Vec<TaskInfo>, String> {
-    let pid_root: Option<String> = project_id.as_ref().and_then(|pid| {
-        state
-            .workspace
-            .lock_safe()
-            .list_projects()
-            .into_iter()
-            .find(|p| p.id.to_string() == *pid)
-            .map(|p| p.root_path.to_string_lossy().to_string())
-    });
-    let rows = if let Some(ref pid) = project_id {
-        state.read_db(|db| -> Result<_, String> {
-            let mut rows = db.list_tasks_for_project(pid).map_err(|e| e.to_string())?;
-            // First-send persistence maps the task to the DB project that owns
-            // this root path, which can have a different id than the workspace
-            // project (issue #1). Include those rows so the chat isn't orphaned.
-            if let Some(root) = pid_root {
-                if let Ok(Some(alias)) = db.get_project_by_path(&root) {
-                    if alias.id != *pid {
-                        if let Ok(extra) = db.list_tasks_for_project(&alias.id) {
-                            rows.extend(extra);
-                        }
-                    }
-                }
-            }
-            Ok(rows)
-        })?
-    } else {
-        // No project filter: load all in-memory tasks as fallback
-        let agent = state.agent.lock_safe();
-        return Ok(agent.tasks.values().map(|t| t.info.clone()).collect());
-    };
-
-    // Treat any DB-persisted "Running" tasks as Completed — they cannot be running
-    // after a fresh app start (they were left over from a crashed session).
-    if rows.iter().any(|r| r.status == "Running" || r.status == "Waiting") {
-        let db = state.db.lock_safe();
-        for row in &rows {
-            if row.status == "Running" || row.status == "Waiting" {
-                tracing::warn!(
-                    target: "rustic::list_tasks",
-                    task = %row.id,
-                    db_status = %row.status,
-                    "found stale Running/Waiting task on startup — defensively marking Completed",
-                );
-                let _ = db.update_task_status(&row.id, "Completed");
-            }
-        }
-    }
-
-    let mut agent = state.agent.lock_safe();
-    for row in &rows {
-        if !agent.tasks.contains_key(&row.id) {
-            let status = match row.status.as_str() {
-                // "Running" is intentionally omitted — treated as Completed (see above)
-                "Failed" => TaskStatus::Failed,
-                "Cancelled" => TaskStatus::Cancelled,
-                _ => TaskStatus::Completed,
-            };
-            let permissions = agent
-                .project_permissions
-                .get(&row.project_id)
-                .cloned()
-                .unwrap_or_default();
-            // The DB only persists token totals + the rolled-up estimated cost.
-            // Re-derive the per-category USD breakdown from token counts and the
-            // task's last-used model so the cost popover doesn't show $0.00 for
-            // every category on history reload. Cache-write tokens aren't
-            // persisted yet — they contribute to `estimated_cost_usd` at write
-            // time, so the breakdown sum may be slightly under the total when
-            // the task used prompt caching. Close enough for the UI's purpose.
-            let usage = TokenUsage {
-                input_tokens: row.total_input_tokens as u32,
-                output_tokens: row.total_output_tokens as u32,
-                cache_read_tokens: row.total_cache_read_tokens as u32,
-                cache_write_tokens: 0,
-            };
-            // Try to find custom pricing from the current AI config for this model.
-            // This is best-effort for historical tasks — if the provider config has
-            // changed since the task ran, the breakdown might differ from what was
-            // actually billed, but it's better than ignoring custom pricing entirely.
-            let provider_entry = agent
-                .ai_config
-                .providers
-                .iter()
-                .find(|p| p.provider_key() == row.provider_type);
-            let (custom_inp, custom_out, custom_cr, custom_cw) = provider_entry
-                .map(|pe| {
-                    (
-                        if pe.custom_input_cost > 0.0 {
-                            Some(pe.custom_input_cost)
-                        } else {
-                            None
-                        },
-                        if pe.custom_output_cost > 0.0 {
-                            Some(pe.custom_output_cost)
-                        } else {
-                            None
-                        },
-                        if pe.custom_cached_input_cost > 0.0 {
-                            Some(pe.custom_cached_input_cost)
-                        } else {
-                            None
-                        },
-                        if pe.custom_cached_output_cost > 0.0 {
-                            Some(pe.custom_cached_output_cost)
-                        } else {
-                            None
-                        },
-                    )
-                })
-                .unwrap_or((None, None, None, None));
-
-            let breakdown = calculate_cost_breakdown(
-                &row.model, &usage, custom_inp, custom_out, custom_cr, custom_cw,
-            );
-            let cost = row
-                .cost_json
-                .as_deref()
-                .and_then(|j| serde_json::from_str::<TaskCost>(j).ok())
-                .unwrap_or_else(|| TaskCost {
-                    total_input_tokens: row.total_input_tokens as u64,
-                    total_output_tokens: row.total_output_tokens as u64,
-                    total_cache_read_tokens: row.total_cache_read_tokens as u64,
-                    total_cache_write_tokens: 0,
-                    estimated_cost_usd: row.estimated_cost_usd,
-                    turn_count: row.turn_count as u32,
-                    input_cost_usd: breakdown.input_usd,
-                    output_cost_usd: breakdown.output_usd,
-                    cache_read_cost_usd: breakdown.cache_read_usd,
-                    cache_write_cost_usd: breakdown.cache_write_usd,
-                    ..Default::default()
-                });
-            // Also populate the in-memory cost map so get_task_cost works
-            if let Ok(mut cost_map) = state.task_costs.lock() {
-                cost_map
-                    .entry(row.id.clone())
-                    .or_insert_with(|| cost.clone());
-            }
-            agent.tasks.insert(
-                row.id.clone(),
-                AgentTask {
-                    info: TaskInfo {
-                        id: row.id.clone(),
-                        project_id: row.project_id.clone(),
-                        title: row.title.clone(),
-                        status,
-                        provider_type: row.provider_type.clone(),
-                        model: row.model.clone(),
-                        created_at: row.created_at.clone(),
-                        updated_at: row.updated_at.clone(),
-                        thinking_tier: row.thinking_tier.clone(),
-                        pinned: row.pinned,
-                        goal: row.goal.clone(),
-                    },
-                    messages: Vec::new(),
-                    permissions,
-                    sensitive_files_allowed: false,
-                    is_plan_mode: false,
-                    shared_permissions: None,
-                    goal: std::sync::Arc::new(std::sync::Mutex::new(row.goal.clone().map(
-                        |condition| rustic_agent::task::goal::GoalState {
-                            condition,
-                            turns: 0,
-                        },
-                    ))),
-                    last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                },
-            );
-        }
-    }
-
-    // Keep the frontend-visible goal in sync with the DB — the executor and
-    // event forwarder clear tasks.goal on "met" without touching TaskInfo.
-    for row in &rows {
-        if let Some(t) = agent.tasks.get_mut(&row.id) {
-            t.info.goal = row.goal.clone();
-        }
-    }
-
-    Ok(rows
-        .iter()
-        .map(|row| agent.tasks[&row.id].info.clone())
-        .collect())
+    rustic_app::host_ops::tasks::list_tasks(&state, project_id.as_deref())
 }
 
 #[tauri::command(async)]
@@ -2768,121 +2587,7 @@ pub fn get_task_messages(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Vec<MessageDto>, String> {
-    // Synthetic executor-injected user messages (sub-agent result blocks, terminal
-    // exit notices, orchestrator nudges) are stripped from the DTO so the frontend
-    // never renders them as visible chat bubbles.
-    let times: std::collections::HashMap<i64, String> = state
-        .read_db(|db| db.get_message_times(&task_id).unwrap_or_default())
-        .into_iter()
-        .collect();
-    let mem_dtos: Option<Vec<MessageDto>> = {
-        let agent = state.agent.lock_safe();
-        agent
-            .tasks
-            .get(&task_id)
-            .filter(|task| !task.messages.is_empty())
-            .map(|task| {
-                let fingerprint = rustic_agent::history_dto::history_fingerprint(&task.messages);
-                let mut cache = message_dto_cache().lock_safe();
-                if let Some((cached_fp, cached)) = cache.get(&task_id) {
-                    if *cached_fp == fingerprint {
-                        return cached.clone();
-                    }
-                }
-                let built: Vec<MessageDto> = task
-                    .messages
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, m)| {
-                        let clean = strip_synthetic_blocks(m)?;
-                        Some(MessageDto {
-                            role: match m.role {
-                                Role::User => "user".to_string(),
-                                Role::Assistant => "assistant".to_string(),
-                                Role::System => "system".to_string(),
-                            },
-                            content: rustic_agent::history_dto::slim_content(&clean),
-                            turn_usage: None,
-                            sort_order: Some(i as i64),
-                            created_at: None,
-                        })
-                    })
-                    .collect();
-                if cache.len() >= MESSAGE_DTO_CACHE_CAP {
-                    cache.clear();
-                }
-                cache.insert(task_id.clone(), (fingerprint, built.clone()));
-                built
-            })
-    };
-    if let Some(mut dtos) = mem_dtos {
-        for dto in dtos.iter_mut() {
-            dto.created_at = dto.sort_order.and_then(|i| times.get(&i).cloned());
-        }
-        let archived = state.read_db(|db| archived_history_dtos(db, &task_id));
-        return Ok(merge_archived_history(archived, dtos));
-    }
-
-    let rows = state
-        .read_db(|db| db.get_messages_for_task(&task_id))
-        .map_err(|e| e.to_string())?;
-
-    let mut dtos = Vec::new();
-    let mut messages_for_cache = Vec::new();
-    for row in &rows {
-        let role = match row.role.as_str() {
-            "user" => Role::User,
-            _ => Role::Assistant,
-        };
-        let content: Vec<ContentBlock> = serde_json::from_str(&row.content_json)
-            .unwrap_or_else(|e| {
-                tracing::warn!("[get_task_messages] Failed to deserialize content_json for message {}: {}. Falling back to raw text.", row.id, e);
-                vec![ContentBlock::Text { text: row.content_json.clone() }]
-            });
-        let turn_usage: Option<TurnUsage> = row
-            .turn_usage_json
-            .as_deref()
-            .and_then(|j| serde_json::from_str(j).ok());
-        let msg_for_cache = Message {
-            role,
-            content: content.clone(),
-        };
-        // Keep synthetic injections in the executor cache (it needs them for
-        // context on the next turn) but exclude them from the DTO sent to the
-        // frontend so they don't render as visible chat bubbles.
-        if let Some(clean_content) = strip_synthetic_blocks(&msg_for_cache) {
-            dtos.push(MessageDto {
-                role: row.role.clone(),
-                content: rustic_agent::history_dto::slim_content(&clean_content),
-                turn_usage,
-                sort_order: Some(row.sort_order),
-                created_at: Some(row.created_at.clone()),
-            });
-        }
-        messages_for_cache.push(msg_for_cache);
-    }
-
-    // Hydrate into in-memory task if it exists
-    if !rows.is_empty() {
-        let mut agent = state.agent.lock_safe();
-        if let Some(task) = agent.tasks.get_mut(&task_id) {
-            task.messages = messages_for_cache;
-        }
-    }
-
-    let archived = state.read_db(|db| archived_history_dtos(db, &task_id));
-    Ok(merge_archived_history(archived, dtos))
-}
-
-const MESSAGE_DTO_CACHE_CAP: usize = 32;
-
-/// Per-task cache of slimmed in-memory transcripts, keyed by an exact history fingerprint.
-fn message_dto_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<MessageDto>)>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<MessageDto>)>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
+    rustic_app::host_ops::tasks::get_task_messages(&state, &task_id)
 }
 
 /// Read the persisted todo list for a task. Returns an empty list when the
@@ -3100,7 +2805,7 @@ pub async fn delete_task(
             let ws = state.workspace.lock().ok()?;
             ws.list_projects()
                 .into_iter()
-                .find(|p| p.id.to_string() == pid)
+                .find(|p| p.id == pid)
                 .map(|p| p.root_path.to_string_lossy().to_string())
         })
     };
@@ -3201,7 +2906,7 @@ pub async fn delete_tasks_for_project(
         ws.and_then(|w| {
             w.list_projects()
                 .into_iter()
-                .find(|p| p.id.to_string() == project_id)
+                .find(|p| p.id == project_id)
                 .map(|p| p.root_path.to_string_lossy().to_string())
         })
     };
@@ -3301,6 +3006,7 @@ pub fn set_task_goal(
 }
 
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub fn set_ai_provider(
     state: State<'_, AppState>,
     provider_type: String,
@@ -3511,6 +3217,7 @@ pub fn set_ai_provider(
 ///   the model to defaults — same shape the previous one-flag command used,
 ///   just generalised across multiple flags.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn set_model_capabilities(
     state: State<'_, AppState>,
     model_id: String,
@@ -3772,6 +3479,15 @@ pub fn set_subagent_concurrency_cap(
 pub fn get_subagent_concurrency_cap(state: State<'_, AppState>) -> Result<Option<usize>, String> {
     let agent = state.agent.lock().map_err(|e| e.to_string())?;
     Ok(agent.ai_config.budget.max_concurrent_subagents)
+}
+
+/// Set the global "auto-condense at" token cap (0 = automatic).
+#[tauri::command]
+pub fn set_condense_threshold(state: State<'_, AppState>, tokens: u32) -> Result<(), String> {
+    let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+    agent.ai_config.condense_threshold = tokens;
+    persist_ai_config(&agent.ai_config, &state)?;
+    Ok(())
 }
 
 /// P0.4: read the current budget settings. UI uses this to populate the

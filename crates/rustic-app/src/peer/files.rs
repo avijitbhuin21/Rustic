@@ -29,10 +29,13 @@ pub fn safe_rel(path: &str) -> Result<PathBuf, String> {
 
 /// Local root folder of project `project_id`.
 pub fn project_root(state: &crate::state::AppState, project_id: &str) -> Result<PathBuf, String> {
-    let ws = state.workspace.lock().map_err(|_| "workspace unavailable".to_string())?;
+    let ws = state
+        .workspace
+        .lock()
+        .map_err(|_| "workspace unavailable".to_string())?;
     ws.list_projects()
         .into_iter()
-        .find(|p| p.id.to_string() == project_id)
+        .find(|p| p.id == project_id)
         .map(|p| p.root_path.clone())
         .ok_or_else(|| "That project doesn't exist on this machine".to_string())
 }
@@ -69,7 +72,8 @@ fn hidden(name: &str) -> bool {
 pub fn list_dir(root: &Path, rel: &str) -> Result<Vec<FsEntry>, String> {
     let rel_path = safe_rel(rel)?;
     let dir = root.join(&rel_path);
-    let rd = std::fs::read_dir(&dir).map_err(|e| format!("Can't open {}: {e}", rel_string(&rel_path)))?;
+    let rd = std::fs::read_dir(&dir)
+        .map_err(|e| format!("Can't open {}: {e}", rel_string(&rel_path)))?;
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -131,10 +135,20 @@ pub fn read_preview(root: &Path, rel: &str) -> Result<Preview, String> {
         return Err("That's a folder".into());
     }
     let size = meta.len();
-    let base = Preview { path: rel_string(&rel_path), size, kind: "binary".into(), content: None, mime: None };
+    let base = Preview {
+        path: rel_string(&rel_path),
+        size,
+        kind: "binary".into(),
+        content: None,
+        mime: None,
+    };
     if let Some(mime) = image_mime(&path) {
         if size > MAX_IMAGE_PREVIEW {
-            return Ok(Preview { kind: "too_large".into(), mime: Some(mime.into()), ..base });
+            return Ok(Preview {
+                kind: "too_large".into(),
+                mime: Some(mime.into()),
+                ..base
+            });
         }
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         return Ok(Preview {
@@ -145,14 +159,21 @@ pub fn read_preview(root: &Path, rel: &str) -> Result<Preview, String> {
         });
     }
     if size > MAX_TEXT_PREVIEW {
-        return Ok(Preview { kind: "too_large".into(), ..base });
+        return Ok(Preview {
+            kind: "too_large".into(),
+            ..base
+        });
     }
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     if bytes.iter().take(8192).any(|b| *b == 0) {
         return Ok(base);
     }
     match String::from_utf8(bytes) {
-        Ok(text) => Ok(Preview { kind: "text".into(), content: Some(text), ..base }),
+        Ok(text) => Ok(Preview {
+            kind: "text".into(),
+            content: Some(text),
+            ..base
+        }),
         Err(_) => Ok(base),
     }
 }
@@ -166,7 +187,9 @@ pub struct SizeInfo {
 
 /// Recursively measure `abs` (file or folder), skipping hidden folders.
 fn measure_path(abs: &Path, out: &mut SizeInfo) {
-    let Ok(meta) = std::fs::symlink_metadata(abs) else { return };
+    let Ok(meta) = std::fs::symlink_metadata(abs) else {
+        return;
+    };
     if meta.is_file() {
         out.bytes += meta.len();
         out.files += 1;
@@ -198,7 +221,12 @@ pub struct PackItem {
 }
 
 /// Recursively append `abs` as `name` to the tar.
-fn append_path<W: Write>(tar: &mut tar::Builder<W>, abs: &Path, name: &Path, cancel: &dyn Fn() -> bool) -> Result<(), String> {
+fn append_path<W: Write>(
+    tar: &mut tar::Builder<W>,
+    abs: &Path,
+    name: &Path,
+    cancel: &dyn Fn() -> bool,
+) -> Result<(), String> {
     if cancel() {
         return Err("cancelled".into());
     }
@@ -239,15 +267,30 @@ pub fn pack(
     if compress {
         let enc = zstd::stream::write::Encoder::new(sink, 1).map_err(|e| e.to_string())?;
         let enc = write_tar(items, enc, cancel, progress)?;
-        enc.finish().map_err(|e| e.to_string())?.flush().map_err(|e| e.to_string())
+        enc.finish()
+            .map_err(|e| e.to_string())?
+            .flush()
+            .map_err(|e| e.to_string())
     } else {
-        write_tar(items, sink, cancel, progress)?.flush().map_err(|e| e.to_string())
+        write_tar(items, sink, cancel, progress)?
+            .flush()
+            .map_err(|e| e.to_string())
     }
 }
 
 /// Append `items` as tar entries to `w`, returning the writer once the archive is closed.
-fn write_tar<W: Write>(items: &[PackItem], w: W, cancel: &dyn Fn() -> bool, progress: &dyn Fn(u64)) -> Result<W, String> {
-    let counted = Counting { inner: w, n: 0, progress, cancel };
+fn write_tar<W: Write>(
+    items: &[PackItem],
+    w: W,
+    cancel: &dyn Fn() -> bool,
+    progress: &dyn Fn(u64),
+) -> Result<W, String> {
+    let counted = Counting {
+        inner: w,
+        n: 0,
+        progress,
+        cancel,
+    };
     let mut tar = tar::Builder::new(counted);
     tar.follow_symlinks(false);
     for it in items {
@@ -308,21 +351,35 @@ const CHANNEL_CHUNK: usize = 256 * 1024;
 
 impl ChannelWriter {
     /// Writer + the receiving end to turn into a body stream.
-    pub fn new() -> (Self, tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::io::Error>>) {
+    pub fn new() -> (
+        Self,
+        tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::io::Error>>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        (Self { tx, buf: Vec::with_capacity(CHANNEL_CHUNK) }, rx)
+        (
+            Self {
+                tx,
+                buf: Vec::with_capacity(CHANNEL_CHUNK),
+            },
+            rx,
+        )
     }
 
     /// Send an error to the reader (aborts the HTTP body).
     pub fn fail(&self, msg: &str) {
-        let _ = self.tx.blocking_send(Err(std::io::Error::other(msg.to_string())));
+        let _ = self
+            .tx
+            .blocking_send(Err(std::io::Error::other(msg.to_string())));
     }
 
     fn send_buf(&mut self) -> std::io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
-        let chunk = axum::body::Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHANNEL_CHUNK)));
+        let chunk = axum::body::Bytes::from(std::mem::replace(
+            &mut self.buf,
+            Vec::with_capacity(CHANNEL_CHUNK),
+        ));
         self.tx
             .blocking_send(Ok(chunk))
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver closed"))
@@ -352,7 +409,9 @@ impl Drop for ChannelWriter {
 pub fn channel_stream(
     rx: tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::io::Error>>,
 ) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static {
-    futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) })
+    futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
 }
 
 /// `Read` end over an async byte stream (for unpacking streamed HTTP bodies
@@ -364,9 +423,18 @@ pub struct ChannelReader {
 
 impl ChannelReader {
     /// Reader + the sender the async side pushes chunks into.
-    pub fn new() -> (Self, tokio::sync::mpsc::Sender<Result<axum::body::Bytes, String>>) {
+    pub fn new() -> (
+        Self,
+        tokio::sync::mpsc::Sender<Result<axum::body::Bytes, String>>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        (Self { rx, cur: axum::body::Bytes::new() }, tx)
+        (
+            Self {
+                rx,
+                cur: axum::body::Bytes::new(),
+            },
+            tx,
+        )
     }
 }
 
@@ -399,15 +467,29 @@ pub enum ConflictPolicy {
 
 /// Which of `names` already exist in `dest_dir`.
 pub fn conflicts(dest_dir: &Path, names: &[String]) -> Vec<String> {
-    names.iter().filter(|n| dest_dir.join(n).exists()).cloned().collect()
+    names
+        .iter()
+        .filter(|n| dest_dir.join(n).exists())
+        .cloned()
+        .collect()
 }
 
 /// First free `stem-N.ext` next to `name` in `dir`.
 pub fn auto_rename(dir: &Path, name: &str) -> String {
     let p = Path::new(name);
-    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| name.to_string());
-    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    let (stem, ext) = if name.starts_with('.') && p.extension().is_none() { (name.to_string(), String::new()) } else { (stem, ext) };
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string());
+    let ext = p
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let (stem, ext) = if name.starts_with('.') && p.extension().is_none() {
+        (name.to_string(), String::new())
+    } else {
+        (stem, ext)
+    };
     (1..)
         .map(|n| format!("{stem}-{n}{ext}"))
         .find(|c| !dir.join(c).exists())
@@ -452,7 +534,12 @@ pub fn unpack(
     } else {
         Box::new(chained)
     };
-    let mut archive = tar::Archive::new(Counting { inner: dec, n: 0, progress, cancel });
+    let mut archive = tar::Archive::new(Counting {
+        inner: dec,
+        n: 0,
+        progress,
+        cancel,
+    });
     let mut summary = UnpackSummary::default();
     let mut mapped: HashMap<String, Option<String>> = HashMap::new();
     for entry in archive.entries().map_err(|e| e.to_string())? {
@@ -463,7 +550,9 @@ pub fn unpack(
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
         let rel = safe_rel(&path.to_string_lossy())?;
         let mut comps = rel.components();
-        let Some(Component::Normal(top)) = comps.next() else { continue };
+        let Some(Component::Normal(top)) = comps.next() else {
+            continue;
+        };
         let top = top.to_string_lossy().into_owned();
         let rest: PathBuf = comps.collect();
         let target_top = mapped
@@ -483,7 +572,11 @@ pub fn unpack(
                     }
                     ConflictPolicy::Replace => {
                         let p = dest_dir.join(&top);
-                        let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+                        let _ = if p.is_dir() {
+                            std::fs::remove_dir_all(&p)
+                        } else {
+                            std::fs::remove_file(&p)
+                        };
                         summary.replaced.push(top.clone());
                         Some(top.clone())
                     }
@@ -495,7 +588,9 @@ pub fn unpack(
                 }
             })
             .clone();
-        let Some(target_top) = target_top else { continue };
+        let Some(target_top) = target_top else {
+            continue;
+        };
         safe_rel(&target_top)?;
         let out = if rest.as_os_str().is_empty() {
             dest_dir.join(&target_top)
@@ -509,7 +604,8 @@ pub fn unpack(
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            let mut f = std::fs::File::create(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+            let mut f =
+                std::fs::File::create(&out).map_err(|e| format!("{}: {e}", out.display()))?;
             let n = std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
             summary.files += 1;
             summary.bytes += n;
@@ -545,12 +641,28 @@ pub struct ManifestEntry {
 /// Deterministic, sorted walk of `abs` (skipping hidden folders and
 /// symlinks), pushing entries named under `rel` and sourced at `src`.
 fn walk_manifest(abs: &Path, rel: &str, project_id: &str, src: &str, out: &mut Vec<ManifestEntry>) {
-    let Ok(meta) = std::fs::symlink_metadata(abs) else { return };
+    let Ok(meta) = std::fs::symlink_metadata(abs) else {
+        return;
+    };
     if meta.is_file() {
-        out.push(ManifestEntry { rel: rel.into(), project_id: project_id.into(), src: src.into(), is_dir: false, size: meta.len() });
+        out.push(ManifestEntry {
+            rel: rel.into(),
+            project_id: project_id.into(),
+            src: src.into(),
+            is_dir: false,
+            size: meta.len(),
+        });
     } else if meta.is_dir() {
-        out.push(ManifestEntry { rel: rel.into(), project_id: project_id.into(), src: src.into(), is_dir: true, size: 0 });
-        let Ok(rd) = std::fs::read_dir(abs) else { return };
+        out.push(ManifestEntry {
+            rel: rel.into(),
+            project_id: project_id.into(),
+            src: src.into(),
+            is_dir: true,
+            size: 0,
+        });
+        let Ok(rd) = std::fs::read_dir(abs) else {
+            return;
+        };
         let mut children: Vec<String> = rd
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -558,8 +670,18 @@ fn walk_manifest(abs: &Path, rel: &str, project_id: &str, src: &str, out: &mut V
             .collect();
         children.sort();
         for c in children {
-            let child_src = if src.is_empty() { c.clone() } else { format!("{src}/{c}") };
-            walk_manifest(&abs.join(&c), &format!("{rel}/{c}"), project_id, &child_src, out);
+            let child_src = if src.is_empty() {
+                c.clone()
+            } else {
+                format!("{src}/{c}")
+            };
+            walk_manifest(
+                &abs.join(&c),
+                &format!("{rel}/{c}"),
+                project_id,
+                &child_src,
+                out,
+            );
         }
     }
 }
@@ -570,7 +692,11 @@ pub fn manifest(items: &[(String, String, PathBuf, String)]) -> Vec<ManifestEntr
     for (pid, src, abs, top) in items {
         // Push sources (no project id) are local ABSOLUTE paths: trimming the
         // leading '/' turns `/Users/..` into a relative path on macOS/Linux.
-        let src = if pid.is_empty() { src.trim_end_matches('/') } else { src.trim_matches('/') };
+        let src = if pid.is_empty() {
+            src.trim_end_matches('/')
+        } else {
+            src.trim_matches('/')
+        };
         walk_manifest(abs, top, pid, src, &mut out);
     }
     out
@@ -606,7 +732,11 @@ pub fn plan_tops(
                 }
                 ConflictPolicy::Replace => {
                     let p = dest_dir.join(top);
-                    let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+                    let _ = if p.is_dir() {
+                        std::fs::remove_dir_all(&p)
+                    } else {
+                        std::fs::remove_file(&p)
+                    };
                     summary.replaced.push(top.clone());
                     Some(top.clone())
                 }
@@ -629,19 +759,34 @@ pub fn plan_tops(
 }
 
 /// Local path for manifest entry `rel` under `dest_dir` per `plan` (`None` = skipped).
-pub fn planned_target(dest_dir: &Path, plan: &HashMap<String, Option<String>>, rel: &str) -> Result<Option<PathBuf>, String> {
+pub fn planned_target(
+    dest_dir: &Path,
+    plan: &HashMap<String, Option<String>>,
+    rel: &str,
+) -> Result<Option<PathBuf>, String> {
     let rel_path = safe_rel(rel)?;
     let mut comps = rel_path.components();
-    let Some(Component::Normal(top)) = comps.next() else { return Err(format!("invalid path: {rel}")) };
+    let Some(Component::Normal(top)) = comps.next() else {
+        return Err(format!("invalid path: {rel}"));
+    };
     let top = top.to_string_lossy().into_owned();
-    let Some(mapped) = plan.get(&top).cloned().unwrap_or(Some(top.clone())) else { return Ok(None) };
+    let Some(mapped) = plan.get(&top).cloned().unwrap_or(Some(top.clone())) else {
+        return Ok(None);
+    };
     let rest: PathBuf = comps.collect();
-    Ok(Some(if rest.as_os_str().is_empty() { dest_dir.join(mapped) } else { dest_dir.join(mapped).join(rest) }))
+    Ok(Some(if rest.as_os_str().is_empty() {
+        dest_dir.join(mapped)
+    } else {
+        dest_dir.join(mapped).join(rest)
+    }))
 }
 
 /// In-progress sibling of a file being received.
 pub fn part_path(target: &Path) -> PathBuf {
-    let mut name = target.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".rustic-part");
     target.with_file_name(name)
 }
@@ -654,7 +799,9 @@ pub fn received_len(target: &Path, size: u64) -> u64 {
             return size;
         }
     }
-    std::fs::metadata(part_path(target)).map(|m| m.len()).unwrap_or(0)
+    std::fs::metadata(part_path(target))
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 /// Open `target`'s part file for appending at `offset` (truncating anything
@@ -672,12 +819,15 @@ pub fn open_part_at(target: &Path, offset: u64) -> Result<std::fs::File, String>
         .map_err(|e| format!("{}: {e}", part.display()))?;
     let len = f.metadata().map_err(|e| e.to_string())?.len();
     if offset > len {
-        return Err(format!("resume offset {offset} is past the {len} bytes received"));
+        return Err(format!(
+            "resume offset {offset} is past the {len} bytes received"
+        ));
     }
     f.set_len(offset).map_err(|e| e.to_string())?;
     use std::io::Seek;
     let mut f = f;
-    f.seek(std::io::SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    f.seek(std::io::SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
     Ok(f)
 }
 
@@ -713,11 +863,28 @@ mod resumable_tests {
 
         let dest = d.join("dest");
         std::fs::create_dir_all(dest.join("src")).unwrap();
-        let (plan, s) = plan_tops(&dest, &["src".into()], ConflictPolicy::AutoRename, &HashMap::new()).unwrap();
+        let (plan, s) = plan_tops(
+            &dest,
+            &["src".into()],
+            ConflictPolicy::AutoRename,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(plan["src"].as_deref(), Some("src-1"));
         assert_eq!(s.renamed["src"], "src-1");
-        assert_eq!(planned_target(&dest, &plan, "src/b/a.txt").unwrap().unwrap(), dest.join("src-1").join("b").join("a.txt"));
-        let (skip, _) = plan_tops(&dest, &["src".into()], ConflictPolicy::Skip, &HashMap::new()).unwrap();
+        assert_eq!(
+            planned_target(&dest, &plan, "src/b/a.txt")
+                .unwrap()
+                .unwrap(),
+            dest.join("src-1").join("b").join("a.txt")
+        );
+        let (skip, _) = plan_tops(
+            &dest,
+            &["src".into()],
+            ConflictPolicy::Skip,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(planned_target(&dest, &skip, "src/z.txt").unwrap(), None);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -762,16 +929,29 @@ mod tests {
     fn cancel_stops_packing_inside_one_large_file() {
         let src = tmp("cancel-src");
         std::fs::write(src.join("big.bin"), vec![7u8; 4 * 1024 * 1024]).unwrap();
-        let items = vec![PackItem { abs: src.join("big.bin"), name: "big.bin".into() }];
+        let items = vec![PackItem {
+            abs: src.join("big.bin"),
+            name: "big.bin".into(),
+        }];
         let flag = std::sync::atomic::AtomicBool::new(false);
         let mut out = Vec::new();
-        let res = pack(&items, &mut out, false, &|| flag.load(std::sync::atomic::Ordering::SeqCst), &|n| {
-            if n > 64 * 1024 {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        });
+        let res = pack(
+            &items,
+            &mut out,
+            false,
+            &|| flag.load(std::sync::atomic::Ordering::SeqCst),
+            &|n| {
+                if n > 64 * 1024 {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        );
         assert!(res.is_err(), "pack must stop when cancelled mid-file");
-        assert!(out.len() < 4 * 1024 * 1024, "stopped before writing the whole file ({} bytes)", out.len());
+        assert!(
+            out.len() < 4 * 1024 * 1024,
+            "stopped before writing the whole file ({} bytes)",
+            out.len()
+        );
         let _ = std::fs::remove_dir_all(&src);
     }
 
@@ -779,7 +959,10 @@ mod tests {
     fn safe_rel_rejects_escapes() {
         assert!(safe_rel("../x").is_err());
         assert!(safe_rel("a/../../x").is_err());
-        assert_eq!(safe_rel("/src/lib/").unwrap(), PathBuf::from("src").join("lib"));
+        assert_eq!(
+            safe_rel("/src/lib/").unwrap(),
+            PathBuf::from("src").join("lib")
+        );
         assert_eq!(safe_rel("").unwrap(), PathBuf::new());
     }
 
@@ -803,10 +986,19 @@ mod tests {
         std::fs::create_dir_all(src.join("lib/.git")).unwrap();
         std::fs::write(src.join("lib/.git/HEAD"), "ref").unwrap();
         let items = vec![
-            PackItem { abs: src.join("lib"), name: "lib".into() },
-            PackItem { abs: src.join("readme.md"), name: "readme.md".into() },
+            PackItem {
+                abs: src.join("lib"),
+                name: "lib".into(),
+            },
+            PackItem {
+                abs: src.join("readme.md"),
+                name: "readme.md".into(),
+            },
         ];
-        assert_eq!(measure(&items.iter().map(|i| i.abs.clone()).collect::<Vec<_>>()).files, 2);
+        assert_eq!(
+            measure(&items.iter().map(|i| i.abs.clone()).collect::<Vec<_>>()).files,
+            2
+        );
         let mut buf = Vec::new();
         pack(&items, &mut buf, true, &|| false, &|_| {}).unwrap();
         assert_eq!(buf[..4], ZSTD_MAGIC);
@@ -814,26 +1006,76 @@ mod tests {
         pack(&items, &mut plain, false, &|| false, &|_| {}).unwrap();
         assert_ne!(plain[..4], ZSTD_MAGIC);
         let plain_dst = tmp("plain-dst");
-        unpack(&plain[..], &plain_dst, ConflictPolicy::AutoRename, &HashMap::new(), &|| false, &|_| {}).unwrap();
-        assert_eq!(std::fs::read_to_string(plain_dst.join("lib/inner/a.rs")).unwrap(), "fn a() {}");
+        unpack(
+            &plain[..],
+            &plain_dst,
+            ConflictPolicy::AutoRename,
+            &HashMap::new(),
+            &|| false,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(plain_dst.join("lib/inner/a.rs")).unwrap(),
+            "fn a() {}"
+        );
         let _ = std::fs::remove_dir_all(&plain_dst);
 
         let dst = tmp("dst");
         std::fs::write(dst.join("readme.md"), "mine").unwrap();
-        let s = unpack(&buf[..], &dst, ConflictPolicy::AutoRename, &HashMap::new(), &|| false, &|_| {}).unwrap();
-        assert_eq!(std::fs::read_to_string(dst.join("lib/inner/a.rs")).unwrap(), "fn a() {}");
+        let s = unpack(
+            &buf[..],
+            &dst,
+            ConflictPolicy::AutoRename,
+            &HashMap::new(),
+            &|| false,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.join("lib/inner/a.rs")).unwrap(),
+            "fn a() {}"
+        );
         assert!(!dst.join("lib/.git").exists());
-        assert_eq!(std::fs::read_to_string(dst.join("readme.md")).unwrap(), "mine");
-        assert_eq!(std::fs::read_to_string(dst.join("readme-1.md")).unwrap(), "hi");
-        assert_eq!(s.renamed.get("readme.md").map(String::as_str), Some("readme-1.md"));
+        assert_eq!(
+            std::fs::read_to_string(dst.join("readme.md")).unwrap(),
+            "mine"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("readme-1.md")).unwrap(),
+            "hi"
+        );
+        assert_eq!(
+            s.renamed.get("readme.md").map(String::as_str),
+            Some("readme-1.md")
+        );
 
-        let s = unpack(&buf[..], &dst, ConflictPolicy::Replace, &HashMap::new(), &|| false, &|_| {}).unwrap();
-        assert_eq!(std::fs::read_to_string(dst.join("readme.md")).unwrap(), "hi");
+        let s = unpack(
+            &buf[..],
+            &dst,
+            ConflictPolicy::Replace,
+            &HashMap::new(),
+            &|| false,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.join("readme.md")).unwrap(),
+            "hi"
+        );
         assert!(s.replaced.contains(&"lib".to_string()));
 
         let mut ren = HashMap::new();
         ren.insert("lib".to_string(), "lib-copy".to_string());
-        unpack(&buf[..], &dst, ConflictPolicy::Skip, &ren, &|| false, &|_| {}).unwrap();
+        unpack(
+            &buf[..],
+            &dst,
+            ConflictPolicy::Skip,
+            &ren,
+            &|| false,
+            &|_| {},
+        )
+        .unwrap();
         assert!(dst.join("lib-copy/inner/a.rs").exists());
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);

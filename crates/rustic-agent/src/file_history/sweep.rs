@@ -139,6 +139,8 @@ pub enum SweepEnqueueError {
 
 #[cfg(test)]
 mod tests {
+    type Collected = Arc<StdMutex<Vec<(String, Vec<String>)>>>;
+
     use super::*;
     use crate::file_history::tracker::FileHistory;
     use rustic_db::Database;
@@ -200,7 +202,7 @@ mod tests {
     /// reporting two paths would satisfy `at_least=2` and let the test
     /// proceed before a second callback had a chance to fire.
     async fn wait_for_paths(
-        collected: Arc<StdMutex<Vec<(String, Vec<String>)>>>,
+        collected: Collected,
         at_least: usize,
         timeout: Duration,
     ) -> Vec<(String, Vec<String>)> {
@@ -236,8 +238,7 @@ mod tests {
         let post = f.project_root.join("post.txt");
         write(&post, b"written during bash");
 
-        let collected: Arc<StdMutex<Vec<(String, Vec<String>)>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let collected: Collected = Arc::new(StdMutex::new(Vec::new()));
         let collected_cl = collected.clone();
         let cb: ChangeCallback = Arc::new(move |_task_id, msg, paths| {
             collected_cl
@@ -286,8 +287,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         let later = SystemTime::now();
 
-        let collected: Arc<StdMutex<Vec<(String, Vec<String>)>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let collected: Collected = Arc::new(StdMutex::new(Vec::new()));
         let collected_cl = collected.clone();
         let cb: ChangeCallback = Arc::new(move |_task_id, msg, paths| {
             collected_cl
@@ -342,8 +342,7 @@ mod tests {
         write(&f.project_root.join("x.txt"), b"x");
         write(&f.project_root.join("y.txt"), b"y");
 
-        let collected: Arc<StdMutex<Vec<(String, Vec<String>)>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let collected: Collected = Arc::new(StdMutex::new(Vec::new()));
         let collected_cl = collected.clone();
         let cb: ChangeCallback = Arc::new(move |_task_id, msg, paths| {
             collected_cl
@@ -404,8 +403,7 @@ mod tests {
         let big = vec![b'A'; 10 * 1024 * 1024];
         write(&f.project_root.join("huge.bin"), &big);
 
-        let collected: Arc<StdMutex<Vec<(String, Vec<String>)>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let collected: Collected = Arc::new(StdMutex::new(Vec::new()));
         let collected_cl = collected.clone();
         let cb: ChangeCallback = Arc::new(move |_task_id, msg, paths| {
             collected_cl

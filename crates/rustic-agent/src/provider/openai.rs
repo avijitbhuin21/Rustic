@@ -15,6 +15,12 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
 }
 
+impl Default for OpenAiProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenAiProvider {
     pub fn new() -> Self {
         Self {
@@ -39,7 +45,7 @@ impl OpenAiProvider {
             .trim_end_matches('/');
         let url = format!("{}/responses", base);
 
-        let (extracted_instructions, input_items) = convert_messages_to_responses_api(&messages);
+        let (extracted_instructions, input_items) = convert_messages_to_responses_api(messages);
 
         let mut body = json!({
             "model": config.model,
@@ -169,7 +175,10 @@ fn mark_openrouter_cache_part(msg: &mut serde_json::Value, cc: &serde_json::Valu
     match content {
         serde_json::Value::String(s) => {
             let (head, tree) = match s.find(tree_open) {
-                Some(i) => (s[..i].trim_end_matches('\n').to_string(), Some(s[i..].to_string())),
+                Some(i) => (
+                    s[..i].trim_end_matches('\n').to_string(),
+                    Some(s[i..].to_string()),
+                ),
                 None => (s.clone(), None),
             };
             if head.trim().is_empty() {
@@ -1948,8 +1957,14 @@ mod openrouter_cache_tests {
 
     #[test]
     fn family_detection() {
-        assert_eq!(openrouter_cache_family("anthropic/claude-sonnet-4.6"), Some(OpenRouterCacheFamily::Anthropic));
-        assert_eq!(openrouter_cache_family("google/gemini-2.5-pro"), Some(OpenRouterCacheFamily::Gemini));
+        assert_eq!(
+            openrouter_cache_family("anthropic/claude-sonnet-4.6"),
+            Some(OpenRouterCacheFamily::Anthropic)
+        );
+        assert_eq!(
+            openrouter_cache_family("google/gemini-2.5-pro"),
+            Some(OpenRouterCacheFamily::Gemini)
+        );
         assert_eq!(openrouter_cache_family("openai/gpt-5"), None);
         assert_eq!(openrouter_cache_family("deepseek/deepseek-chat"), None);
     }
@@ -1968,16 +1983,25 @@ mod openrouter_cache_tests {
     fn anthropic_marks_system_1h_and_two_rolling_breakpoints_before_tree() {
         let mut msgs = convo();
         apply_openrouter_cache_control(&mut msgs, "anthropic/claude-opus-4.7");
-        assert_eq!(msgs[0]["content"][0]["cache_control"], json!({ "type": "ephemeral", "ttl": "1h" }));
+        assert_eq!(
+            msgs[0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
         assert_eq!(msgs[0]["content"][0]["text"], "SYSTEM");
         // latest user message: split, stable head marked, tree tail unmarked
         let last = msgs[4]["content"].as_array().unwrap();
         assert_eq!(last[0]["text"], "latest");
         assert_eq!(last[0]["cache_control"], json!({ "type": "ephemeral" }));
-        assert!(last[1]["text"].as_str().unwrap().starts_with(crate::system_prompt::PROJECT_TREE_OPEN));
+        assert!(last[1]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(crate::system_prompt::PROJECT_TREE_OPEN));
         assert!(last[1].get("cache_control").is_none());
         // tool result is the second rolling breakpoint; older messages untouched
-        assert_eq!(msgs[3]["content"][0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert_eq!(
+            msgs[3]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
         assert_eq!(msgs[1]["content"], "first");
         assert!(msgs[2].get("content").is_none());
     }
@@ -1986,7 +2010,10 @@ mod openrouter_cache_tests {
     fn gemini_marks_only_system_and_others_untouched() {
         let mut msgs = convo();
         apply_openrouter_cache_control(&mut msgs, "google/gemini-2.5-flash");
-        assert_eq!(msgs[0]["content"][0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert_eq!(
+            msgs[0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
         assert!(msgs[4]["content"].is_string());
         let mut msgs = convo();
         let before = msgs.clone();

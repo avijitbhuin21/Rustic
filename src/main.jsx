@@ -4,10 +4,12 @@ import './styles/globals.css';
 import App from './App.jsx';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { installGlobalErrorHandlers } from '@/lib/crash-logger';
+import { installChunkReload } from '@/lib/chunk-reload';
 
 // Capture uncaught errors / promise rejections to the backend log before
 // anything renders, so even a crash during initial mount leaves a trace.
 installGlobalErrorHandlers();
+installChunkReload();
 
 // Safety net for OS file drags: if a dragged file is dropped anywhere no
 // component handles, the webview's default action is to NAVIGATE to that

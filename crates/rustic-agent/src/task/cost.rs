@@ -92,6 +92,7 @@ impl CostBreakdown {
 }
 
 impl TaskCost {
+    #[allow(clippy::too_many_arguments)]
     pub fn add_turn(
         &mut self,
         model: &str,
@@ -139,16 +140,17 @@ impl TaskCost {
         self.turn_count += 1;
 
         let turn_usd = actual_cost.unwrap_or_else(|| breakdown.total());
-        let entry = match self.by_model.iter_mut().find(|m| m.model == model) {
-            Some(e) => e,
+        let idx = match self.by_model.iter().position(|m| m.model == model) {
+            Some(i) => i,
             None => {
                 self.by_model.push(ModelCost {
                     model: model.to_string(),
                     ..Default::default()
                 });
-                self.by_model.last_mut().expect("pushed above")
+                self.by_model.len() - 1
             }
         };
+        let entry = &mut self.by_model[idx];
         entry.input_tokens += usage.input_tokens as u64;
         entry.output_tokens += usage.output_tokens as u64;
         entry.cache_read_tokens += usage.cache_read_tokens as u64;

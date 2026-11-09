@@ -7,6 +7,7 @@
 //! - URL source or global scope → prompt always, in every mode.
 //! - MCP servers → prompt always, in every mode.
 //! - Uninstalls → prompt in ManualEdit only; always reversible via trash.
+//!
 //! Sub-agents are rejected outright and told to escalate to the orchestrator.
 
 use crate::extensions::{
@@ -214,7 +215,7 @@ async fn list_extensions(context: &ToolContext) -> Result<ToolOutput> {
             let mgr = std::sync::Arc::clone(mgr);
             let root2 = root.clone();
             tokio::task::spawn_blocking(move || {
-                let m = mgr.lock().unwrap();
+                let m = mgr.lock().unwrap_or_else(|p| p.into_inner());
                 let pool: Vec<Value> = m
                     .list_pool_servers_with_status()
                     .into_iter()
@@ -576,7 +577,12 @@ async fn add_mcp_server(params: Value, context: &ToolContext) -> Result<ToolOutp
             true,
         ));
     }
-    let (name, transport_val) = pairs.into_iter().next().expect("non-empty pairs");
+    let Some((name, transport_val)) = pairs.into_iter().next() else {
+        return Ok(ToolOutput::text(
+            "INVALID_PARAMS: the config lists no servers".to_string(),
+            true,
+        ));
+    };
     if let Err(e) = validate_name(&name) {
         return Ok(ToolOutput::text(format!("INVALID_PARAMS: {}", e), true));
     }
@@ -635,7 +641,7 @@ async fn add_mcp_server(params: Value, context: &ToolContext) -> Result<ToolOutp
     let name_for_block = name.clone();
     let add_result = tokio::task::spawn_blocking(
         move || -> anyhow::Result<(String, std::result::Result<Vec<crate::provider::ToolDef>, String>)> {
-            let mut m = mgr_clone.lock().unwrap();
+            let mut m = mgr_clone.lock().unwrap_or_else(|p| p.into_inner());
             match scope {
                 McpScope::User => {
                     m.add_pool_server(&name_for_block, &entry)?;
@@ -931,7 +937,7 @@ async fn uninstall_extension(params: Value, context: &ToolContext) -> Result<Too
                 let res = tokio::task::spawn_blocking(move || {
                     mgr_clone
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|p| p.into_inner())
                         .save_project_server(&root, &name_c, None, false, false)
                 })
                 .await;
@@ -967,7 +973,7 @@ async fn uninstall_extension(params: Value, context: &ToolContext) -> Result<Too
             let name_c = name.clone();
             let result =
                 tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String, String)> {
-                    let mut m = mgr_clone.lock().unwrap();
+                    let mut m = mgr_clone.lock().unwrap_or_else(|p| p.into_inner());
                     let matched: Vec<_> = m
                         .list_servers()
                         .into_iter()
@@ -978,16 +984,15 @@ async fn uninstall_extension(params: Value, context: &ToolContext) -> Result<Too
                             _ => true,
                         })
                         .collect();
-                    if matched.is_empty() {
-                        anyhow::bail!("no MCP server named `{}` in the requested scope", name_c);
-                    }
                     if matched.len() > 1 {
                         anyhow::bail!(
                         "`{}` exists in multiple scopes — pass `scope` (\"project\" or \"user\")",
                         name_c
                     );
                     }
-                    let cfg = matched.into_iter().next().unwrap();
+                    let Some(cfg) = matched.into_iter().next() else {
+                        anyhow::bail!("no MCP server named `{}` in the requested scope", name_c);
+                    };
                     let backup = serde_json::to_string_pretty(&cfg)?;
                     m.remove_server(&cfg.id)?;
                     Ok((cfg.id, format!("{:?}", cfg.scope).to_lowercase(), backup))

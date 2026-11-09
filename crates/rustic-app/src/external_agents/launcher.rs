@@ -121,7 +121,11 @@ fn fallback_install_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(prefix) = std::env::var_os("NPM_CONFIG_PREFIX").filter(|p| !p.is_empty()) {
         let prefix = PathBuf::from(prefix);
-        dirs.push(if cfg!(windows) { prefix.clone() } else { prefix.join("bin") });
+        dirs.push(if cfg!(windows) {
+            prefix.clone()
+        } else {
+            prefix.join("bin")
+        });
     }
     if cfg!(windows) {
         if let Some(appdata) = std::env::var_os("APPDATA") {

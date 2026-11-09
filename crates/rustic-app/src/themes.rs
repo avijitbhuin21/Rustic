@@ -33,54 +33,104 @@ const TRUST_KEY: &str = "theme_trust";
 /// The 31 color slots of a mode; any may be omitted (falls back to the base).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Colors {
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bg_hard: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bg: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bg_soft: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bg1: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bg2: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bg3: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bg4: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub fg: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub fg1: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub fg2: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub fg3: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub fg4: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub accent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub primary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub border: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bright_red: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bright_green: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bright_yellow: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bright_blue: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bright_purple: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bright_aqua: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub bright_orange: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_keyword: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_string: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_comment: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_function: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_variable: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_number: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_operator: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_punctuation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_hard: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_soft: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg2: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg4: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg2: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg4: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bright_red: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bright_green: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bright_yellow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bright_blue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bright_purple: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bright_aqua: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bright_orange: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_keyword: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_function: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_variable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_number: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_operator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_punctuation: Option<String>,
 }
 
 /// `(name, &value)` for every slot, in field order.
 macro_rules! color_fields {
     ($c:expr) => {
         [
-            ("bg_hard", &$c.bg_hard), ("bg", &$c.bg), ("bg_soft", &$c.bg_soft), ("bg1", &$c.bg1),
-            ("bg2", &$c.bg2), ("bg3", &$c.bg3), ("bg4", &$c.bg4), ("fg", &$c.fg), ("fg1", &$c.fg1),
-            ("fg2", &$c.fg2), ("fg3", &$c.fg3), ("fg4", &$c.fg4), ("accent", &$c.accent),
-            ("primary", &$c.primary), ("border", &$c.border), ("bright_red", &$c.bright_red),
-            ("bright_green", &$c.bright_green), ("bright_yellow", &$c.bright_yellow),
-            ("bright_blue", &$c.bright_blue), ("bright_purple", &$c.bright_purple),
-            ("bright_aqua", &$c.bright_aqua), ("bright_orange", &$c.bright_orange),
-            ("token_keyword", &$c.token_keyword), ("token_string", &$c.token_string),
-            ("token_comment", &$c.token_comment), ("token_function", &$c.token_function),
-            ("token_type", &$c.token_type), ("token_variable", &$c.token_variable),
-            ("token_number", &$c.token_number), ("token_operator", &$c.token_operator),
+            ("bg_hard", &$c.bg_hard),
+            ("bg", &$c.bg),
+            ("bg_soft", &$c.bg_soft),
+            ("bg1", &$c.bg1),
+            ("bg2", &$c.bg2),
+            ("bg3", &$c.bg3),
+            ("bg4", &$c.bg4),
+            ("fg", &$c.fg),
+            ("fg1", &$c.fg1),
+            ("fg2", &$c.fg2),
+            ("fg3", &$c.fg3),
+            ("fg4", &$c.fg4),
+            ("accent", &$c.accent),
+            ("primary", &$c.primary),
+            ("border", &$c.border),
+            ("bright_red", &$c.bright_red),
+            ("bright_green", &$c.bright_green),
+            ("bright_yellow", &$c.bright_yellow),
+            ("bright_blue", &$c.bright_blue),
+            ("bright_purple", &$c.bright_purple),
+            ("bright_aqua", &$c.bright_aqua),
+            ("bright_orange", &$c.bright_orange),
+            ("token_keyword", &$c.token_keyword),
+            ("token_string", &$c.token_string),
+            ("token_comment", &$c.token_comment),
+            ("token_function", &$c.token_function),
+            ("token_type", &$c.token_type),
+            ("token_variable", &$c.token_variable),
+            ("token_number", &$c.token_number),
+            ("token_operator", &$c.token_operator),
             ("token_punctuation", &$c.token_punctuation),
         ]
     };
@@ -91,15 +141,37 @@ impl Colors {
     pub fn from_theme(t: &Theme) -> Self {
         let s = |v: &String| Some(v.clone());
         Colors {
-            bg_hard: s(&t.bg_hard), bg: s(&t.bg), bg_soft: s(&t.bg_soft), bg1: s(&t.bg1), bg2: s(&t.bg2),
-            bg3: s(&t.bg3), bg4: s(&t.bg4), fg: s(&t.fg), fg1: s(&t.fg1), fg2: s(&t.fg2), fg3: s(&t.fg3),
-            fg4: s(&t.fg4), accent: s(&t.accent), primary: t.primary.clone(), border: s(&t.border),
-            bright_red: s(&t.bright_red), bright_green: s(&t.bright_green), bright_yellow: s(&t.bright_yellow),
-            bright_blue: s(&t.bright_blue), bright_purple: s(&t.bright_purple), bright_aqua: s(&t.bright_aqua),
-            bright_orange: s(&t.bright_orange), token_keyword: s(&t.token_keyword), token_string: s(&t.token_string),
-            token_comment: s(&t.token_comment), token_function: s(&t.token_function), token_type: s(&t.token_type),
-            token_variable: s(&t.token_variable), token_number: s(&t.token_number),
-            token_operator: s(&t.token_operator), token_punctuation: s(&t.token_punctuation),
+            bg_hard: s(&t.bg_hard),
+            bg: s(&t.bg),
+            bg_soft: s(&t.bg_soft),
+            bg1: s(&t.bg1),
+            bg2: s(&t.bg2),
+            bg3: s(&t.bg3),
+            bg4: s(&t.bg4),
+            fg: s(&t.fg),
+            fg1: s(&t.fg1),
+            fg2: s(&t.fg2),
+            fg3: s(&t.fg3),
+            fg4: s(&t.fg4),
+            accent: s(&t.accent),
+            primary: t.primary.clone(),
+            border: s(&t.border),
+            bright_red: s(&t.bright_red),
+            bright_green: s(&t.bright_green),
+            bright_yellow: s(&t.bright_yellow),
+            bright_blue: s(&t.bright_blue),
+            bright_purple: s(&t.bright_purple),
+            bright_aqua: s(&t.bright_aqua),
+            bright_orange: s(&t.bright_orange),
+            token_keyword: s(&t.token_keyword),
+            token_string: s(&t.token_string),
+            token_comment: s(&t.token_comment),
+            token_function: s(&t.token_function),
+            token_type: s(&t.token_type),
+            token_variable: s(&t.token_variable),
+            token_number: s(&t.token_number),
+            token_operator: s(&t.token_operator),
+            token_punctuation: s(&t.token_punctuation),
         }
     }
 
@@ -110,19 +182,36 @@ impl Colors {
                 *b = v.trim().to_string();
             }
         };
-        pick(&self.bg_hard, &mut base.bg_hard); pick(&self.bg, &mut base.bg); pick(&self.bg_soft, &mut base.bg_soft);
-        pick(&self.bg1, &mut base.bg1); pick(&self.bg2, &mut base.bg2); pick(&self.bg3, &mut base.bg3);
-        pick(&self.bg4, &mut base.bg4); pick(&self.fg, &mut base.fg); pick(&self.fg1, &mut base.fg1);
-        pick(&self.fg2, &mut base.fg2); pick(&self.fg3, &mut base.fg3); pick(&self.fg4, &mut base.fg4);
-        pick(&self.accent, &mut base.accent); pick(&self.border, &mut base.border);
-        pick(&self.bright_red, &mut base.bright_red); pick(&self.bright_green, &mut base.bright_green);
-        pick(&self.bright_yellow, &mut base.bright_yellow); pick(&self.bright_blue, &mut base.bright_blue);
-        pick(&self.bright_purple, &mut base.bright_purple); pick(&self.bright_aqua, &mut base.bright_aqua);
-        pick(&self.bright_orange, &mut base.bright_orange); pick(&self.token_keyword, &mut base.token_keyword);
-        pick(&self.token_string, &mut base.token_string); pick(&self.token_comment, &mut base.token_comment);
-        pick(&self.token_function, &mut base.token_function); pick(&self.token_type, &mut base.token_type);
-        pick(&self.token_variable, &mut base.token_variable); pick(&self.token_number, &mut base.token_number);
-        pick(&self.token_operator, &mut base.token_operator); pick(&self.token_punctuation, &mut base.token_punctuation);
+        pick(&self.bg_hard, &mut base.bg_hard);
+        pick(&self.bg, &mut base.bg);
+        pick(&self.bg_soft, &mut base.bg_soft);
+        pick(&self.bg1, &mut base.bg1);
+        pick(&self.bg2, &mut base.bg2);
+        pick(&self.bg3, &mut base.bg3);
+        pick(&self.bg4, &mut base.bg4);
+        pick(&self.fg, &mut base.fg);
+        pick(&self.fg1, &mut base.fg1);
+        pick(&self.fg2, &mut base.fg2);
+        pick(&self.fg3, &mut base.fg3);
+        pick(&self.fg4, &mut base.fg4);
+        pick(&self.accent, &mut base.accent);
+        pick(&self.border, &mut base.border);
+        pick(&self.bright_red, &mut base.bright_red);
+        pick(&self.bright_green, &mut base.bright_green);
+        pick(&self.bright_yellow, &mut base.bright_yellow);
+        pick(&self.bright_blue, &mut base.bright_blue);
+        pick(&self.bright_purple, &mut base.bright_purple);
+        pick(&self.bright_aqua, &mut base.bright_aqua);
+        pick(&self.bright_orange, &mut base.bright_orange);
+        pick(&self.token_keyword, &mut base.token_keyword);
+        pick(&self.token_string, &mut base.token_string);
+        pick(&self.token_comment, &mut base.token_comment);
+        pick(&self.token_function, &mut base.token_function);
+        pick(&self.token_type, &mut base.token_type);
+        pick(&self.token_variable, &mut base.token_variable);
+        pick(&self.token_number, &mut base.token_number);
+        pick(&self.token_operator, &mut base.token_operator);
+        pick(&self.token_punctuation, &mut base.token_punctuation);
         if let Some(p) = self.primary.as_ref().filter(|v| !v.trim().is_empty()) {
             base.primary = Some(p.trim().to_string());
         }
@@ -135,25 +224,35 @@ impl Colors {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Style {
     /// UI font stack, e.g. `"Inter", sans-serif`.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub font_sans: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_sans: Option<String>,
     /// Code font stack.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub font_mono: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_mono: Option<String>,
     /// Base corner radius, e.g. `0.5rem` or `8px`.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub radius: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<String>,
     /// `"full"` (default) or `"reduced"` (no transitions / animations).
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub motion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<String>,
     /// Border width, e.g. `1px` / `2px`.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub border_width: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_width: Option<String>,
     /// `"none" | "soft" | "strong" | "glow" | "hard"` (hard = offset, no blur).
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub shadow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<String>,
     /// `"solid" | "glass"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub surface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
     /// `"compact" | "normal" | "comfortable"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub density: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub density: Option<String>,
     /// `"solid" | "pill" | "raised" | "brutal" | "glow"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub button: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button: Option<String>,
     /// App background pattern: `"none" | "grain" | "grid" | "dots" | "scanlines"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub texture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texture: Option<String>,
 }
 
 /// Allowed values for the enum-like style keys.
@@ -172,11 +271,16 @@ pub struct Pack {
     #[serde(default = "default_format")]
     pub format: u32,
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub author: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub dark: Option<Colors>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub light: Option<Colors>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark: Option<Colors>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light: Option<Colors>,
     #[serde(default)]
     pub style: Style,
     /// Optional custom CSS (scanned; scoped away from protected UI).
@@ -217,8 +321,12 @@ impl Pack {
     /// Modes this pack provides.
     pub fn modes(&self) -> Vec<&'static str> {
         let mut m = Vec::new();
-        if self.dark.is_some() { m.push("dark"); }
-        if self.light.is_some() { m.push("light"); }
+        if self.dark.is_some() {
+            m.push("dark");
+        }
+        if self.light.is_some() {
+            m.push("light");
+        }
         m
     }
 
@@ -247,16 +355,26 @@ impl Pack {
 /// Parse a theme file: format 2 pack, or a v1 palette (JSON or TOML).
 pub fn parse(text: &str) -> Result<Pack, String> {
     if text.len() > MAX_FILE_BYTES {
-        return Err(format!("Theme file is too large (max {} KB)", MAX_FILE_BYTES / 1024));
+        return Err(format!(
+            "Theme file is too large (max {} KB)",
+            MAX_FILE_BYTES / 1024
+        ));
     }
     let trimmed = text.trim_start();
     if trimmed.starts_with('{') {
-        let v: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| format!("Invalid theme JSON: {e}"))?;
-        let is_v2 = v.get("format").is_some() || v.get("dark").is_some() || v.get("light").is_some() || v.get("style").is_some() || v.get("css").is_some();
+        let v: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|e| format!("Invalid theme JSON: {e}"))?;
+        let is_v2 = v.get("format").is_some()
+            || v.get("dark").is_some()
+            || v.get("light").is_some()
+            || v.get("style").is_some()
+            || v.get("css").is_some();
         let pack = if is_v2 {
             serde_json::from_value::<Pack>(v).map_err(|e| format!("Invalid theme: {e}"))?
         } else {
-            Pack::from_v1(&serde_json::from_value::<Theme>(v).map_err(|e| format!("Invalid palette: {e}"))?)
+            Pack::from_v1(
+                &serde_json::from_value::<Theme>(v).map_err(|e| format!("Invalid palette: {e}"))?,
+            )
         };
         validate(&pack)?;
         return Ok(pack);
@@ -273,16 +391,33 @@ pub fn is_safe_color(v: &str) -> bool {
     if v.is_empty() || v.len() > 80 {
         return false;
     }
-    if v.contains(['{', '}', ';', '<', '>', '\\', '"', '\'', '@', '!']) || v.to_ascii_lowercase().contains("url") {
+    if v.contains(['{', '}', ';', '<', '>', '\\', '"', '\'', '@', '!'])
+        || v.to_ascii_lowercase().contains("url")
+    {
         return false;
     }
     if let Some(hex) = v.strip_prefix('#') {
         return matches!(hex.len(), 3 | 4 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
     }
     let lower = v.to_ascii_lowercase();
-    let funcs = ["rgb(", "rgba(", "hsl(", "hsla(", "hwb(", "lab(", "lch(", "oklab(", "oklch(", "color(", "color-mix("];
+    let funcs = [
+        "rgb(",
+        "rgba(",
+        "hsl(",
+        "hsla(",
+        "hwb(",
+        "lab(",
+        "lch(",
+        "oklab(",
+        "oklch(",
+        "color(",
+        "color-mix(",
+    ];
     if funcs.iter().any(|f| lower.starts_with(f)) {
-        return lower.ends_with(')') && lower.chars().all(|c| c.is_ascii_alphanumeric() || " .,%/()-+#".contains(c));
+        return lower.ends_with(')')
+            && lower
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || " .,%/()-+#".contains(c));
     }
     lower.chars().all(|c| c.is_ascii_alphabetic())
 }
@@ -294,19 +429,24 @@ fn is_safe_style_value(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 200
         && !v.to_ascii_lowercase().contains("url")
-        && v.chars().all(|c| c.is_ascii_alphanumeric() || " .,%-_()'\"/".contains(c))
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || " .,%-_()'\"/".contains(c))
 }
 
 /// Reject packs whose metadata / colors / style values could inject CSS.
 pub fn validate(p: &Pack) -> Result<(), String> {
     if p.format > FORMAT {
-        return Err(format!("This theme needs a newer Rustic (format {}, supported {FORMAT})", p.format));
+        return Err(format!(
+            "This theme needs a newer Rustic (format {}, supported {FORMAT})",
+            p.format
+        ));
     }
     let name = p.name.trim();
     if name.is_empty() || name.len() > 80 {
         return Err("The theme needs a name (up to 80 characters)".into());
     }
-    if p.dark.is_none() && p.light.is_none() && p.css.as_deref().is_none_or(|c| c.trim().is_empty()) {
+    if p.dark.is_none() && p.light.is_none() && p.css.as_deref().is_none_or(|c| c.trim().is_empty())
+    {
         return Err("The theme defines no colors and no CSS".into());
     }
     for (mode, colors) in [("dark", &p.dark), ("light", &p.light)] {
@@ -321,9 +461,16 @@ pub fn validate(p: &Pack) -> Result<(), String> {
     }
     let s = &p.style;
     for (field, value) in [
-        ("font_sans", &s.font_sans), ("font_mono", &s.font_mono), ("radius", &s.radius),
-        ("motion", &s.motion), ("border_width", &s.border_width), ("shadow", &s.shadow),
-        ("surface", &s.surface), ("density", &s.density), ("button", &s.button), ("texture", &s.texture),
+        ("font_sans", &s.font_sans),
+        ("font_mono", &s.font_mono),
+        ("radius", &s.radius),
+        ("motion", &s.motion),
+        ("border_width", &s.border_width),
+        ("shadow", &s.shadow),
+        ("surface", &s.surface),
+        ("density", &s.density),
+        ("button", &s.button),
+        ("texture", &s.texture),
     ] {
         if let Some(v) = value {
             if !is_safe_style_value(v) {
@@ -331,7 +478,10 @@ pub fn validate(p: &Pack) -> Result<(), String> {
             }
             if let Some((_, allowed)) = STYLE_ENUMS.iter().find(|(f, _)| *f == field) {
                 if !allowed.contains(&v.trim()) {
-                    return Err(format!("style.{field}: \"{v}\" — use one of: {}", allowed.join(", ")));
+                    return Err(format!(
+                        "style.{field}: \"{v}\" — use one of: {}",
+                        allowed.join(", ")
+                    ));
                 }
             }
         }
@@ -380,15 +530,29 @@ fn css_urls(css: &str) -> Vec<String> {
     let mut i = 0;
     while let Some(pos) = lower[i..].find("url(") {
         let start = i + pos + 4;
-        let end = lower[start..].find(')').map(|e| start + e).unwrap_or(lower.len());
-        out.push(lower[start..end].trim().trim_matches(['"', '\'']).trim().to_string());
+        let end = lower[start..]
+            .find(')')
+            .map(|e| start + e)
+            .unwrap_or(lower.len());
+        out.push(
+            lower[start..end]
+                .trim()
+                .trim_matches(['"', '\''])
+                .trim()
+                .to_string(),
+        );
         i = end.min(lower.len());
-        if i >= lower.len() { break; }
+        if i >= lower.len() {
+            break;
+        }
     }
     let mut j = 0;
     while let Some(pos) = lower[j..].find("@import") {
         let start = j + pos + 7;
-        let seg_end = lower[start..].find(';').map(|e| start + e).unwrap_or(lower.len());
+        let seg_end = lower[start..]
+            .find(';')
+            .map(|e| start + e)
+            .unwrap_or(lower.len());
         let seg = lower[start..seg_end].trim();
         if let Some(q) = seg.chars().next().filter(|c| *c == '"' || *c == '\'') {
             if let Some(close) = seg[1..].find(q) {
@@ -396,14 +560,19 @@ fn css_urls(css: &str) -> Vec<String> {
             }
         }
         j = seg_end.min(lower.len());
-        if j >= lower.len() { break; }
+        if j >= lower.len() {
+            break;
+        }
     }
     out
 }
 
 /// Host of an http(s) URL.
 fn url_host(u: &str) -> Option<String> {
-    let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")).or_else(|| u.strip_prefix("//"))?;
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .or_else(|| u.strip_prefix("//"))?;
     let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?;
     (!host.is_empty()).then(|| host.to_string())
 }
@@ -418,7 +587,11 @@ fn hex_luminance(c: &str) -> Option<f64> {
     };
     let ch = |i: usize| -> Option<f64> {
         let v = u8::from_str_radix(&h[i..i + 2], 16).ok()? as f64 / 255.0;
-        Some(if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) })
+        Some(if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        })
     };
     Some(0.2126 * ch(0)? + 0.7152 * ch(2)? + 0.0722 * ch(4)?)
 }
@@ -433,7 +606,12 @@ fn contrast(a: &str, b: &str) -> Option<f64> {
 /// Scan a pack's CSS and colors.
 pub fn scan(p: &Pack) -> ScanReport {
     let mut r = ScanReport::default();
-    let mut block = |code: &str, msg: String| r.blocked.push(Finding { code: code.into(), message: msg });
+    let mut block = |code: &str, msg: String| {
+        r.blocked.push(Finding {
+            code: code.into(),
+            message: msg,
+        })
+    };
     let raw = p.css.clone().unwrap_or_default();
     let css = strip_comments(&raw);
     let lower = css.to_ascii_lowercase();
@@ -442,12 +620,28 @@ pub fn scan(p: &Pack) -> ScanReport {
     for (needle, code, msg) in [
         ("javascript:", "script-url", "Contains a javascript: URL"),
         ("vbscript:", "script-url", "Contains a vbscript: URL"),
-        ("expression(", "css-expression", "Uses expression(), which can run script in old engines"),
-        ("behavior:", "css-behavior", "Uses behavior:, which can load script in old engines"),
-        ("-moz-binding", "css-binding", "Uses -moz-binding, which can load script"),
+        (
+            "expression(",
+            "css-expression",
+            "Uses expression(), which can run script in old engines",
+        ),
+        (
+            "behavior:",
+            "css-behavior",
+            "Uses behavior:, which can load script in old engines",
+        ),
+        (
+            "-moz-binding",
+            "css-binding",
+            "Uses -moz-binding, which can load script",
+        ),
         ("<script", "html-in-css", "Contains a <script> tag"),
         ("</style", "html-in-css", "Tries to close the style block"),
-        ("data-rustic-protected", "protected-ui", "Targets Rustic's protected prompts"),
+        (
+            "data-rustic-protected",
+            "protected-ui",
+            "Targets Rustic's protected prompts",
+        ),
     ] {
         if compact.contains(&needle.replace(' ', "")) {
             block(code, msg.to_string());
@@ -457,15 +651,24 @@ pub fn scan(p: &Pack) -> ScanReport {
     let mut warns: Vec<Finding> = Vec::new();
     let mut warn = |code: &str, msg: String| {
         if !warns.iter().any(|w| w.code == code && w.message == msg) {
-            warns.push(Finding { code: code.into(), message: msg });
+            warns.push(Finding {
+                code: code.into(),
+                message: msg,
+            });
         }
     };
     for u in css_urls(&css) {
-        if u.starts_with("data:") {
-            let mime = u[5..].split([';', ',']).next().unwrap_or_default();
-            let ok = mime.starts_with("image/") && mime != "image/svg+xml" || mime.starts_with("font/") || mime.starts_with("application/font") || mime.starts_with("application/x-font");
+        if let Some(data) = u.strip_prefix("data:") {
+            let mime = data.split([';', ',']).next().unwrap_or_default();
+            let ok = mime.starts_with("image/") && mime != "image/svg+xml"
+                || mime.starts_with("font/")
+                || mime.starts_with("application/font")
+                || mime.starts_with("application/x-font");
             if !ok {
-                block("data-url", format!("Embeds data of type \"{mime}\" (only images and fonts are allowed)"));
+                block(
+                    "data-url",
+                    format!("Embeds data of type \"{mime}\" (only images and fonts are allowed)"),
+                );
             }
         } else if u.starts_with("http://") || u.starts_with("https://") || u.starts_with("//") {
             if let Some(h) = url_host(&u) {
@@ -475,40 +678,96 @@ pub fn scan(p: &Pack) -> ScanReport {
                 warn("insecure-url", format!("Loads over plain HTTP: {u}"));
             }
         } else if u.contains(':') {
-            block("url-scheme", format!("Loads from an unsupported location: {u}"));
+            block(
+                "url-scheme",
+                format!("Loads from an unsupported location: {u}"),
+            );
         }
     }
     if !hosts.is_empty() {
-        warn("remote", format!("Loads files from the internet: {}", hosts.iter().cloned().collect::<Vec<_>>().join(", ")));
+        warn(
+            "remote",
+            format!(
+                "Loads files from the internet: {}",
+                hosts.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        );
     }
     if compact.contains("@import") {
-        warn("import", "Imports other stylesheets (their contents are not scanned)".into());
+        warn(
+            "import",
+            "Imports other stylesheets (their contents are not scanned)".into(),
+        );
     }
-    let broad = ["*{", "*,", "body{", "html{", ":root{", "body>", "body*", "[role=dialog]", "[role=\"dialog\"]", "dialog{", "[data-slot=dialog"];
-    let hides = ["display:none", "visibility:hidden", "opacity:0;", "opacity:0}", "pointer-events:none", "clip-path:", "transform:scale(0"];
+    let broad = [
+        "*{",
+        "*,",
+        "body{",
+        "html{",
+        ":root{",
+        "body>",
+        "body*",
+        "[role=dialog]",
+        "[role=\"dialog\"]",
+        "dialog{",
+        "[data-slot=dialog",
+    ];
+    let hides = [
+        "display:none",
+        "visibility:hidden",
+        "opacity:0;",
+        "opacity:0}",
+        "pointer-events:none",
+        "clip-path:",
+        "transform:scale(0",
+    ];
     if broad.iter().any(|b| compact.contains(b)) && hides.iter().any(|h| compact.contains(h)) {
         warn("hide", "May hide or block large parts of the app (broad selectors with display/visibility/opacity/pointer-events)".into());
     }
-    let overlays = compact.contains("position:fixed") && (compact.contains("z-index:") && lower.split("z-index").skip(1).any(|s| {
-        s.trim_start_matches([':', ' ']).chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().is_ok_and(|n| n >= 1000)
-    }));
+    let overlays = compact.contains("position:fixed")
+        && (compact.contains("z-index:")
+            && lower.split("z-index").skip(1).any(|s| {
+                s.trim_start_matches([':', ' '])
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .is_ok_and(|n| n >= 1000)
+            }));
     if overlays {
-        warn("overlay", "Creates fixed overlays with a very high z-index (could cover the app)".into());
+        warn(
+            "overlay",
+            "Creates fixed overlays with a very high z-index (could cover the app)".into(),
+        );
     }
     if compact.contains("content:") && lower.matches("content").count() > 20 {
-        warn("content", "Injects a lot of text via content: (could imitate UI)".into());
+        warn(
+            "content",
+            "Injects a lot of text via content: (could imitate UI)".into(),
+        );
     }
     if raw.len() > 200 * 1024 {
-        warn("size", format!("Large stylesheet ({} KB)", raw.len() / 1024));
+        warn(
+            "size",
+            format!("Large stylesheet ({} KB)", raw.len() / 1024),
+        );
     }
     for (mode, colors) in [("dark", &p.dark), ("light", &p.light)] {
-        if colors.is_none() { continue; }
+        if colors.is_none() {
+            continue;
+        }
         let t = p.resolve(mode);
         if let Some(c) = contrast(&t.fg, &t.bg).filter(|c| *c < 4.5) {
-            warn("contrast", format!("{mode}: text on background has low contrast ({c:.1}:1, aim for 4.5:1)"));
+            warn(
+                "contrast",
+                format!("{mode}: text on background has low contrast ({c:.1}:1, aim for 4.5:1)"),
+            );
         }
         if let Some(c) = contrast(&t.fg3, &t.bg).filter(|c| *c < 3.0) {
-            warn("contrast", format!("{mode}: muted text is hard to read ({c:.1}:1)"));
+            warn(
+                "contrast",
+                format!("{mode}: muted text is hard to read ({c:.1}:1)"),
+            );
         }
     }
     r.warnings = warns;
@@ -541,27 +800,50 @@ pub fn prepare_css(css: &str) -> String {
             i += lead + end;
             continue;
         }
-        let hoist = ["@font-face", "@keyframes", "@-webkit-keyframes", "@property", "@counter-style"]
-            .iter()
-            .any(|a| lower.starts_with(a));
+        let hoist = [
+            "@font-face",
+            "@keyframes",
+            "@-webkit-keyframes",
+            "@property",
+            "@counter-style",
+        ]
+        .iter()
+        .any(|a| lower.starts_with(a));
         // Find the end of this top-level statement / block.
         let mut depth = 0i32;
         let mut end = trimmed.len();
         let mut seen_brace = false;
         for (k, ch) in trimmed.char_indices() {
             match ch {
-                '{' => { depth += 1; seen_brace = true; }
+                '{' => {
+                    depth += 1;
+                    seen_brace = true;
+                }
                 '}' => {
                     depth -= 1;
-                    if depth <= 0 && seen_brace { end = k + 1; break; }
+                    if depth <= 0 && seen_brace {
+                        end = k + 1;
+                        break;
+                    }
                 }
-                ';' if depth == 0 && !seen_brace => { end = k + 1; break; }
+                ';' if depth == 0 && !seen_brace => {
+                    end = k + 1;
+                    break;
+                }
                 _ => {}
             }
         }
-        if end == 0 { break; }
+        if end == 0 {
+            break;
+        }
         let chunk = &trimmed[..end];
-        if hoist { hoisted.push_str(chunk); hoisted.push('\n'); } else { body.push_str(chunk); body.push('\n'); }
+        if hoist {
+            hoisted.push_str(chunk);
+            hoisted.push('\n');
+        } else {
+            body.push_str(chunk);
+            body.push('\n');
+        }
         i += lead + end;
     }
     let mut out = String::new();
@@ -602,7 +884,11 @@ pub fn dir(data_dir: &Path) -> PathBuf {
 
 /// File for theme `id`.
 fn file_for(data_dir: &Path, id: &str) -> Result<PathBuf, String> {
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(format!("Invalid theme id: {id}"));
     }
     Ok(dir(data_dir).join(format!("{id}{EXT}")))
@@ -616,13 +902,24 @@ fn slug(name: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let s = s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
-    if s.is_empty() { "theme".into() } else { s.chars().take(48).collect() }
+    let s = s
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if s.is_empty() {
+        "theme".into()
+    } else {
+        s.chars().take(48).collect()
+    }
 }
 
 /// sha-256 of `bytes` (hex).
 pub fn hash(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn read_settings(state: &AppState) -> rustic_core::config::UserSettings {
@@ -636,7 +933,11 @@ fn read_settings(state: &AppState) -> rustic_core::config::UserSettings {
 
 fn write_settings(state: &AppState, s: &rustic_core::config::UserSettings) -> Result<(), String> {
     let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
-    state.db.lock_safe().set_setting("user_settings", &json).map_err(|e| e.to_string())
+    state
+        .db
+        .lock_safe()
+        .set_setting("user_settings", &json)
+        .map_err(|e| e.to_string())
 }
 
 fn read_trust(state: &AppState) -> BTreeMap<String, String> {
@@ -652,7 +953,11 @@ fn read_trust(state: &AppState) -> BTreeMap<String, String> {
 
 fn write_trust(state: &AppState, t: &BTreeMap<String, String>) -> Result<(), String> {
     let json = serde_json::to_string(t).map_err(|e| e.to_string())?;
-    state.db.lock_safe().set_setting(TRUST_KEY, &json).map_err(|e| e.to_string())
+    state
+        .db
+        .lock_safe()
+        .set_setting(TRUST_KEY, &json)
+        .map_err(|e| e.to_string())
 }
 
 /// Move palettes imported before theme files existed (DB `theme:<name>`) into
@@ -698,7 +1003,12 @@ pub fn to_file_text(p: &Pack) -> Result<String, String> {
 }
 
 /// Write a new theme file (unique id from its name). Returns `(id, hash)`.
-fn save_new(_state: &AppState, data_dir: &Path, p: &Pack, _migrating: bool) -> Result<(String, String), String> {
+fn save_new(
+    _state: &AppState,
+    data_dir: &Path,
+    p: &Pack,
+    _migrating: bool,
+) -> Result<(String, String), String> {
     let d = dir(data_dir);
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     let base = slug(&p.name);
@@ -716,7 +1026,8 @@ fn save_new(_state: &AppState, data_dir: &Path, p: &Pack, _migrating: bool) -> R
 /// A theme file's text, pack and hash.
 pub fn read_file(data_dir: &Path, id: &str) -> Result<(String, Pack, String), String> {
     let path = file_for(data_dir, id)?;
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("Couldn't read theme {id}: {e}"))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("Couldn't read theme {id}: {e}"))?;
     let pack = parse(&text)?;
     let h = hash(text.as_bytes());
     Ok((text, pack, h))
@@ -728,11 +1039,20 @@ const PACKS: &[(&str, &str)] = &[
     ("Basalt", include_str!("../themes/basalt.rustic-theme.json")),
     ("Hearth", include_str!("../themes/hearth.rustic-theme.json")),
     ("Petal", include_str!("../themes/petal.rustic-theme.json")),
-    ("Midnight", include_str!("../themes/midnight.rustic-theme.json")),
+    (
+        "Midnight",
+        include_str!("../themes/midnight.rustic-theme.json"),
+    ),
     ("Onyx", include_str!("../themes/onyx.rustic-theme.json")),
-    ("Neo Brutal", include_str!("../themes/neo-brutal.rustic-theme.json")),
+    (
+        "Neo Brutal",
+        include_str!("../themes/neo-brutal.rustic-theme.json"),
+    ),
     ("Grove", include_str!("../themes/grove.rustic-theme.json")),
-    ("Neon Grid", include_str!("../themes/neon-grid.rustic-theme.json")),
+    (
+        "Neon Grid",
+        include_str!("../themes/neon-grid.rustic-theme.json"),
+    ),
 ];
 
 /// Retired built-in ids → (replacement id, color mode to switch to).
@@ -799,7 +1119,15 @@ fn swatches(p: &Pack) -> BTreeMap<String, Vec<String>> {
     let mut m = BTreeMap::new();
     for mode in p.modes() {
         let t = p.resolve(mode);
-        m.insert(mode.to_string(), vec![t.bg.clone(), t.bg1.clone(), t.fg.clone(), t.primary.clone().unwrap_or(t.accent.clone())]);
+        m.insert(
+            mode.to_string(),
+            vec![
+                t.bg.clone(),
+                t.bg1.clone(),
+                t.fg.clone(),
+                t.primary.clone().unwrap_or(t.accent.clone()),
+            ],
+        );
     }
     m
 }
@@ -827,11 +1155,20 @@ pub fn list(state: &AppState, data_dir: &Path) -> Vec<Entry> {
         })
         .collect();
     if let Ok(rd) = std::fs::read_dir(dir(data_dir)) {
-        let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().ends_with(EXT)).collect();
+        let mut files: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(EXT))
+            .collect();
         files.sort();
         for path in files {
-            let id = path.file_name().map(|n| n.to_string_lossy().trim_end_matches(EXT).to_string()).unwrap_or_default();
-            let Ok((_, pack, h)) = read_file(data_dir, &id) else { continue };
+            let id = path
+                .file_name()
+                .map(|n| n.to_string_lossy().trim_end_matches(EXT).to_string())
+                .unwrap_or_default();
+            let Ok((_, pack, h)) = read_file(data_dir, &id) else {
+                continue;
+            };
             out.push(Entry {
                 trusted: trust.get(&id) == Some(&h),
                 id,
@@ -865,12 +1202,30 @@ pub struct Detail {
 pub fn get(state: &AppState, data_dir: &Path, id: &str) -> Result<Detail, String> {
     if let Some(p) = builtin_pack(id) {
         let text = to_file_text(&p)?;
-        let entry = list(state, data_dir).into_iter().find(|e| e.id == id).ok_or("unknown theme")?;
-        return Ok(Detail { entry, scan: scan(&p), hash: hash(text.as_bytes()), pack: p, text });
+        let entry = list(state, data_dir)
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or("unknown theme")?;
+        return Ok(Detail {
+            entry,
+            scan: scan(&p),
+            hash: hash(text.as_bytes()),
+            pack: p,
+            text,
+        });
     }
     let (text, pack, h) = read_file(data_dir, id)?;
-    let entry = list(state, data_dir).into_iter().find(|e| e.id == id).ok_or("unknown theme")?;
-    Ok(Detail { entry, scan: scan(&pack), pack, text, hash: h })
+    let entry = list(state, data_dir)
+        .into_iter()
+        .find(|e| e.id == id)
+        .ok_or("unknown theme")?;
+    Ok(Detail {
+        entry,
+        scan: scan(&pack),
+        pack,
+        text,
+        hash: h,
+    })
 }
 
 /// Install theme text as a new file (always untrusted). Returns its detail.
@@ -885,7 +1240,10 @@ pub fn import_text(state: &AppState, data_dir: &Path, text: &str) -> Result<Deta
 pub fn import_path(state: &AppState, data_dir: &Path, path: &str) -> Result<Detail, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("Couldn't read {path}: {e}"))?;
     if meta.len() as usize > MAX_FILE_BYTES {
-        return Err(format!("Theme file is too large (max {} KB)", MAX_FILE_BYTES / 1024));
+        return Err(format!(
+            "Theme file is too large (max {} KB)",
+            MAX_FILE_BYTES / 1024
+        ));
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("Couldn't read {path}: {e}"))?;
     import_text(state, data_dir, &text)
@@ -925,7 +1283,12 @@ pub fn delete(state: &AppState, data_dir: &Path, id: &str) -> Result<(), String>
 }
 
 /// Trust theme `id` — only if its file still has the `hash` the user reviewed.
-pub fn trust(state: &AppState, data_dir: &Path, id: &str, reviewed_hash: &str) -> Result<(), String> {
+pub fn trust(
+    state: &AppState,
+    data_dir: &Path,
+    id: &str,
+    reviewed_hash: &str,
+) -> Result<(), String> {
     let (_, pack, h) = read_file(data_dir, id)?;
     if h != reviewed_hash {
         return Err("The theme file changed after you reviewed it — review it again".into());
@@ -992,18 +1355,36 @@ pub fn active(state: &AppState, data_dir: &Path) -> Active {
         s.theme.mode = m.into();
         let _ = write_settings(state, &s);
     }
-    let mode = if s.theme.mode.is_empty() { "dark".to_string() } else { s.theme.mode.clone() };
+    let mode = if s.theme.mode.is_empty() {
+        "dark".to_string()
+    } else {
+        s.theme.mode.clone()
+    };
     let id = s.theme.active_theme.clone();
     let (pack, fallback) = match builtin_pack(&id) {
         Some(p) => (p, false),
         None => match read_file(data_dir, &id) {
-            Ok((_, p, h)) if read_trust(state).get(&id) == Some(&h) && scan(&p).blocked.is_empty() => (p, false),
+            Ok((_, p, h))
+                if read_trust(state).get(&id) == Some(&h) && scan(&p).blocked.is_empty() =>
+            {
+                (p, false)
+            }
             _ => (builtin_pack("Obsidian").unwrap_or_default(), true),
         },
     };
-    let css = pack.css.as_deref().filter(|c| !c.trim().is_empty()).map(prepare_css);
+    let css = pack
+        .css
+        .as_deref()
+        .filter(|c| !c.trim().is_empty())
+        .map(prepare_css);
     // A single-mode theme still switches: the missing mode uses the default palette.
-    let variant = |m: &str, has: bool| Some(if has || pack.modes().is_empty() { pack.resolve(m) } else { base_for(m) });
+    let variant = |m: &str, has: bool| {
+        Some(if has || pack.modes().is_empty() {
+            pack.resolve(m)
+        } else {
+            base_for(m)
+        })
+    };
     Active {
         id: if fallback { "Obsidian".into() } else { id },
         name: pack.name.clone(),
@@ -1024,7 +1405,9 @@ pub struct AgentThemeHost {
 impl AgentThemeHost {
     /// Register the store the agent's `*_theme` tools use.
     pub fn register(host: crate::peer::HostRef) {
-        rustic_agent::tools::theme_tools::set_theme_host(std::sync::Arc::new(AgentThemeHost { host }));
+        rustic_agent::tools::theme_tools::set_theme_host(std::sync::Arc::new(AgentThemeHost {
+            host,
+        }));
     }
 }
 
@@ -1056,14 +1439,20 @@ impl rustic_agent::tools::theme_tools::ThemeHost for AgentThemeHost {
             None => import_text(state, &dir, text)?,
         };
         use crate::context::EventEmitterExt;
-        self.host.emitter().emit("theme-agent-saved", serde_json::json!({ "id": d.entry.id, "name": d.entry.name }));
+        self.host.emitter().emit(
+            "theme-agent-saved",
+            serde_json::json!({ "id": d.entry.id, "name": d.entry.name }),
+        );
         Ok(serde_json::json!({ "entry": d.entry, "scan": d.scan }))
     }
 
     fn delete(&self, id: &str) -> Result<(), String> {
         delete(self.host.state(), &self.host.data_dir()?, id)?;
         use crate::context::EventEmitterExt;
-        self.host.emitter().emit("theme-agent-saved", serde_json::json!({ "id": id, "deleted": true }));
+        self.host.emitter().emit(
+            "theme-agent-saved",
+            serde_json::json!({ "id": id, "deleted": true }),
+        );
         Ok(())
     }
 }
@@ -1089,37 +1478,92 @@ mod tests {
         let v1 = serde_json::to_string(&Theme::verdigris()).unwrap();
         let p = parse(&v1).unwrap();
         assert_eq!(p.modes(), vec!["dark"]);
-        assert_eq!(p.resolve("light").bg, Theme::verdigris().bg, "single-mode pack uses its only mode");
+        assert_eq!(
+            p.resolve("light").bg,
+            Theme::verdigris().bg,
+            "single-mode pack uses its only mode"
+        );
 
         let v2 = r##"{ "format": 2, "name": "Duo", "dark": { "bg": "#101010", "primary": "#ff8800" }, "light": { "bg": "#fafafa" } }"##;
         let p = parse(v2).unwrap();
         let d = p.resolve("dark");
-        assert_eq!((d.bg.as_str(), d.primary.as_deref(), d.kind.as_str()), ("#101010", Some("#ff8800"), "dark"));
-        assert_eq!(d.fg, Theme::obsidian().fg, "missing slots come from the dark base");
+        assert_eq!(
+            (d.bg.as_str(), d.primary.as_deref(), d.kind.as_str()),
+            ("#101010", Some("#ff8800"), "dark")
+        );
+        assert_eq!(
+            d.fg,
+            Theme::obsidian().fg,
+            "missing slots come from the dark base"
+        );
         let l = p.resolve("light");
-        assert_eq!((l.bg.as_str(), l.fg.as_str(), l.kind.as_str()), ("#fafafa", base_for("light").fg.as_str(), "light"));
-        assert!(parse(r##"{ "format": 2, "name": "Bad", "dark": { "bg": "#000;}*{display:none" } }"##).is_err());
+        assert_eq!(
+            (l.bg.as_str(), l.fg.as_str(), l.kind.as_str()),
+            ("#fafafa", base_for("light").fg.as_str(), "light")
+        );
+        assert!(parse(
+            r##"{ "format": 2, "name": "Bad", "dark": { "bg": "#000;}*{display:none" } }"##
+        )
+        .is_err());
         assert!(parse(r#"{ "format": 9, "name": "Future", "css": "a{}" }"#).is_err());
     }
 
     #[test]
     fn scanner_blocks_script_and_warns_on_risky_css() {
-        let pack = |css: &str| Pack { name: "T".into(), css: Some(css.into()), ..Default::default() };
-        assert_eq!(scan(&pack("a { background: url(javascript:alert(1)) }")).blocked[0].code, "script-url");
-        assert_eq!(scan(&pack("a { width: expression(alert(1)) }")).blocked[0].code, "css-expression");
-        assert!(!scan(&pack("[data-rustic-protected] { display:none }")).blocked.is_empty());
-        assert!(!scan(&pack("a { background: url('data:text/html,<b>') }")).blocked.is_empty());
-        assert!(!scan(&pack("a { background: url(file:///etc/passwd) }")).blocked.is_empty());
-        assert!(scan(&pack("/* javascript: in a comment is fine */ a { color: red }")).blocked.is_empty());
+        let pack = |css: &str| Pack {
+            name: "T".into(),
+            css: Some(css.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            scan(&pack("a { background: url(javascript:alert(1)) }")).blocked[0].code,
+            "script-url"
+        );
+        assert_eq!(
+            scan(&pack("a { width: expression(alert(1)) }")).blocked[0].code,
+            "css-expression"
+        );
+        assert!(!scan(&pack("[data-rustic-protected] { display:none }"))
+            .blocked
+            .is_empty());
+        assert!(!scan(&pack("a { background: url('data:text/html,<b>') }"))
+            .blocked
+            .is_empty());
+        assert!(!scan(&pack("a { background: url(file:///etc/passwd) }"))
+            .blocked
+            .is_empty());
+        assert!(scan(&pack(
+            "/* javascript: in a comment is fine */ a { color: red }"
+        ))
+        .blocked
+        .is_empty());
 
         let r = scan(&pack("@import url('https://fonts.example.com/x.css'); body { display: none } .x { position: fixed; z-index: 99999 }"));
         assert!(r.blocked.is_empty());
         let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
-        assert!(codes.contains(&"remote") && codes.contains(&"import") && codes.contains(&"hide") && codes.contains(&"overlay"), "{codes:?}");
+        assert!(
+            codes.contains(&"remote")
+                && codes.contains(&"import")
+                && codes.contains(&"hide")
+                && codes.contains(&"overlay"),
+            "{codes:?}"
+        );
         assert_eq!(r.remote_hosts, vec!["fonts.example.com"]);
-        assert!(scan(&pack("a { background: url(data:image/png;base64,AAAA) }")).blocked.is_empty());
+        assert!(
+            scan(&pack("a { background: url(data:image/png;base64,AAAA) }"))
+                .blocked
+                .is_empty()
+        );
 
-        let low = Pack { name: "Low".into(), dark: Some(Colors { bg: Some("#777777".into()), fg: Some("#888888".into()), ..Default::default() }), ..Default::default() };
+        let low = Pack {
+            name: "Low".into(),
+            dark: Some(Colors {
+                bg: Some("#777777".into()),
+                fg: Some("#888888".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         assert!(scan(&low).warnings.iter().any(|w| w.code == "contrast"));
     }
 
@@ -1129,7 +1573,10 @@ mod tests {
         let import_at = out.find("@import").unwrap();
         let scope_at = out.find("@scope").unwrap();
         assert!(import_at < scope_at, "{out}");
-        assert!(out.find("@font-face").unwrap() < scope_at && out.find("@keyframes").unwrap() < scope_at);
+        assert!(
+            out.find("@font-face").unwrap() < scope_at
+                && out.find("@keyframes").unwrap() < scope_at
+        );
         let scoped = &out[scope_at..];
         assert!(scoped.contains(".a { color: red }") && scoped.contains("@media"));
         assert!(scoped.starts_with("@scope (:root) to ([data-rustic-protected])"));
@@ -1143,7 +1590,11 @@ mod tests {
         assert_eq!(p.modes(), vec!["dark", "light"]);
         assert_eq!(renamed("Kiln Light"), Some(("Hearth", "light")));
         assert!(is_builtin("Obsidian") && is_builtin("Onyx") && !is_builtin("Nope"));
-        assert_ne!(base_for("light").bg, Theme::graphite_light().bg, "default light base is Basalt light");
+        assert_ne!(
+            base_for("light").bg,
+            Theme::graphite_light().bg,
+            "default light base is Basalt light"
+        );
         let t = parse(&template()).unwrap();
         assert_eq!(t.modes(), vec!["dark", "light"]);
         assert!(scan(&t).blocked.is_empty());
@@ -1156,10 +1607,17 @@ mod tests {
             let p = builtin_pack(id).unwrap_or_else(|| panic!("{id} must parse"));
             assert_eq!(p.modes(), vec!["dark", "light"], "{id}");
             let r = scan(&p);
-            assert!(r.blocked.is_empty() && !r.warnings.iter().any(|w| w.code == "contrast"), "{id}: {:?}", r.warnings);
+            assert!(
+                r.blocked.is_empty() && !r.warnings.iter().any(|w| w.code == "contrast"),
+                "{id}: {:?}",
+                r.warnings
+            );
             assert!(is_builtin(id));
         }
-        assert!(parse(r#"{ "format": 2, "name": "X", "css": "a{}", "style": { "button": "wobbly" } }"#).is_err());
+        assert!(parse(
+            r#"{ "format": 2, "name": "X", "css": "a{}", "style": { "button": "wobbly" } }"#
+        )
+        .is_err());
         assert!(parse(r#"{ "format": 2, "name": "X", "css": "a{}", "style": { "texture": "grid", "shadow": "hard" } }"#).is_ok());
     }
 

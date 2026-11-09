@@ -145,6 +145,7 @@ impl PermissionOp {
 
 /// Events emitted during task execution for real-time UI updates.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // public event API matched across hosts; boxing would ripple everywhere
 pub enum TaskEvent {
     /// The provider stream has been silent for `silent_ms` (well below the
     /// hard stall abort). Purely informational — lets the UI say "provider is

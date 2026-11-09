@@ -271,7 +271,7 @@ fn disk_usage(path: &Path) -> (u64, u64) {
         let mount = disk.mount_point();
         if path.starts_with(mount) {
             let len = mount.as_os_str().len();
-            if best.map_or(true, |(prev, _, _)| len > prev) {
+            if best.is_none_or(|(prev, _, _)| len > prev) {
                 best = Some((len, disk.total_space(), disk.available_space()));
             }
         }

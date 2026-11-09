@@ -180,7 +180,7 @@ pub fn refresh_file(
         index.drop_file(path);
         return Ok(0);
     }
-    index_one(path, ts, index).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    index_one(path, ts, index).map_err(std::io::Error::other)
 }
 
 /// Parse + query + insert for one file. Returns the number of entries

@@ -50,7 +50,9 @@ mod imp {
                 false
             } else {
                 let v = CFDictionaryGetValue(dict, key);
-                let on = !v.is_null() && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v) != 0;
+                let on = !v.is_null()
+                    && CFGetTypeID(v) == CFBooleanGetTypeID()
+                    && CFBooleanGetValue(v) != 0;
                 CFRelease(key);
                 on
             };

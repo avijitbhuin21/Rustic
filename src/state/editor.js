@@ -44,6 +44,15 @@ const BINARY_EXT = new Set([
   'ttf','otf','woff','woff2','eot',
   'db','sqlite','sqlite3',
 ]);
+// Opaque formats with no preview yet: shown as "file type not supported yet"
+// instead of garbage in Monaco or a raw hex dump.
+const UNSUPPORTED_EXT = new Set([
+  'doc','ppt','pptx','key','pages','numbers','odt','odp','rtf',
+  'psd','ai','sketch','fig','xd','indd','heic','heif','tif','tiff','raw','cr2','nef','dng','icns',
+  'dmg','iso','pkg','msi','deb','rpm','apk','ipa','jar','war','appimage',
+  'blend','fbx','glb','gltf','stl','3ds','max','unitypackage',
+  'parquet','avro','pickle','pkl','npy','npz','h5','hdf5','onnx','pt','pth','safetensors','ckpt',
+]);
 
 // Preview kinds that are backed by editable text, so the editor can flip
 // between a rendered "preview" and the raw Monaco "edit" view. Edit is the
@@ -66,6 +75,7 @@ export function getFileKind(path) {
   if (NOTEBOOK_EXT.has(ext)) return 'notebook';
   if (XLSX_EXT.has(ext))   return 'xlsx';
   if (BINARY_EXT.has(ext)) return 'hex';
+  if (UNSUPPORTED_EXT.has(ext)) return 'unsupported';
   return 'code';
 }
 

@@ -18,6 +18,12 @@ pub struct ClaudeProvider {
     client: reqwest::Client,
 }
 
+impl Default for ClaudeProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClaudeProvider {
     pub fn new() -> Self {
         Self {
@@ -1053,6 +1059,7 @@ enum SseContentBlock {
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::enum_variant_names)] // names mirror Anthropic's `*_delta` wire types
 enum SseDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
@@ -1108,6 +1115,7 @@ struct SseError {
 ///   - a stale local `tool_result` with a `srvtoolu_` id, persisted before the
 ///     executor learned never to run server tools locally, or
 ///   - a `server_tool_use` whose result was lost (stream cut / paused turn).
+///
 /// Sending either orphans the id and earns a 400 ("tool_result ... must have a
 /// corresponding tool_use in the previous message"). Stripping them here keeps
 /// the request valid AND heals conversations persisted before the fix.
@@ -1192,6 +1200,22 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Va
         }
     }
 
+    // Claude 4.6+ models reject assistant prefill ("conversation must end with
+    // a user message"). A history ends on assistant after a paused/stripped
+    // server-tool turn, a cancelled turn, or a resume — close it with a user
+    // nudge so the request is always valid on every model.
+    if api_msgs
+        .last()
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("assistant")
+    {
+        api_msgs.push(json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "Continue." }]
+        }));
+    }
+
     (system, api_msgs)
 }
 
@@ -1200,7 +1224,9 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Va
 /// api.anthropic.com) keep the plain 5m marker since some proxies reject the
 /// `ttl` field and the auto-learn path can't strip a nested key.
 fn static_prefix_cache_control(base_url: Option<&str>) -> serde_json::Value {
-    let native = base_url.map(|u| u.contains("api.anthropic.com")).unwrap_or(true);
+    let native = base_url
+        .map(|u| u.contains("api.anthropic.com"))
+        .unwrap_or(true);
     if native {
         json!({ "type": "ephemeral", "ttl": "1h" })
     } else {
@@ -1556,12 +1582,40 @@ mod orphan_server_tool_tests {
             },
         ];
         let (_sys, api) = convert_messages(&messages);
-        assert_eq!(api.len(), 2, "the two orphan-only messages must be skipped");
+        assert_eq!(api.len(), 3, "the two orphan-only messages must be skipped");
         assert_eq!(api[0]["role"], "user");
         assert_eq!(api[1]["role"], "assistant");
+        assert_eq!(
+            api[2]["role"], "user",
+            "trailing assistant gets a user nudge"
+        );
         // No generic tool_result with a srvtoolu_ id leaked through.
         let dump = serde_json::to_string(&api).unwrap();
         assert!(!dump.contains("srvtoolu_D"));
+    }
+
+    #[test]
+    fn convert_messages_never_ends_on_assistant() {
+        // A paused server-tool turn whose orphan server_tool_use is stripped
+        // leaves assistant text last — Opus 4.6+ 400s on that as "prefill".
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![text("search the web")],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![text("Searching…"), srv_use("srvtoolu_P", "web_search")],
+            },
+        ];
+        let (_sys, api) = convert_messages(&messages);
+        assert_eq!(api.last().unwrap()["role"], "user");
+        let ends_user = vec![Message {
+            role: Role::User,
+            content: vec![text("hi")],
+        }];
+        let (_sys, api) = convert_messages(&ends_user);
+        assert_eq!(api.len(), 1, "a user-terminated history is left alone");
     }
 
     #[test]
@@ -2113,7 +2167,10 @@ mod static_ttl_tests {
 
     #[test]
     fn native_api_gets_1h_gateways_keep_default() {
-        assert_eq!(static_prefix_cache_control(None), json!({ "type": "ephemeral", "ttl": "1h" }));
+        assert_eq!(
+            static_prefix_cache_control(None),
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
         assert_eq!(
             static_prefix_cache_control(Some("https://api.anthropic.com/v1/messages")),
             json!({ "type": "ephemeral", "ttl": "1h" })
@@ -2130,11 +2187,23 @@ mod static_ttl_tests {
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
         )
         .unwrap();
-        assert!(matches!(e, SseEvent::ContentBlockStart { content_block: SseContentBlock::Text {}, .. }));
+        assert!(matches!(
+            e,
+            SseEvent::ContentBlockStart {
+                content_block: SseContentBlock::Text {},
+                ..
+            }
+        ));
         let e: SseEvent = serde_json::from_str(
             r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
         )
         .unwrap();
-        assert!(matches!(e, SseEvent::ContentBlockStart { content_block: SseContentBlock::Thinking {}, .. }));
+        assert!(matches!(
+            e,
+            SseEvent::ContentBlockStart {
+                content_block: SseContentBlock::Thinking {},
+                ..
+            }
+        ));
     }
 }

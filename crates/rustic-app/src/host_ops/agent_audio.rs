@@ -397,8 +397,14 @@ mod tests {
     #[test]
     fn normalizes_openai_bases() {
         assert_eq!(normalize_openai_base(" https://x/v1/ "), "https://x/v1");
-        assert_eq!(normalize_openai_base("https://x/v1/chat/completions"), "https://x/v1");
-        assert_eq!(normalize_openai_base("https://x/v1/completions/"), "https://x/v1");
+        assert_eq!(
+            normalize_openai_base("https://x/v1/chat/completions"),
+            "https://x/v1"
+        );
+        assert_eq!(
+            normalize_openai_base("https://x/v1/completions/"),
+            "https://x/v1"
+        );
     }
 
     #[test]

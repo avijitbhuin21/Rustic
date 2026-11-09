@@ -38,6 +38,28 @@ fn signature_valid(secret: &str, body: &[u8], header: Option<&str>) -> bool {
     mac.verify_slice(&expected_sig).is_ok()
 }
 
+const RECENT_DELIVERY_CAP: usize = 2048;
+
+/// Records a delivery GUID; returns false when it was already seen (a replay).
+fn first_delivery(id: &str) -> bool {
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<(VecDeque<String>, HashSet<String>)>> = OnceLock::new();
+    let lock = SEEN.get_or_init(|| Mutex::new((VecDeque::new(), HashSet::new())));
+    let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let (order, set) = &mut *guard;
+    if !set.insert(id.to_string()) {
+        return false;
+    }
+    order.push_back(id.to_string());
+    if order.len() > RECENT_DELIVERY_CAP {
+        if let Some(old) = order.pop_front() {
+            set.remove(&old);
+        }
+    }
+    true
+}
+
 pub async fn github_webhook(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -58,6 +80,16 @@ pub async fn github_webhook(
     if !signature_valid(&secret, &body, sig) {
         tracing::warn!("github webhook: signature mismatch — dropping delivery");
         return (StatusCode::UNAUTHORIZED, "bad signature").into_response();
+    }
+    if let Some(delivery) = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        if !first_delivery(delivery) {
+            tracing::warn!(%delivery, "github webhook: duplicate delivery id — ignoring replay");
+            return Json(json!({ "ok": true, "outcome": "duplicate-delivery" })).into_response();
+        }
     }
 
     let event = headers
@@ -244,5 +276,13 @@ mod tests {
         assert!(!signature_valid(secret, body, Some("sha256=deadbeef")));
         assert!(!signature_valid(secret, b"tampered", Some(&sig)));
         assert!(!signature_valid(secret, body, None));
+    }
+
+    #[test]
+    fn duplicate_delivery_ids_are_rejected() {
+        let id = "test-delivery-7f3a";
+        assert!(super::first_delivery(id));
+        assert!(!super::first_delivery(id));
+        assert!(super::first_delivery("test-delivery-other"));
     }
 }

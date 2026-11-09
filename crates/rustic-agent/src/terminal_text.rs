@@ -257,7 +257,11 @@ fn is_prompt_line(line: &str) -> bool {
         let mut parts = t.split_whitespace();
         let _ = parts.next();
         if let Some(env) = parts.next() {
-            if ["MINGW", "MSYS", "UCRT", "CLANG"].iter().any(|p| env.starts_with(p)) && words <= 4 {
+            if ["MINGW", "MSYS", "UCRT", "CLANG"]
+                .iter()
+                .any(|p| env.starts_with(p))
+                && words <= 4
+            {
                 return true;
             }
         }
@@ -450,8 +454,14 @@ mod tests {
         assert_eq!(strip_trailing_prompt("out\nbash-3.2$"), "out");
         assert_eq!(strip_trailing_prompt("out\n%"), "out");
         // Git Bash: header line + `$` on its own line.
-        assert_eq!(strip_trailing_prompt("out\nuser@HOST MINGW64 /c/proj\n$"), "out");
-        assert_eq!(strip_trailing_prompt("out\nuser@HOST MSYS ~/proj (main)\n$"), "out");
+        assert_eq!(
+            strip_trailing_prompt("out\nuser@HOST MINGW64 /c/proj\n$"),
+            "out"
+        );
+        assert_eq!(
+            strip_trailing_prompt("out\nuser@HOST MSYS ~/proj (main)\n$"),
+            "out"
+        );
         // A normal sentence ending in % is output, not a prompt.
         assert_eq!(
             strip_trailing_prompt("coverage is now at 95 %"),

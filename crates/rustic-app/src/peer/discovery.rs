@@ -9,7 +9,12 @@ use super::{Discovered, Identity, LanState, SERVICE_TYPE};
 /// Keep `lan.discovered` up to date with other Rustic instances and, when
 /// `advertise` is set, announce this device on `port`. Returns the daemon;
 /// dropping/shutting it down stops both.
-pub fn start(lan: &LanState, id: &Identity, port: u16, advertise: bool) -> Result<ServiceDaemon, String> {
+pub fn start(
+    lan: &LanState,
+    id: &Identity,
+    port: u16,
+    advertise: bool,
+) -> Result<ServiceDaemon, String> {
     let daemon = ServiceDaemon::new().map_err(|e| format!("mDNS unavailable: {e}"))?;
     if advertise {
         let host = format!("{}.local.", id.device_id);

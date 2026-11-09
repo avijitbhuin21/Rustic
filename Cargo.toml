@@ -65,7 +65,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.26"
 uuid = { version = "1", features = ["v4"] }
-zip = { version = "2", features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 zstd = "0.13"
 
 [workspace.lints.clippy]

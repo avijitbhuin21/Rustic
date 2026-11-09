@@ -502,7 +502,7 @@ fn run_grep(run: GrepRun, progress: &dyn Fn(usize, u32)) -> String {
                             break;
                         }
                         match_count += g.match_count;
-                        if match_count % 20 == 0 {
+                        if match_count.is_multiple_of(20) {
                             progress(
                                 match_count,
                                 files_searched.load(std::sync::atomic::Ordering::Relaxed),

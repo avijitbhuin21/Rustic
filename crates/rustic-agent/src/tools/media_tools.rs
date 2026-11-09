@@ -1397,6 +1397,7 @@ fn decode_data_url(url: &str) -> Option<Vec<u8>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn openai_generate_videos(
     provider: &ResolvedProvider,
     model: &str,
@@ -1532,6 +1533,7 @@ async fn openai_generate_videos(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn gemini_generate_videos(
     provider: &ResolvedProvider,
     model: &str,
@@ -1692,6 +1694,7 @@ async fn gemini_generate_videos(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn openrouter_generate_videos(
     provider: &ResolvedProvider,
     model: &str,

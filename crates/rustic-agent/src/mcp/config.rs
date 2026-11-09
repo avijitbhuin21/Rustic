@@ -4,17 +4,13 @@ use std::collections::HashMap;
 /// Which config file an MCP server was loaded from.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum McpScope {
     /// Global, in the app data dir (`mcp.json`). Shared across projects.
+    #[default]
     User,
     /// Per-project `.mcp.json` in the project root. Committed to source control.
     Project,
-}
-
-impl Default for McpScope {
-    fn default() -> Self {
-        McpScope::User
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

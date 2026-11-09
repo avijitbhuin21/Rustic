@@ -97,7 +97,11 @@ impl Ticket {
             kind: req.kind.clone(),
             projects: req.projects.iter().map(|p| p.id.clone()).collect(),
             meta: req.meta.iter().map(|m| m.key.clone()).collect(),
-            files: req.files.iter().map(|f| file_key(&f.project_id, &f.path)).collect(),
+            files: req
+                .files
+                .iter()
+                .map(|f| file_key(&f.project_id, &f.path))
+                .collect(),
             expires: Instant::now() + TICKET_TTL,
         }
     }
@@ -109,7 +113,9 @@ impl Ticket {
             return true;
         }
         let key = file_key(project_id, path);
-        self.files.iter().any(|f| key == *f || key.starts_with(&format!("{f}/")) || f == &format!("{project_id}/"))
+        self.files.iter().any(|f| {
+            key == *f || key.starts_with(&format!("{f}/")) || f == &format!("{project_id}/")
+        })
     }
 
     /// Whether this ticket lets `device_id` do a `kind` transfer right now.
@@ -124,7 +130,13 @@ pub fn unshared_items(req: &TransferRequest, share: &super::Share) -> Vec<String
         .projects
         .iter()
         .filter(|p| !share.has_project(&p.id))
-        .map(|p| if p.name.is_empty() { p.id.clone() } else { p.name.clone() })
+        .map(|p| {
+            if p.name.is_empty() {
+                p.id.clone()
+            } else {
+                p.name.clone()
+            }
+        })
         .collect();
     out.extend(
         req.meta
@@ -136,7 +148,17 @@ pub fn unshared_items(req: &TransferRequest, share: &super::Share) -> Vec<String
         req.files
             .iter()
             .filter(|f| !share.has_project(&f.project_id))
-            .map(|f| format!("{}/{}", if f.project_name.is_empty() { &f.project_id } else { &f.project_name }, f.path)),
+            .map(|f| {
+                format!(
+                    "{}/{}",
+                    if f.project_name.is_empty() {
+                        &f.project_id
+                    } else {
+                        &f.project_name
+                    },
+                    f.path
+                )
+            }),
     );
     out
 }
@@ -201,8 +223,16 @@ mod tests {
     fn req(kind: &str) -> TransferRequest {
         TransferRequest {
             kind: kind.into(),
-            projects: vec![RequestedProject { id: "p1".into(), name: "Alpha".into(), exists: false }],
-            meta: vec![RequestedMeta { key: "skill/x".into(), category: "skill".into(), name: "x".into() }],
+            projects: vec![RequestedProject {
+                id: "p1".into(),
+                name: "Alpha".into(),
+                exists: false,
+            }],
+            meta: vec![RequestedMeta {
+                key: "skill/x".into(),
+                category: "skill".into(),
+                name: "x".into(),
+            }],
             ..Default::default()
         }
     }
@@ -220,21 +250,37 @@ mod tests {
     #[test]
     fn unshared_items_respects_allowlist() {
         let none = Share::default();
-        assert_eq!(unshared_items(&req("pull"), &none), vec!["Alpha", "skill/x"]);
-        let all = Share { projects: vec!["p1".into()], meta: vec!["skill/x".into()] };
+        assert_eq!(
+            unshared_items(&req("pull"), &none),
+            vec!["Alpha", "skill/x"]
+        );
+        let all = Share {
+            projects: vec!["p1".into()],
+            meta: vec!["skill/x".into()],
+        };
         assert!(unshared_items(&req("pull"), &all).is_empty());
     }
 
     #[test]
     fn summarize_hides_content_but_keeps_identity() {
         use crate::meta_sync::{diff_bundles, MetaBundle, MetaItem, MetaStatus};
-        let item = |p: &str| MetaItem { category: "skill".into(), name: "x".into(), payload: serde_json::json!({ "body": p }) };
-        let remote = MetaBundle { items: vec![item("secret")] };
+        let item = |p: &str| MetaItem {
+            category: "skill".into(),
+            name: "x".into(),
+            payload: serde_json::json!({ "body": p }),
+        };
+        let remote = MetaBundle {
+            items: vec![item("secret")],
+        };
         let s = summarize(&remote);
         assert!(is_summary(&s));
         assert!(!s.items[0].payload.to_string().contains("secret"));
-        let same = summarize(&MetaBundle { items: vec![item("secret")] });
-        let diff = summarize(&MetaBundle { items: vec![item("other")] });
+        let same = summarize(&MetaBundle {
+            items: vec![item("secret")],
+        });
+        let diff = summarize(&MetaBundle {
+            items: vec![item("other")],
+        });
         assert_eq!(diff_bundles(&s, &same)[0].status, MetaStatus::Same);
         assert_eq!(diff_bundles(&s, &diff)[0].status, MetaStatus::Conflict);
     }
@@ -243,11 +289,20 @@ mod tests {
     fn validate_rejects_bad_requests() {
         assert!(validate(&req("pull")).is_ok());
         assert!(validate(&req("steal")).is_err());
-        let empty = TransferRequest { kind: "push".into(), ..Default::default() };
+        let empty = TransferRequest {
+            kind: "push".into(),
+            ..Default::default()
+        };
         assert!(validate(&empty).is_err());
         let escape = TransferRequest {
             kind: "pull".into(),
-            files: vec![RequestedFile { project_id: "p".into(), project_name: String::new(), path: "../etc".into(), is_dir: false, names: vec![] }],
+            files: vec![RequestedFile {
+                project_id: "p".into(),
+                project_name: String::new(),
+                path: "../etc".into(),
+                is_dir: false,
+                names: vec![],
+            }],
             ..Default::default()
         };
         assert!(validate(&escape).is_err());
@@ -257,7 +312,13 @@ mod tests {
     fn ticket_covers_files_inside_approved_folders() {
         let r = TransferRequest {
             kind: "pull".into(),
-            files: vec![RequestedFile { project_id: "p".into(), project_name: String::new(), path: "src/lib".into(), is_dir: true, names: vec![] }],
+            files: vec![RequestedFile {
+                project_id: "p".into(),
+                project_name: String::new(),
+                path: "src/lib".into(),
+                is_dir: true,
+                names: vec![],
+            }],
             ..Default::default()
         };
         let t = Ticket::for_request("d", &r);

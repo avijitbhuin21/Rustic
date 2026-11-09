@@ -98,9 +98,7 @@ fn format_bracket_based(source: &str, language: &str, indent: &str) -> String {
         let starts_with_close = matches!(first_char, '}' | ')' | ']');
         let is_case_label = is_switch_case_label(trimmed, language);
 
-        let line_depth = if starts_with_close {
-            (depth - 1).max(0)
-        } else if is_case_label {
+        let line_depth = if starts_with_close || is_case_label {
             (depth - 1).max(0)
         } else {
             depth.max(0)
@@ -523,9 +521,7 @@ fn analyze_html_line(line: &str) -> (usize, usize, Option<String>) {
             continue;
         }
 
-        if ch == '<' && i + 1 < len && chars[i + 1].is_alphabetic()
-            || (ch == '<' && i + 1 < len && chars[i + 1] == '!')
-        {
+        if ch == '<' && i + 1 < len && (chars[i + 1].is_alphabetic() || chars[i + 1] == '!') {
             let tag_start = i + 1;
             let mut tag_end = tag_start;
             while tag_end < len

@@ -708,7 +708,10 @@ impl rustls::client::danger::ServerCertVerifier for CaptureVerifier {
 
 /// Client for a manually entered address plus the slot that receives the
 /// certificate fingerprint it presents.
-pub fn capture_client() -> Result<(reqwest::Client, Arc<Mutex<Option<String>>>), String> {
+/// HTTP client plus the slot that receives the server's certificate fingerprint.
+pub type CaptureClient = (reqwest::Client, Arc<Mutex<Option<String>>>);
+
+pub fn capture_client() -> Result<CaptureClient, String> {
     let seen = Arc::new(Mutex::new(None));
     let client = build_client(Arc::new(CaptureVerifier {
         seen: seen.clone(),
@@ -855,7 +858,10 @@ pub fn normalize_addr(input: &str) -> Result<String, String> {
 pub fn is_this_host(addr: &str, own_ip: Option<&str>) -> bool {
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+    if host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+    {
         return true;
     }
     own_ip.is_some_and(|ip| ip == host)
@@ -875,18 +881,36 @@ mod tests {
     #[test]
     fn normalize_addr_adds_default_port() {
         assert_eq!(normalize_addr("192.168.1.5").unwrap(), "192.168.1.5:47820");
-        assert_eq!(normalize_addr(" https://desk.local:5000/ ").unwrap(), "desk.local:5000");
-        assert_eq!(normalize_addr("https://abc-def.trycloudflare.com/").unwrap(), "https://abc-def.trycloudflare.com");
+        assert_eq!(
+            normalize_addr(" https://desk.local:5000/ ").unwrap(),
+            "desk.local:5000"
+        );
+        assert_eq!(
+            normalize_addr("https://abc-def.trycloudflare.com/").unwrap(),
+            "https://abc-def.trycloudflare.com"
+        );
         assert!(is_url_addr("https://abc-def.trycloudflare.com"));
         assert_eq!(base_url("10.0.0.2:47820"), "https://10.0.0.2:47820");
-        assert_eq!(normalize_addr("http://127.0.0.1:8787/").unwrap(), "http://127.0.0.1:8787");
+        assert_eq!(
+            normalize_addr("http://127.0.0.1:8787/").unwrap(),
+            "http://127.0.0.1:8787"
+        );
         assert!(is_url_addr("http://127.0.0.1:8787"));
-        assert_eq!(normalize_addr("https://server.example.com").unwrap(), "https://server.example.com");
-        assert_eq!(api_base("http://127.0.0.1:8787"), "http://127.0.0.1:8787/lan");
+        assert_eq!(
+            normalize_addr("https://server.example.com").unwrap(),
+            "https://server.example.com"
+        );
+        assert_eq!(
+            api_base("http://127.0.0.1:8787"),
+            "http://127.0.0.1:8787/lan"
+        );
         assert_eq!(api_base("10.0.0.2:47820"), "https://10.0.0.2:47820/lan");
         assert!(normalize_addr("").is_err());
         assert!(normalize_addr("a b").is_err());
-        assert_eq!(with_default_port("10.0.0.2:51234").as_deref(), Some("10.0.0.2:47820"));
+        assert_eq!(
+            with_default_port("10.0.0.2:51234").as_deref(),
+            Some("10.0.0.2:47820")
+        );
         assert_eq!(with_default_port("10.0.0.2:47820"), None);
     }
 

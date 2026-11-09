@@ -20,7 +20,11 @@ pub fn create_skill(name: String, body: String) -> Result<SkillInfo, String> {
 }
 
 #[tauri::command(async)]
-pub fn update_skill(original_name: String, name: String, body: String) -> Result<SkillInfo, String> {
+pub fn update_skill(
+    original_name: String,
+    name: String,
+    body: String,
+) -> Result<SkillInfo, String> {
     ops::update_skill(&original_name, &name, &body)
 }
 

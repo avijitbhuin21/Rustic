@@ -26,7 +26,7 @@ impl FileLockRegistry {
     /// Get or create the per-file lock for `path`.
     /// Prefer `acquire` / `acquire_owned` over calling this directly.
     pub fn get_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.locks.lock().unwrap();
+        let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
         locks
             .entry(path.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))

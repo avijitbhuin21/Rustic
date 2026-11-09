@@ -275,6 +275,9 @@ pub fn spawn_session_monitor(
         // Only arm the idle-close once we've observed the shell actually
         // running something. Protects brand-new and display-only terminals.
         let mut seen_running = false;
+        // Last reported "idle with a background job" state, so the list is
+        // refreshed when a `cmd &` job starts or ends.
+        let mut last_bg = false;
         // Per-command completion tracking (agent sessions): the marker is the
         // send-instant of the current in-flight command; a marker change means
         // a new command was sent and the trackers reset.
@@ -333,6 +336,13 @@ pub fn spawn_session_monitor(
                         m.ok().and_then(|m| m.command_busy(session_id))
                     }
                     .or(has_children);
+                    let bg = cmd_marker.is_none()
+                        && cmd_busy == Some(false)
+                        && has_children == Some(true);
+                    if bg != last_bg {
+                        last_bg = bg;
+                        emit_terminal_list_changed(&app);
+                    }
                     match cmd_busy {
                         Some(true) => {
                             if cmd_marker.is_some() {
@@ -431,6 +441,7 @@ fn validate_shell_program(candidate: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn create_terminal(
     app: AppHandle,
     state: State<'_, AppState>,

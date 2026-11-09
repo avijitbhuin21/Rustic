@@ -42,7 +42,9 @@ pub async fn dispatch(
     let state = ctx.state();
     Some(match command {
         "get_settings" => handle(args, |_: Value| ops::get_settings(state)),
-        "update_settings" => handle(args, |a: SettingsArg| ops::update_settings(state, &a.settings)),
+        "update_settings" => handle(args, |a: SettingsArg| {
+            ops::update_settings(state, &a.settings)
+        }),
         "get_active_theme" => handle(args, |_: Value| ops::get_active_theme(state)),
         "list_themes" => handle(args, |_: Value| ops::list_themes(state)),
         "import_theme" => handle(args, |a: PathArg| ops::import_theme(state, &a.path)),
@@ -103,7 +105,8 @@ fn theme_command(ctx: &ServerContext, command: &str, args: &Value) -> Result<Val
         }
         "theme_write" => {
             let a: ThemeTextArg = parse(args)?;
-            let id = a.id.ok_or_else(|| ApiError::from("id is required".to_string()))?;
+            let id =
+                a.id.ok_or_else(|| ApiError::from("id is required".to_string()))?;
             ok(t::write(state, dir, &id, &a.text)?)
         }
         "theme_delete" => {
@@ -129,7 +132,9 @@ fn theme_command(ctx: &ServerContext, command: &str, args: &Value) -> Result<Val
             std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
             ok(d.to_string_lossy().into_owned())
         }
-        other => Err(ApiError::from(format!("{other} isn't available on the server"))),
+        other => Err(ApiError::from(format!(
+            "{other} isn't available on the server"
+        ))),
     }
 }
 
@@ -183,7 +188,9 @@ fn set_tunnel_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
 
     if mode == "subdomain" {
         if preview_domain.is_none() {
-            return Err(ApiError::bad("subdomain mode needs a preview domain".to_string()));
+            return Err(ApiError::bad(
+                "subdomain mode needs a preview domain".to_string(),
+            ));
         }
         if cookie_domain.is_none() {
             return Err(ApiError::bad(

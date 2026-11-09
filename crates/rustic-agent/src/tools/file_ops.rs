@@ -58,20 +58,18 @@ const LEFT_DOUBLE_CURLY_QUOTE: char = '\u{201C}'; // "
 const RIGHT_DOUBLE_CURLY_QUOTE: char = '\u{201D}'; // "
 
 fn normalize_quotes(s: &str) -> String {
-    s.replace(LEFT_SINGLE_CURLY_QUOTE, "'")
-        .replace(RIGHT_SINGLE_CURLY_QUOTE, "'")
-        .replace(LEFT_DOUBLE_CURLY_QUOTE, "\"")
-        .replace(RIGHT_DOUBLE_CURLY_QUOTE, "\"")
+    s.replace([LEFT_SINGLE_CURLY_QUOTE, RIGHT_SINGLE_CURLY_QUOTE], "'")
+        .replace([LEFT_DOUBLE_CURLY_QUOTE, RIGHT_DOUBLE_CURLY_QUOTE], "\"")
 }
 
 fn is_opening_context(chars: &[char], index: usize) -> bool {
     if index == 0 {
         return true;
     }
-    match chars.get(index.wrapping_sub(1)) {
-        Some(&' ' | &'\t' | &'\n' | &'\r' | &'(' | &'[' | &'{' | '\u{2014}' | '\u{2013}') => true,
-        _ => false,
-    }
+    matches!(
+        chars.get(index.wrapping_sub(1)),
+        Some(&' ' | &'\t' | &'\n' | &'\r' | &'(' | &'[' | &'{' | '\u{2014}' | '\u{2013}')
+    )
 }
 
 fn apply_curly_double_quotes(s: &str) -> String {
@@ -101,8 +99,8 @@ fn apply_curly_single_quotes(s: &str) -> String {
         .map(|(i, &ch)| {
             if ch == '\'' {
                 // Check for contractions (apostrophes between letters)
-                let prev_is_letter = i > 0 && chars.get(i - 1).map_or(false, |c| c.is_alphabetic());
-                let next_is_letter = chars.get(i + 1).map_or(false, |c| c.is_alphabetic());
+                let prev_is_letter = i > 0 && chars.get(i - 1).is_some_and(|c| c.is_alphabetic());
+                let next_is_letter = chars.get(i + 1).is_some_and(|c| c.is_alphabetic());
 
                 if prev_is_letter && next_is_letter {
                     // Apostrophe in contraction
@@ -797,10 +795,9 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
     // (temp+rename), so reads are always consistent. Holding the mutex here caused
     // 30 s timeouts when Defender/indexer scans blocked read_to_string inside
     // a concurrent edit_file that held the same mutex.
-    let mtime_now = match std::fs::metadata(&full_path).and_then(|m| m.modified()) {
-        Ok(t) => Some(t),
-        Err(_) => None,
-    };
+    let mtime_now = std::fs::metadata(&full_path)
+        .and_then(|m| m.modified())
+        .ok();
 
     if let Some(current_mtime) = mtime_now {
         if let Ok(metadata) = std::fs::metadata(&full_path) {
@@ -968,22 +965,23 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(P1_11_MAX_READ_BYTES);
     if let Ok(metadata) = std::fs::metadata(&full_path) {
-        if metadata.is_file() && metadata.len() > byte_cap {
-            if start_line.is_some() || end_line.is_some() {
-                return Ok(ToolOutput {
-                    content: format!(
-                        "READ_TOO_LARGE: '{}' is {} bytes, exceeding the {}-byte read cap \
+        if metadata.is_file()
+            && metadata.len() > byte_cap
+            && (start_line.is_some() || end_line.is_some())
+        {
+            return Ok(ToolOutput {
+                content: format!(
+                    "READ_TOO_LARGE: '{}' is {} bytes, exceeding the {}-byte read cap \
                          even with the requested range. Pick a smaller offset/limit window \
                          and retry. (Override the cap process-wide with the \
                          RUSTIC_FILE_READ_MAX_BYTES env var.)",
-                        path,
-                        metadata.len(),
-                        byte_cap
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
+                    path,
+                    metadata.len(),
+                    byte_cap
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     }
 
@@ -3107,10 +3105,8 @@ fn normalize_ws_with_offsets(s: &str) -> (String, Vec<usize>) {
         {
             trimmed_end -= 1;
         }
-        for k in i..trimmed_end {
-            offsets.push(k);
-            out.push(bytes[k]);
-        }
+        offsets.extend(i..trimmed_end);
+        out.extend_from_slice(&bytes[i..trimmed_end]);
         if line_end < bytes.len() {
             offsets.push(line_end);
             out.push(b'\n');
@@ -3121,7 +3117,8 @@ fn normalize_ws_with_offsets(s: &str) -> (String, Vec<usize>) {
     }
     offsets.push(bytes.len());
     // Safety: only ASCII bytes dropped — result is still valid UTF-8.
-    let out_str = String::from_utf8(out).expect("ws normalization preserves utf-8");
+    let out_str = String::from_utf8(out)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     (out_str, offsets)
 }
 
@@ -3170,7 +3167,7 @@ fn build_no_match_context(content: &str, old_string: &str, hint_line: Option<usi
             let mut score = line_similarity(probe, line);
             if let Some(hl) = hint_line {
                 let line_no = idx + 1;
-                let dist = (line_no as isize - hl as isize).unsigned_abs() as usize;
+                let dist = (line_no as isize - hl as isize).unsigned_abs();
                 if dist <= 5 {
                     score += 0.05 * (6.0 - dist as f32) / 6.0;
                 }

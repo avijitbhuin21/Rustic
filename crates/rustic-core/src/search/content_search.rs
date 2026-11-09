@@ -186,7 +186,7 @@ impl SearchEngine {
                 let mut rebuilt = String::with_capacity(line.len());
                 let mut last_end = 0usize;
                 for caps in regex.captures_iter(line) {
-                    let m = caps.get(0).expect("capture 0 always present");
+                    let Some(m) = caps.get(0) else { continue };
                     rebuilt.push_str(&line[last_end..m.start()]);
                     if excluded_ordinals.contains(&ordinal) {
                         rebuilt.push_str(m.as_str());

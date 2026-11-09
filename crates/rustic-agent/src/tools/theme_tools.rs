@@ -118,11 +118,16 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
             true,
         ));
     };
-    let id = params["id"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let id = params["id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     match name {
         "list_themes" => Ok(json_result(host.list())),
         "read_theme" => {
-            let Some(id) = id else { return Ok(missing("id")) };
+            let Some(id) = id else {
+                return Ok(missing("id"));
+            };
             if id == "template" {
                 return Ok(ToolOutput::text(host.template(), false));
             }
@@ -136,7 +141,8 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                 return Ok(denied);
             }
             if name == "write_theme" {
-                let Some(content) = params["content"].as_str().filter(|s| !s.trim().is_empty()) else {
+                let Some(content) = params["content"].as_str().filter(|s| !s.trim().is_empty())
+                else {
                     return Ok(missing("content"));
                 };
                 return Ok(match host.write(id, content) {
@@ -144,7 +150,9 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                     Err(e) => ToolOutput::text(format!("THEME_INVALID: {e}"), true),
                 });
             }
-            let Some(id) = id else { return Ok(missing("id")) };
+            let Some(id) = id else {
+                return Ok(missing("id"));
+            };
             let approved = context
                 .permission_broker
                 .request(
@@ -169,7 +177,10 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                 Err(e) => ToolOutput::text(format!("THEME_ERROR: {e}"), true),
             })
         }
-        _ => Ok(ToolOutput::text(format!("Unknown theme tool: {name}"), true)),
+        _ => Ok(ToolOutput::text(
+            format!("Unknown theme tool: {name}"),
+            true,
+        )),
     }
 }
 
@@ -206,7 +217,10 @@ fn format_scan(scan: &Value) -> String {
     let mut out = String::new();
     for (key, label) in [("blocked", "BLOCKED"), ("warnings", "warning")] {
         for f in scan[key].as_array().into_iter().flatten() {
-            out.push_str(&format!("- {label}: {}\n", f["message"].as_str().unwrap_or("")));
+            out.push_str(&format!(
+                "- {label}: {}\n",
+                f["message"].as_str().unwrap_or("")
+            ));
         }
     }
     if let Some(hosts) = scan["remote_hosts"].as_array().filter(|h| !h.is_empty()) {
@@ -225,7 +239,11 @@ fn format_read(v: &Value) -> String {
         "Theme `{}` ({}){}\nSafety scan:\n{}\nFile:\n{}",
         e["id"].as_str().unwrap_or(""),
         e["name"].as_str().unwrap_or(""),
-        if e["builtin"].as_bool() == Some(true) { " — built-in, read-only" } else { "" },
+        if e["builtin"].as_bool() == Some(true) {
+            " — built-in, read-only"
+        } else {
+            ""
+        },
         format_scan(&v["scan"]),
         v["text"].as_str().unwrap_or("")
     )
@@ -233,7 +251,9 @@ fn format_read(v: &Value) -> String {
 
 fn format_write(v: &Value) -> String {
     let e = &v["entry"];
-    let blocked = v["scan"]["blocked"].as_array().is_some_and(|b| !b.is_empty());
+    let blocked = v["scan"]["blocked"]
+        .as_array()
+        .is_some_and(|b| !b.is_empty());
     format!(
         "Saved theme `{}` ({}). It is NOT applied: {}\nSafety scan:\n{}",
         e["id"].as_str().unwrap_or(""),

@@ -60,6 +60,7 @@ ARG NODE_VERSION=24.18.0
 ARG NODE_SHA256=55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742
 ARG GO_VERSION=1.26.4
 ARG GO_SHA256=1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f
+# Keep CLOUDFLARED_VERSION in sync with crates/rustic-app/src/peer/tunnel.rs.
 ARG CLOUDFLARED_VERSION=2026.6.1
 ARG CLOUDFLARED_SHA256=5861a10a438fe8ddcfebb3b830f83966cbf193edafce0fe2eeb198fbae1f7a22
 # git: required for state-mutating VCS operations (commit/push/pull) per the

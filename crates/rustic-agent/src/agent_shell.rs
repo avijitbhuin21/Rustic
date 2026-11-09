@@ -51,7 +51,11 @@ fn choice() -> &'static Choice {
 
 #[cfg(not(target_os = "windows"))]
 fn detect() -> Choice {
-    let os = if cfg!(target_os = "macos") { "macOS" } else { "Linux" };
+    let os = if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    };
     for (name, fallbacks) in [
         ("zsh", &["/bin/zsh", "/usr/bin/zsh"][..]),
         ("bash", &["/bin/bash", "/usr/bin/bash"][..]),
@@ -64,10 +68,16 @@ fn detect() -> Choice {
                 .map(|p| p.to_string())
         });
         if let Some(path) = found {
-            return Choice { path: Some(path), label: unix_label(name, os) };
+            return Choice {
+                path: Some(path),
+                label: unix_label(name, os),
+            };
         }
     }
-    Choice { path: None, label: unix_label("sh", os) }
+    Choice {
+        path: None,
+        label: unix_label("sh", os),
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -85,16 +95,28 @@ fn unix_label(name: &str, os: &str) -> &'static str {
 #[cfg(target_os = "windows")]
 fn detect() -> Choice {
     if let Some(path) = git_bash_path() {
-        return Choice { path: Some(path), label: "bash (Git Bash) on Windows" };
+        return Choice {
+            path: Some(path),
+            label: "bash (Git Bash) on Windows",
+        };
     }
     if let Some(path) = find_in_path("pwsh.exe") {
-        return Choice { path: Some(path), label: "PowerShell on Windows" };
+        return Choice {
+            path: Some(path),
+            label: "PowerShell on Windows",
+        };
     }
     let legacy = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
     if Path::new(legacy).exists() {
-        return Choice { path: Some(legacy.to_string()), label: "PowerShell on Windows" };
+        return Choice {
+            path: Some(legacy.to_string()),
+            label: "PowerShell on Windows",
+        };
     }
-    Choice { path: None, label: "cmd on Windows" }
+    Choice {
+        path: None,
+        label: "cmd on Windows",
+    }
 }
 
 /// Locates Git for Windows' bash. Never returns WSL's `System32\bash.exe` or the
@@ -110,11 +132,23 @@ pub fn git_bash_path() -> Option<String> {
         }
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        candidates.push(Path::new(&local).join("Programs").join("Git").join("bin").join("bash.exe"));
+        candidates.push(
+            Path::new(&local)
+                .join("Programs")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe"),
+        );
     }
     if let Ok(home) = std::env::var("USERPROFILE") {
         candidates.push(
-            Path::new(&home).join("scoop").join("apps").join("git").join("current").join("bin").join("bash.exe"),
+            Path::new(&home)
+                .join("scoop")
+                .join("apps")
+                .join("git")
+                .join("current")
+                .join("bin")
+                .join("bash.exe"),
         );
     }
     // git.exe on PATH lives in <Git>\cmd, <Git>\bin or <Git>\mingw64\bin.
@@ -141,7 +175,11 @@ fn is_wsl_launcher(p: &Path) -> bool {
 }
 
 fn find_in_path(exe: &str) -> Option<String> {
-    let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+    let sep = if cfg!(target_os = "windows") {
+        ';'
+    } else {
+        ':'
+    };
     let path_var = std::env::var("PATH").ok()?;
     path_var
         .split(sep)
@@ -166,8 +204,15 @@ mod tests {
             assert!(label.ends_with("on Linux"), "{label}");
         }
         if let Some(path) = agent_shell_path() {
-            let stem = Path::new(&path).file_stem().unwrap().to_string_lossy().to_lowercase();
-            assert!(label.starts_with(stem.trim_end_matches(".exe")) || label.starts_with("PowerShell"), "{label} vs {path}");
+            let stem = Path::new(&path)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .to_lowercase();
+            assert!(
+                label.starts_with(stem.trim_end_matches(".exe")) || label.starts_with("PowerShell"),
+                "{label} vs {path}"
+            );
         }
     }
 
@@ -184,7 +229,11 @@ mod tests {
     #[test]
     fn wsl_launchers_are_rejected() {
         assert!(is_wsl_launcher(Path::new(r"C:\Windows\System32\bash.exe")));
-        assert!(is_wsl_launcher(Path::new(r"C:\Users\a\AppData\Local\Microsoft\WindowsApps\bash.exe")));
-        assert!(!is_wsl_launcher(Path::new(r"C:\Program Files\Git\bin\bash.exe")));
+        assert!(is_wsl_launcher(Path::new(
+            r"C:\Users\a\AppData\Local\Microsoft\WindowsApps\bash.exe"
+        )));
+        assert!(!is_wsl_launcher(Path::new(
+            r"C:\Program Files\Git\bin\bash.exe"
+        )));
     }
 }

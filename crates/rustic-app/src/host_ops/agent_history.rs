@@ -324,7 +324,9 @@ mod tests {
         let stale = Arc::new(AtomicBool::new(false));
         // No registered token yet: treated as current.
         assert!(!sync_history_if_current(&mut agent, "t", &current, &[]));
-        agent.cancellation_tokens.insert("t".into(), Arc::clone(&current));
+        agent
+            .cancellation_tokens
+            .insert("t".into(), Arc::clone(&current));
         assert!(!sync_history_if_current(&mut agent, "t", &current, &[]));
         // A newer run swapped the token: the old run is superseded.
         assert!(sync_history_if_current(&mut agent, "t", &stale, &[]));
@@ -342,15 +344,21 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: vec![
-                ContentBlock::Text { text: "[SYSTEM NUDGE] x".into() },
-                ContentBlock::Text { text: "real".into() },
+                ContentBlock::Text {
+                    text: "[SYSTEM NUDGE] x".into(),
+                },
+                ContentBlock::Text {
+                    text: "real".into(),
+                },
             ],
         };
         let clean = strip_synthetic_blocks(&msg).unwrap();
         assert_eq!(clean.len(), 1);
         let only = Message {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: "[All sub-agents done]".into() }],
+            content: vec![ContentBlock::Text {
+                text: "[All sub-agents done]".into(),
+            }],
         };
         assert!(strip_synthetic_blocks(&only).is_none());
     }

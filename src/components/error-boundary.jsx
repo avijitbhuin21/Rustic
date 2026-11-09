@@ -1,5 +1,6 @@
 import React from 'react';
 import { logReactError } from '@/lib/crash-logger';
+import { isChunkLoadError, reloadOnceForChunkError } from '@/lib/chunk-reload';
 
 // Catches render/lifecycle errors anywhere below it, logs them to the backend
 // rolling log (so a crash leaves a trace), and shows a minimal recovery screen
@@ -16,6 +17,7 @@ export class ErrorBoundary extends React.Component {
 
   componentDidCatch(error, info) {
     logReactError(error, info);
+    if (isChunkLoadError(error)) reloadOnceForChunkError();
   }
 
   render() {

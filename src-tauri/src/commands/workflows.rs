@@ -20,7 +20,11 @@ pub fn create_workflow(name: String, body: String) -> Result<WorkflowInfo, Strin
 }
 
 #[tauri::command(async)]
-pub fn update_workflow(original_name: String, name: String, body: String) -> Result<WorkflowInfo, String> {
+pub fn update_workflow(
+    original_name: String,
+    name: String,
+    body: String,
+) -> Result<WorkflowInfo, String> {
     ops::update_workflow(&original_name, &name, &body)
 }
 

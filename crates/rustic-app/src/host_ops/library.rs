@@ -4,12 +4,20 @@
 
 use std::io::Read;
 
-use crate::github_download::{self, DownloadError, MAX_TEXT_DOWNLOAD_BYTES, MAX_ZIP_DOWNLOAD_BYTES};
+use crate::github_download::{
+    self, DownloadError, MAX_TEXT_DOWNLOAD_BYTES, MAX_ZIP_DOWNLOAD_BYTES,
+};
 
 pub fn sanitize_name(name: &str) -> String {
     name.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -29,7 +37,10 @@ pub fn summarize(body: &str) -> String {
 
 /// Canonical `---name/description---` frontmatter + body.
 pub fn with_frontmatter(name: &str, description: &str, body: &str) -> String {
-    format!("---\nname: {}\ndescription: {}\n---\n\n{}", name, description, body)
+    format!(
+        "---\nname: {}\ndescription: {}\n---\n\n{}",
+        name, description, body
+    )
 }
 
 /// Picks entry `i` of an optional parallel name-override list (trimmed, non-empty).
@@ -60,7 +71,9 @@ pub fn parse_github_source(source: &str) -> Result<GithubSource, String> {
     if source.starts_with("https://raw.githubusercontent.com/")
         || source.starts_with("http://raw.githubusercontent.com/")
     {
-        return Ok(GithubSource::RawFile { url: source.to_string() });
+        return Ok(GithubSource::RawFile {
+            url: source.to_string(),
+        });
     }
 
     let path = source
@@ -82,12 +95,23 @@ pub fn parse_github_source(source: &str) -> Result<GithubSource, String> {
         let branch = segments[3];
         let subpath = segments[4..].join("/");
         if subpath.ends_with(".md") {
-            let url = format!("https://raw.githubusercontent.com/{}/{}/{}/{}", owner, repo, branch, subpath);
+            let url = format!(
+                "https://raw.githubusercontent.com/{}/{}/{}/{}",
+                owner, repo, branch, subpath
+            );
             return Ok(GithubSource::RawFile { url });
         }
-        return Ok(GithubSource::RepoZip { owner, repo, subpath: Some(subpath) });
+        return Ok(GithubSource::RepoZip {
+            owner,
+            repo,
+            subpath: Some(subpath),
+        });
     }
-    Ok(GithubSource::RepoZip { owner, repo, subpath: None })
+    Ok(GithubSource::RepoZip {
+        owner,
+        repo,
+        subpath: None,
+    })
 }
 
 fn map_download_err(e: DownloadError) -> String {
@@ -95,9 +119,14 @@ fn map_download_err(e: DownloadError) -> String {
         DownloadError::Transport(msg) => msg,
         DownloadError::Http { status, url } => format!("HTTP {} downloading {}", status, url),
         DownloadError::TooLarge { len, cap, url } => {
-            format!("Download too large ({} bytes, cap {}) for {}", len, cap, url)
+            format!(
+                "Download too large ({} bytes, cap {}) for {}",
+                len, cap, url
+            )
         }
-        DownloadError::ExceededCap { cap, url } => format!("Download exceeded {} byte cap for {}", cap, url),
+        DownloadError::ExceededCap { cap, url } => {
+            format!("Download exceeded {} byte cap for {}", cap, url)
+        }
     }
 }
 
@@ -153,8 +182,14 @@ pub fn matches_subpath(inside: &str, filter: &str) -> bool {
 
 /// Friendly default name from a URL or file path: the filename minus extension.
 pub fn filename_stem(url_or_path: &str) -> String {
-    let last = url_or_path.rsplit(['/', '\\']).next().unwrap_or(url_or_path);
-    last.rsplit_once('.').map(|(a, _)| a).unwrap_or(last).to_string()
+    let last = url_or_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(url_or_path);
+    last.rsplit_once('.')
+        .map(|(a, _)| a)
+        .unwrap_or(last)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -165,15 +200,25 @@ mod tests {
     fn parses_github_sources() {
         assert_eq!(
             parse_github_source("owner/repo.git").unwrap(),
-            GithubSource::RepoZip { owner: "owner".into(), repo: "repo".into(), subpath: None }
+            GithubSource::RepoZip {
+                owner: "owner".into(),
+                repo: "repo".into(),
+                subpath: None
+            }
         );
         assert_eq!(
             parse_github_source("https://github.com/o/r/blob/main/skills/x/SKILL.md").unwrap(),
-            GithubSource::RawFile { url: "https://raw.githubusercontent.com/o/r/main/skills/x/SKILL.md".into() }
+            GithubSource::RawFile {
+                url: "https://raw.githubusercontent.com/o/r/main/skills/x/SKILL.md".into()
+            }
         );
         assert_eq!(
             parse_github_source("https://github.com/o/r/blob/main/skills/x/").unwrap(),
-            GithubSource::RepoZip { owner: "o".into(), repo: "r".into(), subpath: Some("skills/x".into()) }
+            GithubSource::RepoZip {
+                owner: "o".into(),
+                repo: "r".into(),
+                subpath: Some("skills/x".into())
+            }
         );
         assert!(matches!(
             parse_github_source(" https://raw.githubusercontent.com/o/r/main/a.md ").unwrap(),
@@ -187,7 +232,10 @@ mod tests {
         assert_eq!(filename_stem("https://x/y/my-flow.md"), "my-flow");
         assert_eq!(filename_stem("C:\\a\\b.md"), "b");
         assert_eq!(filename_stem("noext"), "noext");
-        assert_eq!(strip_zip_top_dir("repo-main/skills/a/SKILL.md"), "skills/a/SKILL.md");
+        assert_eq!(
+            strip_zip_top_dir("repo-main/skills/a/SKILL.md"),
+            "skills/a/SKILL.md"
+        );
         assert!(matches_subpath("skills/a/SKILL.md", "skills/a/SKILL.md/"));
         assert!(matches_subpath("x/skills/a/SKILL.md", "skills/a/SKILL.md"));
         assert!(!matches_subpath("skills/b/SKILL.md", "skills/a"));
@@ -199,7 +247,10 @@ mod tests {
         assert_eq!(name_override(Some(&names), 0), None);
         assert_eq!(name_override(Some(&names), 1), Some("New".into()));
         assert_eq!(name_override(None, 0), None);
-        assert_eq!(with_frontmatter("a", "d", "b"), "---\nname: a\ndescription: d\n---\n\nb");
+        assert_eq!(
+            with_frontmatter("a", "d", "b"),
+            "---\nname: a\ndescription: d\n---\n\nb"
+        );
         assert_eq!(sanitize_name("My Skill!"), "my-skill");
         assert_eq!(summarize("a\n b"), "a b");
     }

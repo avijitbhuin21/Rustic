@@ -114,13 +114,22 @@ pub async fn start(host: &HostRef, lan: &LanState) -> Result<(), String> {
             return Err(e);
         }
     };
-    let advertise = host.data_dir().map(|d| super::is_local_reach(&d)).unwrap_or(true);
+    let advertise = host
+        .data_dir()
+        .map(|d| super::is_local_reach(&d))
+        .unwrap_or(true);
     match super::discovery::start(lan, &id, port, advertise) {
         Ok(daemon) => lan.lock().mdns = Some(daemon),
         Err(e) => tracing::warn!("LAN discovery unavailable: {e}"),
     }
     tokio::spawn(watch_network(host.clone(), lan.clone(), port));
-    if host.data_dir().ok().and_then(|d| super::internet_mode(&d)).as_deref() == Some("cloudflare") {
+    if host
+        .data_dir()
+        .ok()
+        .and_then(|d| super::internet_mode(&d))
+        .as_deref()
+        == Some("cloudflare")
+    {
         let (h, l) = (host.clone(), lan.clone());
         tokio::spawn(async move {
             if let Err(e) = start_tunnel(&h, &l).await {
@@ -168,20 +177,26 @@ async fn watch_network(host: HostRef, lan: LanState, port: u16) {
             inner.probed.clear();
         }
         crate::transfers::network_changed();
-        host.emitter().emit_json("lan-peers-changed", serde_json::json!({}));
+        host.emitter()
+            .emit_json("lan-peers-changed", serde_json::json!({}));
         if ip.is_some() {
-            let advertise = host.data_dir().map(|d| super::is_local_reach(&d)).unwrap_or(true);
+            let advertise = host
+                .data_dir()
+                .map(|d| super::is_local_reach(&d))
+                .unwrap_or(true);
             match super::discovery::start(&lan, &id, port, advertise) {
                 Ok(daemon) => lan.lock().mdns = Some(daemon),
                 Err(e) => tracing::warn!("LAN discovery restart failed: {e}"),
             }
         }
-        host.emitter().emit_json("lan-status-changed", serde_json::json!({ "ip": ip }));
+        host.emitter()
+            .emit_json("lan-status-changed", serde_json::json!({ "ip": ip }));
         // Give the new interface a moment to route before calling peers.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         announce(&host, &lan).await;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        host.emitter().emit_json("lan-peers-changed", serde_json::json!({}));
+        host.emitter()
+            .emit_json("lan-peers-changed", serde_json::json!({}));
     }
 }
 
@@ -258,11 +273,17 @@ pub async fn status(host: &HostRef, lan: &LanState) -> Result<LanStatus, String>
         device_id,
         device_name,
         port,
-        address: ip.as_ref().filter(|_| port != 0).map(|ip| format!("{ip}:{port}")),
+        address: ip
+            .as_ref()
+            .filter(|_| port != 0)
+            .map(|ip| format!("{ip}:{port}")),
         ip,
         tunnel_url,
         internet_mode: host.data_dir().ok().and_then(|d| super::internet_mode(&d)),
-        local_reach: host.data_dir().map(|d| super::is_local_reach(&d)).unwrap_or(true),
+        local_reach: host
+            .data_dir()
+            .map(|d| super::is_local_reach(&d))
+            .unwrap_or(true),
         default_port: super::DEFAULT_PORT,
     })
 }
@@ -292,7 +313,12 @@ pub fn candidate_addrs(lan: &LanState, peer: &Peer) -> Vec<String> {
             }
         }
     };
-    push(inner.discovered.get(&peer.device_id).map(|d| d.addr.clone()));
+    push(
+        inner
+            .discovered
+            .get(&peer.device_id)
+            .map(|d| d.addr.clone()),
+    );
     push(inner.seen.get(&peer.device_id).and_then(|s| s.addr.clone()));
     push(peer.addr.clone());
     push(peer.addr.as_deref().and_then(super::with_default_port));
@@ -318,12 +344,16 @@ async fn hello_peer(host: HostRef, lan: LanState, peer: Peer) {
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         if let Some(v) = body.get("version").and_then(|v| v.as_str()) {
-            lan.lock().versions.insert(peer.device_id.clone(), v.to_string());
+            lan.lock()
+                .versions
+                .insert(peer.device_id.clone(), v.to_string());
         }
         if status == reqwest::StatusCode::CONFLICT {
             tracing::info!(device = %peer.device_id, theirs = ?body.get("version"), "peer: paired device runs a different version");
             if body.get("version").is_none() {
-                lan.lock().versions.insert(peer.device_id.clone(), String::new());
+                lan.lock()
+                    .versions
+                    .insert(peer.device_id.clone(), String::new());
             }
             lan.lock().mark_seen(&peer.device_id, Some(addr.clone()));
             return;
@@ -337,7 +367,9 @@ async fn hello_peer(host: HostRef, lan: LanState, peer: Peer) {
         }
         if status == reqwest::StatusCode::NOT_FOUND {
             // Older build without /hello: still a different version.
-            lan.lock().versions.insert(peer.device_id.clone(), String::new());
+            lan.lock()
+                .versions
+                .insert(peer.device_id.clone(), String::new());
             lan.lock().mark_seen(&peer.device_id, Some(addr.clone()));
             return;
         }
@@ -356,9 +388,10 @@ fn remember_working(host: &HostRef, lan: &LanState, peer: &Peer, addr: &str) {
     {
         let mut inner = lan.lock();
         inner.mark_seen(&peer.device_id, Some(addr.to_string()));
-        inner
-            .working_addr
-            .insert(peer.device_id.clone(), (addr.to_string(), std::time::Instant::now()));
+        inner.working_addr.insert(
+            peer.device_id.clone(),
+            (addr.to_string(), std::time::Instant::now()),
+        );
     }
     if peer.addr.as_deref() != Some(addr) {
         if let Ok(dir) = host.data_dir() {
@@ -410,18 +443,30 @@ pub async fn resolve_addr(host: &HostRef, lan: &LanState, peer: &Peer) -> Result
         if body.get("device_id").and_then(|v| v.as_str()) != Some(peer.device_id.as_str()) {
             continue;
         }
-        let theirs = body.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        lan.lock().versions.insert(peer.device_id.clone(), theirs.clone());
+        let theirs = body
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        lan.lock()
+            .versions
+            .insert(peer.device_id.clone(), theirs.clone());
         if theirs != super::app_version() {
             lan.lock().mark_seen(&peer.device_id, Some(addr.clone()));
-            return Err(super::version_mismatch_message(&peer.display_name(), Some(&theirs)));
+            return Err(super::version_mismatch_message(
+                &peer.display_name(),
+                Some(&theirs),
+            ));
         }
         remember_working(host, lan, peer, addr);
         return Ok(addr.clone());
     }
     tracing::warn!(device = %peer.device_id, tried = ?candidates, "peer: paired device unreachable");
     Err(if candidates.is_empty() {
-        format!("{} has no known address yet — open Rustic there, or add it by address.", peer.display_name())
+        format!(
+            "{} has no known address yet — open Rustic there, or add it by address.",
+            peer.display_name()
+        )
     } else {
         format!(
             "Couldn't reach {} (tried {}). Check it's running with sync on and on the same network, or connect via its tunnel URL.",
@@ -443,7 +488,10 @@ pub async fn check_response(
         return Ok(resp);
     }
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
-    let msg = body.get("error").and_then(|v| v.as_str()).map(str::to_string);
+    let msg = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     if status == reqwest::StatusCode::UNAUTHORIZED {
         lan.lock().needs_repair.insert(peer.device_id.clone());
         lan.lock().working_addr.remove(&peer.device_id);
@@ -452,12 +500,28 @@ pub async fn check_response(
             peer.display_name()
         ));
     }
-    if status == reqwest::StatusCode::CONFLICT && body.get("code").and_then(|v| v.as_str()) == Some(super::VERSION_MISMATCH) {
-        let theirs = body.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        lan.lock().versions.insert(peer.device_id.clone(), theirs.clone());
-        return Err(super::version_mismatch_message(&peer.display_name(), Some(&theirs)));
+    if status == reqwest::StatusCode::CONFLICT
+        && body.get("code").and_then(|v| v.as_str()) == Some(super::VERSION_MISMATCH)
+    {
+        let theirs = body
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        lan.lock()
+            .versions
+            .insert(peer.device_id.clone(), theirs.clone());
+        return Err(super::version_mismatch_message(
+            &peer.display_name(),
+            Some(&theirs),
+        ));
     }
-    Err(msg.unwrap_or_else(|| format!("{} refused the request (HTTP {status})", peer.display_name())))
+    Err(msg.unwrap_or_else(|| {
+        format!(
+            "{} refused the request (HTTP {status})",
+            peer.display_name()
+        )
+    }))
 }
 
 /// The paired device `device_id`.
@@ -517,7 +581,11 @@ pub async fn devices(host: &HostRef, lan: &LanState) -> Result<Vec<LanDevice>, S
         if running {
             let due = {
                 let mut inner = lan.lock();
-                let every = if online { super::ONLINE_WINDOW / 2 } else { PROBE_EVERY };
+                let every = if online {
+                    super::ONLINE_WINDOW / 2
+                } else {
+                    PROBE_EVERY
+                };
                 let due = inner
                     .probed
                     .get(&p.device_id)
@@ -538,11 +606,16 @@ pub async fn devices(host: &HostRef, lan: &LanState) -> Result<Vec<LanDevice>, S
             name: p.display_name(),
             device_name: p.name.clone(),
             nickname: p.nickname.clone(),
-            addr: found.map(|d| d.addr.clone()).or(seen_addr).or(p.addr.clone()),
+            addr: found
+                .map(|d| d.addr.clone())
+                .or(seen_addr)
+                .or(p.addr.clone()),
             online,
             paired: true,
             manual: false,
-            update_required: version.as_deref().is_some_and(|v| v != super::app_version()),
+            update_required: version
+                .as_deref()
+                .is_some_and(|v| v != super::app_version()),
             version,
             needs_repair,
         });
@@ -568,15 +641,21 @@ pub async fn devices(host: &HostRef, lan: &LanState) -> Result<Vec<LanDevice>, S
                 online: true,
                 paired: false,
                 manual: manual_flag,
-                update_required: d.version.as_deref().is_some_and(|v| v != super::app_version()),
+                update_required: d
+                    .version
+                    .as_deref()
+                    .is_some_and(|v| v != super::app_version()),
                 version: d.version.clone(),
                 needs_repair: false,
             });
         }
     }
     out.sort_by(|a, b| {
-        (!a.paired, !a.online, a.name.to_lowercase())
-            .cmp(&(!b.paired, !b.online, b.name.to_lowercase()))
+        (!a.paired, !a.online, a.name.to_lowercase()).cmp(&(
+            !b.paired,
+            !b.online,
+            b.name.to_lowercase(),
+        ))
     });
     Ok(out)
 }
@@ -584,7 +663,11 @@ pub async fn devices(host: &HostRef, lan: &LanState) -> Result<Vec<LanDevice>, S
 /// "Add machine" by address: read the device's identity from `/lan/info`
 /// (capturing its certificate on a pinned LAN address) so it can be paired
 /// like a discovered one.
-pub async fn add_manual(host: &HostRef, lan: &LanState, address: &str) -> Result<LanDevice, String> {
+pub async fn add_manual(
+    host: &HostRef,
+    lan: &LanState,
+    address: &str,
+) -> Result<LanDevice, String> {
     let me = lan
         .lock()
         .identity
@@ -619,12 +702,17 @@ pub async fn add_manual(host: &HostRef, lan: &LanState, address: &str) -> Result
         .json()
         .await
         .map_err(|_| format!("{addr} is not a Rustic device"))?;
-    let claimed_fp = body.get("fingerprint").and_then(|v| v.as_str()).map(str::to_string);
+    let claimed_fp = body
+        .get("fingerprint")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     // Over a URL address the TLS certificate (if any) isn't the device's own,
     // so its fingerprint can only come from its identity response; the
     // matching 6-digit pairing code on both screens is what authenticates it.
     let fp = if url_addr {
-        claimed_fp.clone().ok_or(format!("{addr} is not a Rustic device"))?
+        claimed_fp
+            .clone()
+            .ok_or(format!("{addr} is not a Rustic device"))?
     } else {
         captured
             .lock()
@@ -638,7 +726,9 @@ pub async fn add_manual(host: &HostRef, lan: &LanState, address: &str) -> Result
         .ok_or(format!("{addr} is not a Rustic device"))?
         .to_string();
     if claimed_fp.as_deref() != Some(fp.as_str()) || !fp.starts_with(&device_id) {
-        return Err(format!("{addr} presented a certificate that doesn't match its identity"));
+        return Err(format!(
+            "{addr} presented a certificate that doesn't match its identity"
+        ));
     }
     if device_id == me.device_id {
         return Err("That address is this machine".into());
@@ -648,8 +738,14 @@ pub async fn add_manual(host: &HostRef, lan: &LanState, address: &str) -> Result
         .and_then(|v| v.as_str())
         .unwrap_or("Rustic")
         .to_string();
-    let version = body.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    lan.lock().versions.insert(device_id.clone(), version.clone());
+    let version = body
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    lan.lock()
+        .versions
+        .insert(device_id.clone(), version.clone());
     let update_required = version != super::app_version();
     tracing::info!(addr, device = %device_id, version, "peer: added machine by address");
 
@@ -657,7 +753,10 @@ pub async fn add_manual(host: &HostRef, lan: &LanState, address: &str) -> Result
     let mut peers = super::load_peers(&dir);
     if let Some(p) = peers.iter_mut().find(|p| p.device_id == device_id) {
         if p.fingerprint != fp {
-            return Err("That device's certificate changed since you paired — forget it and pair again".into());
+            return Err(
+                "That device's certificate changed since you paired — forget it and pair again"
+                    .into(),
+            );
         }
         p.addr = Some(addr.clone());
         let out = LanDevice {
@@ -753,7 +852,11 @@ pub fn pair_code(lan: &LanState, device_id: &str) -> Result<String, String> {
 /// aren't kept in the candidate lists).
 pub fn pair_code_for(host: &HostRef, lan: &LanState, device_id: &str) -> Result<String, String> {
     pair_code(lan, device_id).or_else(|e| {
-        let me = lan.lock().identity.clone().ok_or("Turn on local-network sync first")?;
+        let me = lan
+            .lock()
+            .identity
+            .clone()
+            .ok_or("Turn on local-network sync first")?;
         let peer = paired(host, device_id).map_err(|_| e)?;
         Ok(super::pairing_code(&me.fingerprint, &peer.fingerprint))
     })
@@ -763,7 +866,10 @@ pub fn pair_code_for(host: &HostRef, lan: &LanState, device_id: &str) -> Result<
 /// separately). Tunnel / origin errors mean the request never reached a
 /// running listener, so no prompt was shown on the other machine.
 fn pair_failure_message(name: &str, status: u16, body: &serde_json::Value) -> String {
-    let theirs = body.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let theirs = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
     match (status, theirs) {
         (423, Some(e)) => e.to_string(),
         (423, None) => format!("{name} is locked — try again once it's unlocked"),
@@ -778,11 +884,16 @@ fn pair_failure_message(name: &str, status: u16, body: &serde_json::Value) -> St
 
 /// Who to send a pairing request to: a discovered / manually added device,
 /// else (re-pairing) an already-paired one at an address that answers.
-async fn pair_target(host: &HostRef, lan: &LanState, device_id: &str) -> Result<super::Discovered, String> {
+async fn pair_target(
+    host: &HostRef,
+    lan: &LanState,
+    device_id: &str,
+) -> Result<super::Discovered, String> {
     if let Some(d) = lan.lock().candidate(device_id) {
         return Ok(d);
     }
-    let peer = paired(host, device_id).map_err(|_| "That device is not on the network right now".to_string())?;
+    let peer = paired(host, device_id)
+        .map_err(|_| "That device is not on the network right now".to_string())?;
     // Version is checked again right before the request; don't fail here.
     let addr = match resolve_addr(host, lan, &peer).await {
         Ok(a) => a,
@@ -863,8 +974,14 @@ pub async fn pair(host: &HostRef, lan: &LanState, device_id: &str) -> Result<Str
         .await
     {
         let body: serde_json::Value = r.json().await.unwrap_or_default();
-        let theirs = body.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        lan.lock().versions.insert(target.device_id.clone(), theirs.clone());
+        let theirs = body
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        lan.lock()
+            .versions
+            .insert(target.device_id.clone(), theirs.clone());
         if theirs != super::app_version() {
             return Err(super::version_mismatch_message(&target.name, Some(&theirs)));
         }
@@ -903,8 +1020,14 @@ pub async fn pair(host: &HostRef, lan: &LanState, device_id: &str) -> Result<Str
     })?;
     if resp.status() == reqwest::StatusCode::CONFLICT {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let theirs = body.get("version").and_then(|v| v.as_str()).map(str::to_string);
-        return Err(super::version_mismatch_message(&target.name, theirs.as_deref()));
+        let theirs = body
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        return Err(super::version_mismatch_message(
+            &target.name,
+            theirs.as_deref(),
+        ));
     }
     if !resp.status().is_success() {
         // Before this, a locked machine, sync turned off there, or a dead
@@ -956,9 +1079,10 @@ pub async fn pair(host: &HostRef, lan: &LanState, device_id: &str) -> Result<Str
         inner.manual.remove(&target.device_id);
         inner.needs_repair.remove(&target.device_id);
         inner.mark_seen(&target.device_id, Some(target.addr.clone()));
-        inner
-            .working_addr
-            .insert(target.device_id.clone(), (target.addr.clone(), std::time::Instant::now()));
+        inner.working_addr.insert(
+            target.device_id.clone(),
+            (target.addr.clone(), std::time::Instant::now()),
+        );
     }
     tracing::info!(device = %target.device_id, "peer: paired");
     Ok(target.name)
@@ -1045,7 +1169,9 @@ pub async fn push(
     let (client, base, token) = connect(host, lan, device_id).await?;
     let rep = cs::reporter(host, "push");
     match project_id {
-        Some(pid) => cs::push_project_env(host, &client, &base, &token, pid, &rep, cs::LAN_STREAMS).await,
+        Some(pid) => {
+            cs::push_project_env(host, &client, &base, &token, pid, &rep, cs::LAN_STREAMS).await
+        }
         None => cs::push_env(host, &client, &base, &token, &rep, cs::LAN_STREAMS).await,
     }
 }
@@ -1062,8 +1188,17 @@ pub async fn pull(
     let rep = cs::reporter(host, "pull");
     match project_id {
         Some(pid) => {
-            cs::pull_project_env(host, &client, &base, &token, pid, target_parent, &rep, cs::LAN_STREAMS)
-                .await
+            cs::pull_project_env(
+                host,
+                &client,
+                &base,
+                &token,
+                pid,
+                target_parent,
+                &rep,
+                cs::LAN_STREAMS,
+            )
+            .await
         }
         None => cs::pull_env(host, &client, &base, &token, &rep, cs::LAN_STREAMS).await,
     }
@@ -1087,12 +1222,18 @@ pub async fn list_projects(
         std::time::Duration::from_secs(15),
     )
     .await?;
-    let s = |r: &serde_json::Value, k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let s = |r: &serde_json::Value, k: &str| {
+        r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    };
     Ok(rows
         .iter()
         .filter_map(|r| {
             let id = r.get("id")?.as_str()?.to_string();
-            Some(cs::RemoteProject { id, name: s(r, "name"), root_path: s(r, "root_path") })
+            Some(cs::RemoteProject {
+                id,
+                name: s(r, "name"),
+                root_path: s(r, "root_path"),
+            })
         })
         .collect())
 }
@@ -1132,7 +1273,9 @@ pub async fn local_meta(host: &HostRef) -> Result<Vec<LocalMetaItem>, String> {
             name: i.name.clone(),
         })
         .collect();
-    out.sort_by(|a, b| (a.category.as_str(), a.name.as_str()).cmp(&(b.category.as_str(), b.name.as_str())));
+    out.sort_by(|a, b| {
+        (a.category.as_str(), a.name.as_str()).cmp(&(b.category.as_str(), b.name.as_str()))
+    });
     Ok(out)
 }
 
@@ -1217,7 +1360,12 @@ pub async fn request_approval(
         .filter(|a| *a)
         .and_then(|_| body.get("ticket").and_then(|v| v.as_str()))
         .map(str::to_string)
-        .ok_or_else(|| format!("{} declined (or didn't answer in time)", peer.display_name()))
+        .ok_or_else(|| {
+            format!(
+                "{} declined (or didn't answer in time)",
+                peer.display_name()
+            )
+        })
 }
 
 /// Push or pull the picked projects and metadata items with a paired device.
@@ -1245,30 +1393,59 @@ pub async fn sync_items(
         kind: direction.to_string(),
         projects: projects
             .iter()
-            .map(|p| consent::RequestedProject { id: p.id.clone(), name: p.name.clone(), exists: false })
+            .map(|p| consent::RequestedProject {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                exists: false,
+            })
             .collect(),
         meta: meta.clone(),
         ..Default::default()
     };
     let ticket = request_approval(host, lan, device_id, &request).await?;
 
-    let mut out = SyncItemsResult { projects_ok: 0, failures: Vec::new(), meta: None };
+    let mut out = SyncItemsResult {
+        projects_ok: 0,
+        failures: Vec::new(),
+        meta: None,
+    };
     for p in projects {
-        let label = if p.name.is_empty() { p.id.clone() } else { p.name.clone() };
+        let label = if p.name.is_empty() {
+            p.id.clone()
+        } else {
+            p.name.clone()
+        };
         let handle = crate::transfers::begin(host.emitter(), direction, &label, &peer_name, 0, 0);
-        let rep = crate::cloud_sync::SyncReporter::with_transfer(direction, host.emitter(), handle.clone());
+        let rep = crate::cloud_sync::SyncReporter::with_transfer(
+            direction,
+            host.emitter(),
+            handle.clone(),
+        );
         let res = async {
             let (c, b, t) = connect_with(
                 host,
                 lan,
                 device_id,
-                &[(super::TICKET_HEADER, ticket.clone()), (super::PROJECT_HEADER, p.id.clone())],
+                &[
+                    (super::TICKET_HEADER, ticket.clone()),
+                    (super::PROJECT_HEADER, p.id.clone()),
+                ],
             )
             .await?;
             if direction == "push" {
                 cs::push_project_env(host, &c, &b, &t, p.id.clone(), &rep, cs::LAN_STREAMS).await
             } else {
-                cs::pull_project_env(host, &c, &b, &t, p.id.clone(), p.target_parent.clone(), &rep, cs::LAN_STREAMS).await
+                cs::pull_project_env(
+                    host,
+                    &c,
+                    &b,
+                    &t,
+                    p.id.clone(),
+                    p.target_parent.clone(),
+                    &rep,
+                    cs::LAN_STREAMS,
+                )
+                .await
             }
         }
         .await;
@@ -1281,7 +1458,13 @@ pub async fn sync_items(
 
     if !meta.is_empty() {
         let keys: std::collections::HashSet<String> = meta.iter().map(|m| m.key.clone()).collect();
-        let (c, b, t) = connect_with(host, lan, device_id, &[(super::TICKET_HEADER, ticket.clone())]).await?;
+        let (c, b, t) = connect_with(
+            host,
+            lan,
+            device_id,
+            &[(super::TICKET_HEADER, ticket.clone())],
+        )
+        .await?;
         let res: Result<crate::meta_sync::MetaApplySummary, String> = if direction == "push" {
             let mut bundle = cs::local_meta(host).await?;
             bundle.items.retain(|i| keys.contains(&i.key()));
@@ -1295,7 +1478,10 @@ pub async fn sync_items(
             if r.status().is_success() {
                 r.json().await.map_err(|e| e.to_string())
             } else {
-                Err(format!("{peer_name} refused the metadata (HTTP {})", r.status()))
+                Err(format!(
+                    "{peer_name} refused the metadata (HTTP {})",
+                    r.status()
+                ))
             }
         } else {
             let r = c
@@ -1305,9 +1491,13 @@ pub async fn sync_items(
                 .await
                 .map_err(|e| format!("Fetching metadata failed: {e}"))?;
             if !r.status().is_success() {
-                Err(format!("{peer_name} refused the metadata (HTTP {})", r.status()))
+                Err(format!(
+                    "{peer_name} refused the metadata (HTTP {})",
+                    r.status()
+                ))
             } else {
-                let mut bundle: crate::meta_sync::MetaBundle = r.json().await.map_err(|e| e.to_string())?;
+                let mut bundle: crate::meta_sync::MetaBundle =
+                    r.json().await.map_err(|e| e.to_string())?;
                 bundle.items.retain(|i| keys.contains(&i.key()));
                 cs::apply_local_meta(host, bundle, keys).await
             }
@@ -1352,7 +1542,10 @@ pub async fn start_tunnel(host: &HostRef, lan: &LanState) -> Result<String, Stri
     lan.lock().tunnel = Some(t);
     super::set_public_url(Some(url.clone()));
     tracing::info!(url, port, "peer: Cloudflare tunnel up");
-    host.emitter().emit_json("lan-status-changed", serde_json::json!({ "tunnel_url": url }));
+    host.emitter().emit_json(
+        "lan-status-changed",
+        serde_json::json!({ "tunnel_url": url }),
+    );
     Ok(url)
 }
 
@@ -1370,7 +1563,11 @@ pub async fn set_local_reach(host: &HostRef, lan: &LanState, on: bool) -> Result
     super::set_local_reach(&host.data_dir()?, on)?;
     let running = {
         let inner = lan.lock();
-        inner.identity.clone().filter(|_| inner.port != 0).map(|id| (id, inner.port))
+        inner
+            .identity
+            .clone()
+            .filter(|_| inner.port != 0)
+            .map(|id| (id, inner.port))
     };
     if let Some((id, port)) = running {
         if let Some(d) = lan.lock().mdns.take() {
@@ -1381,14 +1578,19 @@ pub async fn set_local_reach(host: &HostRef, lan: &LanState, on: bool) -> Result
             Err(e) => tracing::warn!("LAN discovery restart failed: {e}"),
         }
     }
-    host.emitter().emit_json("lan-status-changed", serde_json::json!({}));
+    host.emitter()
+        .emit_json("lan-status-changed", serde_json::json!({}));
     Ok(())
 }
 
 /// How other machines reach this one from outside the LAN: `"cloudflare"`,
 /// `"portforward"` or `"off"`. Remembered (see [`restore`]). Returns the
 /// tunnel URL in Cloudflare mode.
-pub async fn set_internet_mode(host: &HostRef, lan: &LanState, mode: &str) -> Result<Option<String>, String> {
+pub async fn set_internet_mode(
+    host: &HostRef,
+    lan: &LanState,
+    mode: &str,
+) -> Result<Option<String>, String> {
     let dir = host.data_dir()?;
     match mode {
         "cloudflare" => {
@@ -1422,7 +1624,6 @@ pub async fn restore(host: &HostRef, lan: &LanState) {
     }
 }
 
-
 /// POST `body` to `<peer>/lan<path>` on a paired device and decode JSON.
 async fn peer_post<T: serde::de::DeserializeOwned>(
     host: &HostRef,
@@ -1431,7 +1632,15 @@ async fn peer_post<T: serde::de::DeserializeOwned>(
     path: &str,
     body: serde_json::Value,
 ) -> Result<T, String> {
-    peer_post_t(host, lan, device_id, path, body, std::time::Duration::from_secs(30)).await
+    peer_post_t(
+        host,
+        lan,
+        device_id,
+        path,
+        body,
+        std::time::Duration::from_secs(30),
+    )
+    .await
 }
 
 /// [`peer_post`] with an explicit request timeout (folder listings use a
@@ -1491,7 +1700,14 @@ pub async fn preview_file(
     project_id: &str,
     path: &str,
 ) -> Result<super::files::Preview, String> {
-    peer_post(host, lan, device_id, "/api/fs/preview", serde_json::json!({ "project_id": project_id, "path": path })).await
+    peer_post(
+        host,
+        lan,
+        device_id,
+        "/api/fs/preview",
+        serde_json::json!({ "project_id": project_id, "path": path }),
+    )
+    .await
 }
 
 /// Total size of a selection on a paired device.
@@ -1501,7 +1717,14 @@ pub async fn remote_size(
     device_id: &str,
     items: &[consent::RequestedFile],
 ) -> Result<super::files::SizeInfo, String> {
-    peer_post(host, lan, device_id, "/api/fs/size", serde_json::json!({ "items": items })).await
+    peer_post(
+        host,
+        lan,
+        device_id,
+        "/api/fs/size",
+        serde_json::json!({ "items": items }),
+    )
+    .await
 }
 
 /// Which of `names` already exist in `dir` of a paired device's project.
@@ -1526,7 +1749,10 @@ pub async fn remote_conflicts(
 
 /// Which top-level names a pull of `items` would collide with in local `dest_dir`.
 pub fn local_conflicts(dest_dir: &str, items: &[consent::RequestedFile]) -> Vec<String> {
-    let names: Vec<String> = items.iter().map(|i| super::files::top_name(&i.project_name, &i.path)).collect();
+    let names: Vec<String> = items
+        .iter()
+        .map(|i| super::files::top_name(&i.project_name, &i.path))
+        .collect();
     super::files::conflicts(std::path::Path::new(dest_dir), &names)
 }
 
@@ -1553,7 +1779,11 @@ enum Fail {
 }
 
 /// Classify a peer response for the resumable loops.
-async fn classify(lan: &LanState, peer: &Peer, resp: Result<reqwest::Response, reqwest::Error>) -> Result<reqwest::Response, Fail> {
+async fn classify(
+    lan: &LanState,
+    peer: &Peer,
+    resp: Result<reqwest::Response, reqwest::Error>,
+) -> Result<reqwest::Response, Fail> {
     let r = resp.map_err(|e| Fail::Net(e.to_string()))?;
     let status = r.status();
     if matches!(status.as_u16(), 502..=504) {
@@ -1561,16 +1791,34 @@ async fn classify(lan: &LanState, peer: &Peer, resp: Result<reqwest::Response, r
     }
     if status == reqwest::StatusCode::FORBIDDEN {
         let body: serde_json::Value = r.json().await.unwrap_or_default();
-        let msg = body.get("error").and_then(|v| v.as_str()).unwrap_or("refused").to_string();
-        return Err(if msg.contains("expired") || msg.contains("needs approval") { Fail::Expired } else { Fail::Fatal(msg) });
+        let msg = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("refused")
+            .to_string();
+        return Err(
+            if msg.contains("expired") || msg.contains("needs approval") {
+                Fail::Expired
+            } else {
+                Fail::Fatal(msg)
+            },
+        );
     }
     check_response(lan, peer, r).await.map_err(Fail::Fatal)
 }
 
 /// Paused for a lost connection: wait until the device answers again (or
 /// the user cancels). Honors a user pause on top.
-async fn wait_for_peer(host: &HostRef, lan: &LanState, device_id: &str, handle: &crate::transfers::Handle, why: &str) -> Result<(), String> {
-    let name = paired(host, device_id).map(|p| p.display_name()).unwrap_or_else(|_| "the other machine".into());
+async fn wait_for_peer(
+    host: &HostRef,
+    lan: &LanState,
+    device_id: &str,
+    handle: &crate::transfers::Handle,
+    why: &str,
+) -> Result<(), String> {
+    let name = paired(host, device_id)
+        .map(|p| p.display_name())
+        .unwrap_or_else(|_| "the other machine".into());
     tracing::info!(device = %device_id, transfer = %handle.id, why, "peer: transfer paused — connection lost");
     handle.net_pause(&format!("Connection lost — waiting for {name}"));
     loop {
@@ -1609,8 +1857,16 @@ async fn checkpoint(handle: &crate::transfers::Handle) -> Result<(), String> {
 const STALL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Approval for `request`, cancellable from the tray.
-async fn approval_for(host: &HostRef, lan: &LanState, device_id: &str, request: &consent::TransferRequest, handle: &crate::transfers::Handle) -> Result<String, String> {
-    let name = paired(host, device_id).map(|p| p.display_name()).unwrap_or_default();
+async fn approval_for(
+    host: &HostRef,
+    lan: &LanState,
+    device_id: &str,
+    request: &consent::TransferRequest,
+    handle: &crate::transfers::Handle,
+) -> Result<String, String> {
+    let name = paired(host, device_id)
+        .map(|p| p.display_name())
+        .unwrap_or_default();
     // File transfers into shared projects are approved without a prompt now, so
     // this is just the handshake; a real prompt (or a "locked" refusal) still fits.
     handle.stage("waiting", "approval", &format!("Connecting to {name}…"));
@@ -1621,7 +1877,15 @@ async fn approval_for(host: &HostRef, lan: &LanState, device_id: &str, request: 
             Err("Cancelled".to_string())
         }
     }?;
-    handle.stage("running", if request.kind == "push" { "uploading" } else { "downloading" }, "");
+    handle.stage(
+        "running",
+        if request.kind == "push" {
+            "uploading"
+        } else {
+            "downloading"
+        },
+        "",
+    );
     Ok(t)
 }
 
@@ -1641,9 +1905,14 @@ async fn fetch_file(
     let offset = super::files::received_len(target, entry.size);
     if offset < entry.size || entry.size == 0 {
         let gen = crate::transfers::network_generation();
-        let (client, base, token) = connect_with(host, lan, device_id, &[(super::TICKET_HEADER, ticket.to_string())])
-            .await
-            .map_err(Fail::Net)?;
+        let (client, base, token) = connect_with(
+            host,
+            lan,
+            device_id,
+            &[(super::TICKET_HEADER, ticket.to_string())],
+        )
+        .await
+        .map_err(Fail::Net)?;
         let resp = client
             .post(format!("{base}/api/fs/read"))
             .bearer_auth(&token)
@@ -1674,7 +1943,10 @@ async fn fetch_file(
         }
         file.flush().map_err(|e| Fail::Fatal(e.to_string()))?;
         if got < entry.size {
-            return Err(Fail::Net(format!("stream ended at {got} of {} bytes", entry.size)));
+            return Err(Fail::Net(format!(
+                "stream ended at {got} of {} bytes",
+                entry.size
+            )));
         }
     }
     super::files::finish_part(target).map_err(Fail::Fatal)
@@ -1700,22 +1972,45 @@ pub async fn pull_files(
     }
     let peer = paired(host, device_id)?;
     let label = label_for_items(&items);
-    let manifest: serde_json::Value = peer_post(host, lan, device_id, "/api/fs/manifest", serde_json::json!({ "items": items })).await?;
+    let manifest: serde_json::Value = peer_post(
+        host,
+        lan,
+        device_id,
+        "/api/fs/manifest",
+        serde_json::json!({ "items": items }),
+    )
+    .await?;
     let entries: Vec<super::files::ManifestEntry> =
-        serde_json::from_value(manifest.get("entries").cloned().unwrap_or_default()).map_err(|e| e.to_string())?;
+        serde_json::from_value(manifest.get("entries").cloned().unwrap_or_default())
+            .map_err(|e| e.to_string())?;
     let total: u64 = entries.iter().map(|e| e.size).sum();
     let files = entries.iter().filter(|e| !e.is_dir).count() as u64;
-    let handle = crate::transfers::begin(host.emitter(), "pull", &label, &peer.display_name(), total, files);
+    let handle = crate::transfers::begin(
+        host.emitter(),
+        "pull",
+        &label,
+        &peer.display_name(),
+        total,
+        files,
+    );
     let archive = total >= super::files::COMPRESS_MIN_BYTES;
     if !archive {
         handle.set_can_pause();
     }
     let result = async {
-        let request = consent::TransferRequest { kind: "pull".into(), files: items.clone(), total_bytes: Some(total), ..Default::default() };
+        let request = consent::TransferRequest {
+            kind: "pull".into(),
+            files: items.clone(),
+            total_bytes: Some(total),
+            ..Default::default()
+        };
         let mut ticket = approval_for(host, lan, device_id, &request, &handle).await?;
         let dest = std::path::PathBuf::from(&dest_dir);
         if archive {
-            return pull_archive(host, lan, device_id, &peer, &ticket, &items, &dest, &opts, &handle).await;
+            return pull_archive(
+                host, lan, device_id, &peer, &ticket, &items, &dest, &opts, &handle,
+            )
+            .await;
         }
         let mut tops: Vec<String> = Vec::new();
         for e in &entries {
@@ -1724,7 +2019,8 @@ pub async fn pull_files(
                 tops.push(top);
             }
         }
-        let (plan, mut summary) = super::files::plan_tops(&dest, &tops, opts.policy, &opts.renames)?;
+        let (plan, mut summary) =
+            super::files::plan_tops(&dest, &tops, opts.policy, &opts.renames)?;
         let mut done: u64 = 0;
         for entry in &entries {
             let Some(target) = super::files::planned_target(&dest, &plan, &entry.rel)? else {
@@ -1737,11 +2033,19 @@ pub async fn pull_files(
             }
             loop {
                 checkpoint(&handle).await?;
-                match fetch_file(host, lan, device_id, &peer, &ticket, entry, &target, &handle, done).await {
+                match fetch_file(
+                    host, lan, device_id, &peer, &ticket, entry, &target, &handle, done,
+                )
+                .await
+                {
                     Ok(()) => break,
                     Err(Fail::Interrupted) => continue,
-                    Err(Fail::Net(why)) => wait_for_peer(host, lan, device_id, &handle, &why).await?,
-                    Err(Fail::Expired) => ticket = approval_for(host, lan, device_id, &request, &handle).await?,
+                    Err(Fail::Net(why)) => {
+                        wait_for_peer(host, lan, device_id, &handle, &why).await?
+                    }
+                    Err(Fail::Expired) => {
+                        ticket = approval_for(host, lan, device_id, &request, &handle).await?
+                    }
                     Err(Fail::Fatal(e)) => return Err(format!("{}: {e}", entry.rel)),
                 }
             }
@@ -1753,7 +2057,12 @@ pub async fn pull_files(
         Ok(summary)
     }
     .await;
-    handle.finish(result.as_ref().map(|_| Some(dest_dir.clone())).map_err(|e| e.clone()));
+    handle.finish(
+        result
+            .as_ref()
+            .map(|_| Some(dest_dir.clone()))
+            .map_err(|e| e.clone()),
+    );
     result
 }
 
@@ -1780,13 +2089,25 @@ pub async fn push_files(
         .filter_map(|p| {
             let abs = std::path::PathBuf::from(p);
             let name = abs.file_name()?.to_string_lossy().into_owned();
-            Some((String::new(), abs.to_string_lossy().replace('\\', "/"), abs, name))
+            Some((
+                String::new(),
+                abs.to_string_lossy().replace('\\', "/"),
+                abs,
+                name,
+            ))
         })
         .collect();
-    let pack_items: Vec<super::files::PackItem> =
-        specs.iter().map(|s| super::files::PackItem { abs: s.2.clone(), name: s.3.clone() }).collect();
+    let pack_items: Vec<super::files::PackItem> = specs
+        .iter()
+        .map(|s| super::files::PackItem {
+            abs: s.2.clone(),
+            name: s.3.clone(),
+        })
+        .collect();
     let names: Vec<String> = specs.iter().map(|s| s.3.clone()).collect();
-    let entries = tokio::task::spawn_blocking(move || super::files::manifest(&specs)).await.map_err(|e| e.to_string())?;
+    let entries = tokio::task::spawn_blocking(move || super::files::manifest(&specs))
+        .await
+        .map_err(|e| e.to_string())?;
     let total: u64 = entries.iter().map(|e| e.size).sum();
     let files = entries.iter().filter(|e| !e.is_dir).count() as u64;
     let label = match names.as_slice() {
@@ -1794,7 +2115,14 @@ pub async fn push_files(
         [first, rest @ ..] => format!("{first} + {} more", rest.len()),
         [] => "files".into(),
     };
-    let handle = crate::transfers::begin(host.emitter(), "push", &label, &peer.display_name(), total, files);
+    let handle = crate::transfers::begin(
+        host.emitter(),
+        "push",
+        &label,
+        &peer.display_name(),
+        total,
+        files,
+    );
     let archive = total >= super::files::COMPRESS_MIN_BYTES;
     if !archive {
         handle.set_can_pause();
@@ -1878,7 +2206,9 @@ pub async fn push_files(
 /// Human message for a non-resumable archive step that failed.
 fn fail_text(f: Fail) -> String {
     match f {
-        Fail::Net(why) => format!("connection lost — large transfers restart from the beginning, send it again ({why})"),
+        Fail::Net(why) => format!(
+            "connection lost — large transfers restart from the beginning, send it again ({why})"
+        ),
         Fail::Expired => "the approval expired — send it again".into(),
         Fail::Interrupted => "cancelled".into(),
         Fail::Fatal(e) => e,
@@ -1915,14 +2245,40 @@ async fn pull_archive(
     handle: &std::sync::Arc<crate::transfers::Handle>,
 ) -> Result<super::files::UnpackSummary, String> {
     use futures_util::StreamExt;
-    let (c, b, t) = connect_with(host, lan, device_id, &[(super::TICKET_HEADER, ticket.to_string())]).await?;
-    let resp = classify(lan, peer, c.post(format!("{b}/api/fs/pull")).bearer_auth(&t).json(&serde_json::json!({ "items": items })).send().await)
-        .await
-        .map_err(fail_text)?;
+    let (c, b, t) = connect_with(
+        host,
+        lan,
+        device_id,
+        &[(super::TICKET_HEADER, ticket.to_string())],
+    )
+    .await?;
+    let resp = classify(
+        lan,
+        peer,
+        c.post(format!("{b}/api/fs/pull"))
+            .bearer_auth(&t)
+            .json(&serde_json::json!({ "items": items }))
+            .send()
+            .await,
+    )
+    .await
+    .map_err(fail_text)?;
     let (reader, tx) = super::files::ChannelReader::new();
-    let (dest_c, policy, renames, h) = (dest.to_path_buf(), opts.policy, opts.renames.clone(), handle.clone());
+    let (dest_c, policy, renames, h) = (
+        dest.to_path_buf(),
+        opts.policy,
+        opts.renames.clone(),
+        handle.clone(),
+    );
     let unpacker = tokio::task::spawn_blocking(move || {
-        super::files::unpack(reader, &dest_c, policy, &renames, &|| h.is_cancelled(), &|n| h.progress("downloading", n, 0))
+        super::files::unpack(
+            reader,
+            &dest_c,
+            policy,
+            &renames,
+            &|| h.is_cancelled(),
+            &|n| h.progress("downloading", n, 0),
+        )
     });
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -1948,12 +2304,20 @@ async fn push_archive(
     dest: &serde_json::Value,
     handle: &std::sync::Arc<crate::transfers::Handle>,
 ) -> Result<serde_json::Value, String> {
-    let (c, b, t) = connect_with(host, lan, device_id, &[(super::TICKET_HEADER, ticket.to_string())]).await?;
+    let (c, b, t) = connect_with(
+        host,
+        lan,
+        device_id,
+        &[(super::TICKET_HEADER, ticket.to_string())],
+    )
+    .await?;
     let (writer, rx) = super::files::ChannelWriter::new();
     let h = handle.clone();
     let packer = tokio::task::spawn_blocking(move || {
         let mut writer = writer;
-        let res = super::files::pack(&items, &mut writer, true, &|| h.is_cancelled(), &|n| h.progress("uploading", n, 0));
+        let res = super::files::pack(&items, &mut writer, true, &|| h.is_cancelled(), &|n| {
+            h.progress("uploading", n, 0)
+        });
         if let Err(e) = &res {
             writer.fail(e);
         }
@@ -1972,7 +2336,9 @@ async fn push_archive(
     .await;
     packer.await.map_err(|e| e.to_string())??;
     let r = resp.map_err(fail_text)?;
-    r.json::<serde_json::Value>().await.map_err(|e| e.to_string())
+    r.json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Upload one local file from the offset the receiver reports.
@@ -1988,14 +2354,21 @@ async fn send_file(
     base_done: u64,
 ) -> Result<(), Fail> {
     let gen = crate::transfers::network_generation();
-    let (client, base, token) = connect_with(host, lan, device_id, &[]).await.map_err(Fail::Net)?;
-    let r = classify(lan, peer, client
-        .post(format!("{base}/api/fs/upload/offset"))
-        .bearer_auth(&token)
-        .timeout(std::time::Duration::from_secs(20))
-        .json(&serde_json::json!({ "id": session_id, "rel": entry.rel }))
-        .send()
-        .await).await?;
+    let (client, base, token) = connect_with(host, lan, device_id, &[])
+        .await
+        .map_err(Fail::Net)?;
+    let r = classify(
+        lan,
+        peer,
+        client
+            .post(format!("{base}/api/fs/upload/offset"))
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(20))
+            .json(&serde_json::json!({ "id": session_id, "rel": entry.rel }))
+            .send()
+            .await,
+    )
+    .await?;
     let v: serde_json::Value = r.json().await.map_err(|e| Fail::Net(e.to_string()))?;
     if v.get("skip").and_then(|x| x.as_bool()) == Some(true) {
         return Ok(());
@@ -2004,10 +2377,14 @@ async fn send_file(
     if offset >= entry.size && entry.size > 0 {
         return Ok(());
     }
-    let mut file = tokio::fs::File::open(&entry.src).await.map_err(|e| Fail::Fatal(format!("{}: {e}", entry.src)))?;
+    let mut file = tokio::fs::File::open(&entry.src)
+        .await
+        .map_err(|e| Fail::Fatal(format!("{}: {e}", entry.src)))?;
     {
         use tokio::io::AsyncSeekExt;
-        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| Fail::Fatal(e.to_string()))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| Fail::Fatal(e.to_string()))?;
     }
     let sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(offset));
     let progress = std::sync::Arc::clone(&sent);
@@ -2020,7 +2397,8 @@ async fn send_file(
             chunk
         })
     };
-    let meta = serde_json::json!({ "id": session_id, "rel": entry.rel, "offset": offset }).to_string();
+    let meta =
+        serde_json::json!({ "id": session_id, "rel": entry.rel, "offset": offset }).to_string();
     let send = client
         .post(format!("{base}/api/fs/upload/chunk"))
         .bearer_auth(&token)
@@ -2051,7 +2429,10 @@ async fn send_file(
     let v: serde_json::Value = r.json().await.map_err(|e| Fail::Net(e.to_string()))?;
     let received = v.get("received").and_then(|x| x.as_u64()).unwrap_or(0);
     if received < entry.size && v.get("skipped").is_none() {
-        return Err(Fail::Net(format!("receiver has {received} of {} bytes", entry.size)));
+        return Err(Fail::Net(format!(
+            "receiver has {received} of {} bytes",
+            entry.size
+        )));
     }
     Ok(())
 }
@@ -2061,21 +2442,40 @@ fn label_for_items(items: &[consent::RequestedFile]) -> String {
     match items {
         [] => "files".into(),
         [one] => super::files::top_name(&one.project_name, &one.path),
-        [first, rest @ ..] => format!("{} + {} more", super::files::top_name(&first.project_name, &first.path), rest.len()),
+        [first, rest @ ..] => format!(
+            "{} + {} more",
+            super::files::top_name(&first.project_name, &first.path),
+            rest.len()
+        ),
     }
 }
 
 /// Ask a paired device for one-time permission to browse all its metadata.
-pub async fn request_meta_access(host: &HostRef, lan: &LanState, device_id: &str) -> Result<(), String> {
-    let request = consent::TransferRequest { kind: "meta_access".into(), meta_access: true, ..Default::default() };
-    request_approval(host, lan, device_id, &request).await.map(|_| ())
+pub async fn request_meta_access(
+    host: &HostRef,
+    lan: &LanState,
+    device_id: &str,
+) -> Result<(), String> {
+    let request = consent::TransferRequest {
+        kind: "meta_access".into(),
+        meta_access: true,
+        ..Default::default()
+    };
+    request_approval(host, lan, device_id, &request)
+        .await
+        .map(|_| ())
 }
 
 /// A paired device's metadata for browsing: `granted = false` means only
 /// what it shares, as hashes (ask with [`request_meta_access`]).
-pub async fn meta_browse(host: &HostRef, lan: &LanState, device_id: &str) -> Result<serde_json::Value, String> {
+pub async fn meta_browse(
+    host: &HostRef,
+    lan: &LanState,
+    device_id: &str,
+) -> Result<serde_json::Value, String> {
     let peer = paired(host, device_id)?;
-    let (client, base, token) = connect_with(host, lan, device_id, &[("x-rustic-meta-view", "1".into())]).await?;
+    let (client, base, token) =
+        connect_with(host, lan, device_id, &[("x-rustic-meta-view", "1".into())]).await?;
     let resp = client
         .get(format!("{base}/api/sync/meta"))
         .bearer_auth(&token)
@@ -2097,7 +2497,10 @@ pub async fn meta_browse(host: &HostRef, lan: &LanState, device_id: &str) -> Res
 pub fn set_meta_view(host: &HostRef, device_id: &str, allowed: bool) -> Result<(), String> {
     let dir = host.data_dir()?;
     let mut peers = super::load_peers(&dir);
-    let p = peers.iter_mut().find(|p| p.device_id == device_id).ok_or("That device is not paired")?;
+    let p = peers
+        .iter_mut()
+        .find(|p| p.device_id == device_id)
+        .ok_or("That device is not paired")?;
     p.meta_view = allowed;
     super::save_peers(&dir, &peers)
 }
@@ -2111,7 +2514,11 @@ mod pair_failure_tests {
     fn pair_refusals_explain_why_no_prompt_appeared() {
         let none = json!({});
         assert_eq!(
-            pair_failure_message("Mac", 423, &json!({ "error": "Mac is locked — try again once it's unlocked" })),
+            pair_failure_message(
+                "Mac",
+                423,
+                &json!({ "error": "Mac is locked — try again once it's unlocked" })
+            ),
             "Mac is locked — try again once it's unlocked"
         );
         assert!(pair_failure_message("Mac", 423, &none).contains("locked"));

@@ -89,10 +89,7 @@ fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
             }
             return Some(full);
         }
-        let popped = match probe.file_name().map(|s| s.to_os_string()) {
-            Some(s) => s,
-            None => return None,
-        };
+        let popped = probe.file_name().map(|s| s.to_os_string())?;
         tail.push(popped);
         if !probe.pop() {
             return None;

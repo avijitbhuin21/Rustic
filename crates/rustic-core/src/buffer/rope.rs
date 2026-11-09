@@ -330,98 +330,6 @@ impl Buffer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// is_modified must use the hash, not "undo stack non-empty" — undoing back
-    /// to the original content should report unmodified.
-    #[test]
-    fn is_modified_undo_to_original() {
-        let mut buf = Buffer::from_string("hello");
-        assert!(!buf.is_modified(), "fresh buffer is not modified");
-
-        let edit = Edit {
-            byte_offset: 5,
-            old_text: String::new(),
-            new_text: " world".to_string(),
-        };
-        buf.apply_edit(edit).unwrap();
-        assert!(buf.is_modified(), "after insert -> modified");
-
-        buf.undo();
-        assert!(
-            !buf.is_modified(),
-            "undo back to original content -> unmodified (got modified)"
-        );
-    }
-
-    /// Saving updates saved_hash so subsequent identical reads report unmodified.
-    #[test]
-    fn save_resets_modified_state() {
-        let dir = std::env::temp_dir().join(format!("rustic-rope-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("x.txt");
-        std::fs::write(&path, "abc").unwrap();
-
-        let mut buf = Buffer::from_file(&path).unwrap();
-        assert!(!buf.is_modified());
-        let edit = Edit {
-            byte_offset: 3,
-            old_text: String::new(),
-            new_text: "d".to_string(),
-        };
-        buf.apply_edit(edit).unwrap();
-        assert!(buf.is_modified());
-
-        buf.save().unwrap();
-        assert!(!buf.is_modified(), "after save -> unmodified");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Non-UTF-8 bytes are decoded with from_utf8_lossy and the buffer reports
-    /// was_lossy=true so the UI can warn before saving.
-    #[test]
-    fn non_utf8_falls_back_to_lossy() {
-        let dir = std::env::temp_dir().join(format!("rustic-rope-lossy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("binary.dat");
-        std::fs::write(&path, [0xff, 0xfe, b'a', b'b']).unwrap();
-
-        let buf = Buffer::from_file(&path).unwrap();
-        assert!(buf.was_lossy, "non-UTF-8 file should be flagged was_lossy");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// reload_from_disk discards in-memory edits and matches disk.
-    #[test]
-    fn reload_discards_edits() {
-        let dir = std::env::temp_dir().join(format!("rustic-rope-reload-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("y.txt");
-        std::fs::write(&path, "disk").unwrap();
-
-        let mut buf = Buffer::from_file(&path).unwrap();
-        let edit = Edit {
-            byte_offset: 4,
-            old_text: String::new(),
-            new_text: "X".to_string(),
-        };
-        buf.apply_edit(edit).unwrap();
-        assert!(buf.is_modified());
-
-        // External change: rewrite the file
-        std::fs::write(&path, "external").unwrap();
-        buf.reload_from_disk().unwrap();
-        assert_eq!(buf.rope.to_string(), "external");
-        assert!(!buf.is_modified());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
 fn detect_language(path: &std::path::Path) -> Option<String> {
     // Check for special filenames first
     let file_name = path.file_name()?.to_str()?;
@@ -615,9 +523,12 @@ fn detect_from_shebang(first_line: &str) -> Option<&'static str> {
         Some("javascript")
     } else if shebang.contains("ruby") {
         Some("ruby")
-    } else if shebang.contains("perl") {
-        Some("bash") // closest grammar
-    } else if shebang.contains("bash") || shebang.contains("/sh") || shebang.contains("zsh") {
+    } else if shebang.contains("perl")
+        || shebang.contains("bash")
+        || shebang.contains("/sh")
+        || shebang.contains("zsh")
+    {
+        // perl has no grammar; bash is the closest
         Some("bash")
     } else if shebang.contains("php") {
         Some("php")
@@ -1153,4 +1064,96 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// is_modified must use the hash, not "undo stack non-empty" — undoing back
+    /// to the original content should report unmodified.
+    #[test]
+    fn is_modified_undo_to_original() {
+        let mut buf = Buffer::from_string("hello");
+        assert!(!buf.is_modified(), "fresh buffer is not modified");
+
+        let edit = Edit {
+            byte_offset: 5,
+            old_text: String::new(),
+            new_text: " world".to_string(),
+        };
+        buf.apply_edit(edit).unwrap();
+        assert!(buf.is_modified(), "after insert -> modified");
+
+        buf.undo();
+        assert!(
+            !buf.is_modified(),
+            "undo back to original content -> unmodified (got modified)"
+        );
+    }
+
+    /// Saving updates saved_hash so subsequent identical reads report unmodified.
+    #[test]
+    fn save_resets_modified_state() {
+        let dir = std::env::temp_dir().join(format!("rustic-rope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.txt");
+        std::fs::write(&path, "abc").unwrap();
+
+        let mut buf = Buffer::from_file(&path).unwrap();
+        assert!(!buf.is_modified());
+        let edit = Edit {
+            byte_offset: 3,
+            old_text: String::new(),
+            new_text: "d".to_string(),
+        };
+        buf.apply_edit(edit).unwrap();
+        assert!(buf.is_modified());
+
+        buf.save().unwrap();
+        assert!(!buf.is_modified(), "after save -> unmodified");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Non-UTF-8 bytes are decoded with from_utf8_lossy and the buffer reports
+    /// was_lossy=true so the UI can warn before saving.
+    #[test]
+    fn non_utf8_falls_back_to_lossy() {
+        let dir = std::env::temp_dir().join(format!("rustic-rope-lossy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("binary.dat");
+        std::fs::write(&path, [0xff, 0xfe, b'a', b'b']).unwrap();
+
+        let buf = Buffer::from_file(&path).unwrap();
+        assert!(buf.was_lossy, "non-UTF-8 file should be flagged was_lossy");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// reload_from_disk discards in-memory edits and matches disk.
+    #[test]
+    fn reload_discards_edits() {
+        let dir = std::env::temp_dir().join(format!("rustic-rope-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("y.txt");
+        std::fs::write(&path, "disk").unwrap();
+
+        let mut buf = Buffer::from_file(&path).unwrap();
+        let edit = Edit {
+            byte_offset: 4,
+            old_text: String::new(),
+            new_text: "X".to_string(),
+        };
+        buf.apply_edit(edit).unwrap();
+        assert!(buf.is_modified());
+
+        // External change: rewrite the file
+        std::fs::write(&path, "external").unwrap();
+        buf.reload_from_disk().unwrap();
+        assert_eq!(buf.rope.to_string(), "external");
+        assert!(!buf.is_modified());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

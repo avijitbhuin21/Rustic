@@ -112,7 +112,10 @@ fn caller_addr(headers: &HeaderMap, remote: Option<Remote>) -> Option<String> {
 
 /// Middleware: refuse every peer route except `/lan/info` unless the caller
 /// runs exactly our version (old builds send no version header at all).
-async fn require_same_version(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+async fn require_same_version(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
     let path = req.uri().path();
     if path.ends_with("/info") {
         return next.run(req).await;
@@ -190,7 +193,11 @@ async fn track_seen(
 /// sessions in `<data>/lan-sync-sessions`. `/lan/info` answers 503 until
 /// `lan.identity` is set (see [`super::ops::start`] / [`super::ops::start_identity_only`]).
 pub fn build_router(host: HostRef, lan: LanState, legacy_root: bool) -> Result<Router, String> {
-    let ctx = Ctx { host, lan, uploads: Arc::default() };
+    let ctx = Ctx {
+        host,
+        lan,
+        uploads: Arc::default(),
+    };
     let sessions_dir = ctx.host.data_dir()?.join("lan-sync-sessions");
     let _ = std::fs::remove_dir_all(&sessions_dir); // leftovers from a previous run
     let transfer = Arc::new(LanTransferHost {
@@ -199,7 +206,9 @@ pub fn build_router(host: HostRef, lan: LanState, legacy_root: bool) -> Result<R
     });
     let api: Router<Ctx> = Router::new()
         // Chunked, parallel, resumable sync (streamed pack ‖ send ‖ extract).
-        .merge(crate::transfer::routes::router::<LanTransferHost, Ctx>(transfer))
+        .merge(crate::transfer::routes::router::<LanTransferHost, Ctx>(
+            transfer,
+        ))
         .route("/api/sync/state", get(sync_state))
         .route(
             "/api/sync/push",
@@ -244,7 +253,10 @@ pub fn build_router(host: HostRef, lan: LanState, legacy_root: bool) -> Result<R
         router = router.merge(api);
     }
     Ok(router
-        .layer(axum::middleware::from_fn_with_state(ctx.clone(), track_seen))
+        .layer(axum::middleware::from_fn_with_state(
+            ctx.clone(),
+            track_seen,
+        ))
         .layer(axum::middleware::from_fn(require_same_version))
         .with_state(ctx))
 }
@@ -257,7 +269,11 @@ pub async fn start(host: HostRef, lan: LanState, id: Identity) -> Result<u16, St
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     let listener = bind_listener().await?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    tracing::info!(port, version = super::app_version(), "peer: LAN listener started");
+    tracing::info!(
+        port,
+        version = super::app_version(),
+        "peer: LAN listener started"
+    );
     let router = build_router(host, lan.clone(), true)?;
 
     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
@@ -299,7 +315,11 @@ async fn bind_listener() -> Result<tokio::net::TcpListener, String> {
         match tokio::net::TcpListener::bind(("0.0.0.0", super::DEFAULT_PORT)).await {
             Ok(l) => {
                 if attempt > 0 {
-                    tracing::info!(attempt, "peer: LAN port {} became free", super::DEFAULT_PORT);
+                    tracing::info!(
+                        attempt,
+                        "peer: LAN port {} became free",
+                        super::DEFAULT_PORT
+                    );
                 }
                 return Ok(l);
             }
@@ -333,7 +353,8 @@ async fn hello(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         Err(r) => return r,
     };
     ctx.emit("lan-peers-changed", json!({}));
-    Json(json!({ "ok": true, "device_id": peer.device_id, "version": super::app_version() })).into_response()
+    Json(json!({ "ok": true, "device_id": peer.device_id, "version": super::app_version() }))
+        .into_response()
 }
 
 /// `POST /lan/unpair` — a paired device forgot us; forget it too so neither
@@ -354,7 +375,10 @@ async fn unpair(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
     }
     tracing::info!(device = %peer.device_id, name = %peer.display_name(), "peer: device unpaired itself; forgot it here too");
     ctx.emit("lan-peers-changed", json!({}));
-    ctx.emit("lan-peer-unpaired", json!({ "device_id": peer.device_id, "name": peer.display_name() }));
+    ctx.emit(
+        "lan-peer-unpaired",
+        json!({ "device_id": peer.device_id, "name": peer.display_name() }),
+    );
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -387,7 +411,10 @@ async fn transfer_cancel(State(ctx): State<Ctx>, headers: HeaderMap) -> Response
     };
     let cancelled: Vec<(String, tokio::sync::oneshot::Sender<bool>)> = {
         let mut inner = ctx.lan.lock();
-        let ids = inner.transfer_by_device.remove(&peer.device_id).unwrap_or_default();
+        let ids = inner
+            .transfer_by_device
+            .remove(&peer.device_id)
+            .unwrap_or_default();
         ids.into_iter()
             .filter_map(|id| inner.pending_transfers.remove(&id).map(|tx| (id, tx)))
             .collect()
@@ -429,9 +456,14 @@ async fn pair(
         let request_id = super::random_token().unwrap_or_default();
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         // A repeated request from the same device replaces its old prompt.
-        if let Some(old) = inner.pair_by_device.insert(req.device_id.clone(), request_id.clone()) {
+        if let Some(old) = inner
+            .pair_by_device
+            .insert(req.device_id.clone(), request_id.clone())
+        {
             inner.pending_pairs.remove(&old);
-            ctx.host.emitter().emit_json("lan-pair-cancelled", json!({ "request_id": old }));
+            ctx.host
+                .emitter()
+                .emit_json("lan-pair-cancelled", json!({ "request_id": old }));
         }
         inner.pending_pairs.insert(request_id.clone(), tx);
         (id, request_id, rx)
@@ -455,7 +487,9 @@ async fn pair(
         }
         if was_pending {
             // Timed out with the prompt still open.
-            ctx.host.emitter().emit_json("lan-pair-cancelled", json!({ "request_id": request_id }));
+            ctx.host
+                .emitter()
+                .emit_json("lan-pair-cancelled", json!({ "request_id": request_id }));
         }
     }
     tracing::info!(device = %req.device_id, accepted, "peer: pairing request answered");
@@ -487,7 +521,9 @@ async fn pair(
         let mut inner = ctx.lan.lock();
         inner.mark_seen(&req.device_id, addr.clone());
         inner.needs_repair.remove(&req.device_id);
-        inner.versions.insert(req.device_id.clone(), super::app_version().to_string());
+        inner
+            .versions
+            .insert(req.device_id.clone(), super::app_version().to_string());
     }
     let peer = Peer {
         device_id: req.device_id,
@@ -555,7 +591,12 @@ async fn transfer_request(
             .state()
             .workspace
             .lock()
-            .map(|ws| ws.list_projects().into_iter().map(|p| p.id.to_string()).collect())
+            .map(|ws| {
+                ws.list_projects()
+                    .into_iter()
+                    .map(|p| p.id.to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         for p in &mut req.projects {
             p.exists = local.contains(&p.id);
@@ -588,7 +629,10 @@ async fn transfer_request(
         && req.projects.is_empty()
         && req.meta.is_empty()
         && !req.meta_access
-        && req.files.iter().all(|f| peer.share.has_project(&f.project_id));
+        && req
+            .files
+            .iter()
+            .all(|f| peer.share.has_project(&f.project_id));
     let approved = if shared_files_only {
         tracing::info!(device = %peer.device_id, kind = %req.kind, "peer: auto-approved (shared project)");
         ctx.emit("lan-transfer-auto-accepted", payload);
@@ -615,7 +659,10 @@ async fn transfer_request(
         );
         let mut inner = ctx.lan.lock();
         if inner.pending_transfers.remove(&request_id).is_some() {
-            ctx.host.emitter().emit_json("lan-transfer-cancelled", json!({ "request_id": request_id }));
+            ctx.host.emitter().emit_json(
+                "lan-transfer-cancelled",
+                json!({ "request_id": request_id }),
+            );
         }
         if let Some(ids) = inner.transfer_by_device.get_mut(&peer.device_id) {
             ids.retain(|i| i != &request_id);
@@ -639,17 +686,25 @@ async fn transfer_request(
     let ticket_id = super::random_token().unwrap_or_default();
     {
         let mut inner = ctx.lan.lock();
-        inner.tickets.retain(|_, t| t.expires > std::time::Instant::now());
         inner
             .tickets
-            .insert(ticket_id.clone(), consent::Ticket::for_request(&peer.device_id, &req));
+            .retain(|_, t| t.expires > std::time::Instant::now());
+        inner.tickets.insert(
+            ticket_id.clone(),
+            consent::Ticket::for_request(&peer.device_id, &req),
+        );
     }
     Json(json!({ "approved": true, "ticket": ticket_id })).into_response()
 }
 
 /// The approved ticket on this request, if it lets `peer` do a `kind` transfer.
 #[allow(clippy::result_large_err)]
-fn ticket(ctx: &Ctx, headers: &HeaderMap, peer: &Peer, kind: &str) -> Result<consent::Ticket, Response> {
+fn ticket(
+    ctx: &Ctx,
+    headers: &HeaderMap,
+    peer: &Peer,
+    kind: &str,
+) -> Result<consent::Ticket, Response> {
     let id = headers
         .get(super::TICKET_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -664,7 +719,12 @@ fn ticket(ctx: &Ctx, headers: &HeaderMap, peer: &Peer, kind: &str) -> Result<con
         .tickets
         .get_mut(id)
         .filter(|t| t.valid_for(&peer.device_id, kind))
-        .ok_or_else(|| err(StatusCode::FORBIDDEN, "approval expired or doesn't cover this — ask again"))?;
+        .ok_or_else(|| {
+            err(
+                StatusCode::FORBIDDEN,
+                "approval expired or doesn't cover this — ask again",
+            )
+        })?;
     // Keep an approval alive while its transfer is still moving.
     t.expires = std::time::Instant::now() + consent::TICKET_TTL;
     Ok(t.clone())
@@ -723,7 +783,9 @@ fn apply_incoming(
     source: Box<dyn std::io::Read + Send>,
     scoped: bool,
 ) -> Result<crate::cloud_sync::SyncManifest, String> {
-    use crate::cloud_sync::{apply_project_archive_from, apply_sync_archive_from, SyncProjectEntry};
+    use crate::cloud_sync::{
+        apply_project_archive_from, apply_sync_archive_from, SyncProjectEntry,
+    };
     let dir = host.data_dir()?;
     let emitter = host.emitter();
     let reporter = crate::cloud_sync::SyncReporter::new("pull", emitter.clone());
@@ -792,12 +854,16 @@ impl crate::transfer::routes::TransferHost for LanTransferHost {
         let scoped = match kind {
             "project" => true,
             "full" => {
-                return Err("full-environment sync isn't available between desktops — pick projects".to_string())
+                return Err(
+                    "full-environment sync isn't available between desktops — pick projects"
+                        .to_string(),
+                )
             }
             other => return Err(format!("unknown archive kind: {other}")),
         };
         let peer = authorize(&self.ctx, headers).map_err(|_| "not paired".to_string())?;
-        let t = ticket(&self.ctx, headers, &peer, "push").map_err(|_| "push not approved".to_string())?;
+        let t = ticket(&self.ctx, headers, &peer, "push")
+            .map_err(|_| "push not approved".to_string())?;
         let project = headers
             .get(super::PROJECT_HEADER)
             .and_then(|v| v.to_str().ok())
@@ -826,7 +892,8 @@ impl crate::transfer::routes::TransferHost for LanTransferHost {
             project_id,
         } = serde_json::from_value(body.clone()).map_err(|e| format!("bad pull request: {e}"))?;
         let peer = authorize(&self.ctx, headers).map_err(|_| "not paired".to_string())?;
-        let t = ticket(&self.ctx, headers, &peer, "pull").map_err(|_| "pull not approved".to_string())?;
+        let t = ticket(&self.ctx, headers, &peer, "pull")
+            .map_err(|_| "pull not approved".to_string())?;
         pull_allowed(&peer, &t, project_id.as_deref())?;
         let ctx = self.ctx.clone();
         Ok(Box::new(move |sink| {
@@ -840,7 +907,9 @@ impl crate::transfer::routes::TransferHost for LanTransferHost {
 /// A pull may only take one project at a time that is both approved and shared.
 fn pull_allowed(peer: &Peer, t: &consent::Ticket, project_id: Option<&str>) -> Result<(), String> {
     let Some(pid) = project_id else {
-        return Err("full-environment sync isn't available between desktops — pick projects".into());
+        return Err(
+            "full-environment sync isn't available between desktops — pick projects".into(),
+        );
     };
     if !t.projects.contains(pid) {
         return Err("this project wasn't in the approved pull".into());
@@ -867,7 +936,10 @@ async fn sync_push(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Re
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !t.projects.contains(project) {
-        return err(StatusCode::FORBIDDEN, "this project wasn't in the approved push");
+        return err(
+            StatusCode::FORBIDDEN,
+            "this project wasn't in the approved push",
+        );
     }
     let dir = match data_dir(&ctx) {
         Ok(d) => d,
@@ -904,7 +976,10 @@ async fn sync_push(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Re
             .map(|m| m.project_scoped)
             .unwrap_or(false);
         if !scoped {
-            return Err("full-environment sync isn't available between desktops — pick projects".to_string());
+            return Err(
+                "full-environment sync isn't available between desktops — pick projects"
+                    .to_string(),
+            );
         }
         let file = std::fs::File::open(&tmp_apply).map_err(|e| e.to_string())?;
         apply_incoming(&host, Box::new(file), scoped)
@@ -1122,13 +1197,21 @@ struct FsPathBody {
 #[allow(clippy::result_large_err)]
 fn shared_root(ctx: &Ctx, peer: &Peer, project_id: &str) -> Result<PathBuf, Response> {
     if !peer.share.has_project(project_id) {
-        return Err(err(StatusCode::FORBIDDEN, "that project isn't shared with you"));
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "that project isn't shared with you",
+        ));
     }
-    super::files::project_root(ctx.host.state(), project_id).map_err(|e| err(StatusCode::NOT_FOUND, e))
+    super::files::project_root(ctx.host.state(), project_id)
+        .map_err(|e| err(StatusCode::NOT_FOUND, e))
 }
 
 /// `POST /api/fs/list` — one folder of a shared project (no approval needed).
-async fn fs_list(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsPathBody>) -> Response {
+async fn fs_list(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<FsPathBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1145,7 +1228,11 @@ async fn fs_list(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsPat
 }
 
 /// `POST /api/fs/preview` — one file of a shared project, loaded on demand.
-async fn fs_preview(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsPathBody>) -> Response {
+async fn fs_preview(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<FsPathBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1168,7 +1255,11 @@ struct FsItemsBody {
 
 /// Absolute paths + archive names for `items`, all inside shared projects.
 #[allow(clippy::result_large_err)]
-fn resolve_items(ctx: &Ctx, peer: &Peer, items: &[consent::RequestedFile]) -> Result<Vec<super::files::PackItem>, Response> {
+fn resolve_items(
+    ctx: &Ctx,
+    peer: &Peer,
+    items: &[consent::RequestedFile],
+) -> Result<Vec<super::files::PackItem>, Response> {
     let mut out = Vec::new();
     for it in items {
         let root = shared_root(ctx, peer, &it.project_id)?;
@@ -1182,7 +1273,11 @@ fn resolve_items(ctx: &Ctx, peer: &Peer, items: &[consent::RequestedFile]) -> Re
 }
 
 /// `POST /api/fs/size` — total bytes / files of a selection (for the ETA).
-async fn fs_size(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsItemsBody>) -> Response {
+async fn fs_size(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<FsItemsBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1207,7 +1302,11 @@ struct FsExistsBody {
 }
 
 /// `POST /api/fs/exists` — which upload names already exist in a folder.
-async fn fs_exists(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsExistsBody>) -> Response {
+async fn fs_exists(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<FsExistsBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1225,7 +1324,11 @@ async fn fs_exists(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsE
 
 /// `POST /api/fs/pull` — stream the approved selection as a tar (zstd above
 /// [`super::files::COMPRESS_MIN_BYTES`]).
-async fn fs_pull(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsItemsBody>) -> Response {
+async fn fs_pull(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<FsItemsBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1234,8 +1337,15 @@ async fn fs_pull(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsIte
         Ok(t) => t,
         Err(r) => return r,
     };
-    if let Some(f) = b.items.iter().find(|f| !t.covers_file(&f.project_id, &f.path)) {
-        return err(StatusCode::FORBIDDEN, format!("{} wasn't in the approved pull", f.path));
+    if let Some(f) = b
+        .items
+        .iter()
+        .find(|f| !t.covers_file(&f.project_id, &f.path))
+    {
+        return err(
+            StatusCode::FORBIDDEN,
+            format!("{} wasn't in the approved pull", f.path),
+        );
     }
     let items = match resolve_items(&ctx, &peer, &b.items) {
         Ok(i) => i,
@@ -1248,11 +1358,20 @@ async fn fs_pull(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsIte
     let peer_name = peer.display_name();
     tokio::task::spawn_blocking(move || {
         let size = super::files::measure(&items.iter().map(|i| i.abs.clone()).collect::<Vec<_>>());
-        let handle = crate::transfers::begin(host.emitter(), "push", &label, &peer_name, size.bytes, size.files);
+        let handle = crate::transfers::begin(
+            host.emitter(),
+            "push",
+            &label,
+            &peer_name,
+            size.bytes,
+            size.files,
+        );
         let mut writer = writer;
         let h = handle.clone();
         let compress = size.bytes >= super::files::COMPRESS_MIN_BYTES;
-        let res = super::files::pack(&items, &mut writer, compress, &|| h.is_cancelled(), &|n| h.progress("uploading", n, 0));
+        let res = super::files::pack(&items, &mut writer, compress, &|| h.is_cancelled(), &|n| {
+            h.progress("uploading", n, 0)
+        });
         if let Err(e) = &res {
             writer.fail(e);
         }
@@ -1271,7 +1390,11 @@ fn label_for(items: &[consent::RequestedFile]) -> String {
     match items {
         [] => "files".into(),
         [one] => super::files::top_name(&one.project_name, &one.path),
-        [first, rest @ ..] => format!("{} + {} more", super::files::top_name(&first.project_name, &first.path), rest.len()),
+        [first, rest @ ..] => format!(
+            "{} + {} more",
+            super::files::top_name(&first.project_name, &first.path),
+            rest.len()
+        ),
     }
 }
 
@@ -1314,7 +1437,10 @@ async fn fs_push(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Resp
         None => return err(StatusCode::BAD_REQUEST, "missing upload destination"),
     };
     if !t.covers_file(&dest.project_id, &dest.dir) {
-        return err(StatusCode::FORBIDDEN, "this folder wasn't in the approved upload");
+        return err(
+            StatusCode::FORBIDDEN,
+            "this folder wasn't in the approved upload",
+        );
     }
     let root = match super::files::project_root(ctx.host.state(), &dest.project_id) {
         Ok(r) => r,
@@ -1329,7 +1455,11 @@ async fn fs_push(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Resp
     let handle = crate::transfers::begin(
         ctx.host.emitter(),
         "pull",
-        if dest.label.is_empty() { "files" } else { &dest.label },
+        if dest.label.is_empty() {
+            "files"
+        } else {
+            &dest.label
+        },
         &peer.display_name(),
         dest.total_bytes,
         0,
@@ -1337,7 +1467,14 @@ async fn fs_push(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Resp
     let h = handle.clone();
     let dir_c = dir.clone();
     let unpacker = tokio::task::spawn_blocking(move || {
-        super::files::unpack(reader, &dir_c, dest.policy, &dest.renames, &|| h.is_cancelled(), &|n| h.progress("downloading", n, 0))
+        super::files::unpack(
+            reader,
+            &dir_c,
+            dest.policy,
+            &dest.renames,
+            &|| h.is_cancelled(),
+            &|n| h.progress("downloading", n, 0),
+        )
     });
     {
         use futures_util::StreamExt;
@@ -1352,7 +1489,11 @@ async fn fs_push(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Resp
         drop(tx);
     }
     let res = unpacker.await.map_err(|e| e.to_string()).and_then(|r| r);
-    handle.finish(res.as_ref().map(|_| Some(dir.to_string_lossy().into_owned())).map_err(|e| e.clone()));
+    handle.finish(
+        res.as_ref()
+            .map(|_| Some(dir.to_string_lossy().into_owned()))
+            .map_err(|e| e.clone()),
+    );
     match res {
         Ok(summary) => {
             ctx.emit(
@@ -1367,7 +1508,11 @@ async fn fs_push(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Resp
 
 /// `POST /api/fs/manifest` — every file/folder of a selection in sending order
 /// (resumable pulls fetch them one by one). Share-gated, no approval needed.
-async fn fs_manifest(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsItemsBody>) -> Response {
+async fn fs_manifest(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<FsItemsBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1382,7 +1527,12 @@ async fn fs_manifest(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<F
             Ok(r) => r,
             Err(e) => return err(StatusCode::BAD_REQUEST, e),
         };
-        specs.push((it.project_id.clone(), it.path.trim_matches('/').to_string(), root.join(rel), super::files::top_name(&it.project_name, &it.path)));
+        specs.push((
+            it.project_id.clone(),
+            it.path.trim_matches('/').to_string(),
+            root.join(rel),
+            super::files::top_name(&it.project_name, &it.path),
+        ));
     }
     match tokio::task::spawn_blocking(move || super::files::manifest(&specs)).await {
         Ok(entries) => {
@@ -1403,7 +1553,11 @@ struct FsReadBody {
 }
 
 /// `POST /api/fs/read` — one approved file's bytes from `offset` (resume).
-async fn fs_read(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsReadBody>) -> Response {
+async fn fs_read(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<FsReadBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1413,7 +1567,10 @@ async fn fs_read(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsRea
         Err(r) => return r,
     };
     if !t.covers_file(&b.project_id, &b.path) {
-        return err(StatusCode::FORBIDDEN, format!("{} wasn't in the approved pull", b.path));
+        return err(
+            StatusCode::FORBIDDEN,
+            format!("{} wasn't in the approved pull", b.path),
+        );
     }
     let root = match shared_root(&ctx, &peer, &b.project_id) {
         Ok(r) => r,
@@ -1429,7 +1586,10 @@ async fn fs_read(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsRea
     };
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
     if b.offset > len {
-        return err(StatusCode::RANGE_NOT_SATISFIABLE, "offset past the end of the file");
+        return err(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "offset past the end of the file",
+        );
     }
     {
         use tokio::io::AsyncSeekExt;
@@ -1440,7 +1600,10 @@ async fn fs_read(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<FsRea
     let stream = tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024);
     let mut resp = Body::from_stream(stream).into_response();
     let h = resp.headers_mut();
-    h.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/octet-stream"));
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
     if let Ok(v) = (len - b.offset).to_string().parse() {
         h.insert(axum::http::header::CONTENT_LENGTH, v);
     }
@@ -1468,7 +1631,11 @@ const UPLOAD_EXPIRE_SECS: u64 = 2 * 60 * 60;
 
 /// `POST /api/fs/upload/begin` — open a resumable upload into a folder of one
 /// of our projects (approved push). Name clashes are planned once here.
-async fn upload_begin(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<UploadBeginBody>) -> Response {
+async fn upload_begin(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<UploadBeginBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1478,7 +1645,10 @@ async fn upload_begin(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<
         Err(r) => return r,
     };
     if !t.covers_file(&b.project_id, &b.dir) {
-        return err(StatusCode::FORBIDDEN, "this folder wasn't in the approved upload");
+        return err(
+            StatusCode::FORBIDDEN,
+            "this folder wasn't in the approved upload",
+        );
     }
     let root = match super::files::project_root(ctx.host.state(), &b.project_id) {
         Ok(r) => r,
@@ -1509,22 +1679,42 @@ async fn upload_begin(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<
     }
     let total: u64 = b.entries.iter().map(|e| e.size).sum();
     let files = b.entries.iter().filter(|e| !e.is_dir).count() as u64;
-    let label = if b.label.is_empty() { "files".to_string() } else { b.label.clone() };
-    let handle = crate::transfers::begin(ctx.host.emitter(), "pull", &label, &peer.display_name(), total, files);
-    let id = super::random_token().map(|t| t[..24].to_string()).unwrap_or_default();
+    let label = if b.label.is_empty() {
+        "files".to_string()
+    } else {
+        b.label.clone()
+    };
+    let handle = crate::transfers::begin(
+        ctx.host.emitter(),
+        "pull",
+        &label,
+        &peer.display_name(),
+        total,
+        files,
+    );
+    let id = super::random_token()
+        .map(|t| t[..24].to_string())
+        .unwrap_or_default();
     let session = Arc::new(UploadSession {
         device_id: peer.device_id.clone(),
         peer_name: peer.display_name(),
         dest: dest.clone(),
         plan,
-        sizes: b.entries.iter().map(|e| (e.rel.clone(), (e.is_dir, e.size))).collect(),
+        sizes: b
+            .entries
+            .iter()
+            .map(|e| (e.rel.clone(), (e.is_dir, e.size)))
+            .collect(),
         summary: std::sync::Mutex::new(summary),
         received: std::sync::atomic::AtomicU64::new(0),
         last_chunk: std::sync::Mutex::new(std::time::Instant::now()),
         handle,
         done: std::sync::atomic::AtomicBool::new(false),
     });
-    ctx.uploads.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), Arc::clone(&session));
+    ctx.uploads
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(id.clone(), Arc::clone(&session));
     tracing::info!(device = %peer.device_id, dest = %dest.display(), files, total, "peer: upload session opened");
     // Show stalls on this side's tray and drop abandoned sessions.
     let (uploads, sid, s) = (ctx.uploads.clone(), id.clone(), Arc::clone(&session));
@@ -1535,14 +1725,26 @@ async fn upload_begin(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<
             if s.done.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            let idle = s.last_chunk.lock().unwrap_or_else(|p| p.into_inner()).elapsed().as_secs();
+            let idle = s
+                .last_chunk
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .elapsed()
+                .as_secs();
             if idle >= UPLOAD_EXPIRE_SECS {
-                s.handle.finish(Err(format!("{} didn't reconnect — upload abandoned", s.peer_name)));
-                uploads.lock().unwrap_or_else(|p| p.into_inner()).remove(&sid);
+                s.handle.finish(Err(format!(
+                    "{} didn't reconnect — upload abandoned",
+                    s.peer_name
+                )));
+                uploads
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&sid);
                 return;
             }
             if idle >= UPLOAD_STALL_SECS && !paused {
-                s.handle.net_pause(&format!("Connection lost — waiting for {}", s.peer_name));
+                s.handle
+                    .net_pause(&format!("Connection lost — waiting for {}", s.peer_name));
                 paused = true;
             } else if idle < UPLOAD_STALL_SECS && paused {
                 s.handle.net_resume();
@@ -1562,7 +1764,12 @@ fn upload_session(ctx: &Ctx, peer: &Peer, id: &str) -> Result<Arc<UploadSession>
         .get(id)
         .filter(|s| s.device_id == peer.device_id)
         .cloned()
-        .ok_or_else(|| err(StatusCode::GONE, "upload session expired — start the upload again"))
+        .ok_or_else(|| {
+            err(
+                StatusCode::GONE,
+                "upload session expired — start the upload again",
+            )
+        })
 }
 
 #[derive(Deserialize)]
@@ -1574,14 +1781,23 @@ struct UploadFileBody {
 /// Local target of `rel` in `s` (`None` = skipped by the conflict plan).
 #[allow(clippy::result_large_err)]
 fn upload_target(s: &UploadSession, rel: &str) -> Result<Option<(PathBuf, u64)>, Response> {
-    let (_, size) = *s.sizes.get(rel).ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("{rel} isn't part of this upload")))?;
+    let (_, size) = *s.sizes.get(rel).ok_or_else(|| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("{rel} isn't part of this upload"),
+        )
+    })?;
     super::files::planned_target(&s.dest, &s.plan, rel)
         .map(|t| t.map(|t| (t, size)))
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))
 }
 
 /// `POST /api/fs/upload/offset` — bytes already received for one file.
-async fn upload_offset(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<UploadFileBody>) -> Response {
+async fn upload_offset(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<UploadFileBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1591,7 +1807,10 @@ async fn upload_offset(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json
         Err(r) => return r,
     };
     match upload_target(&s, &b.rel) {
-        Ok(Some((target, size))) => Json(json!({ "offset": super::files::received_len(&target, size), "skip": false })).into_response(),
+        Ok(Some((target, size))) => {
+            Json(json!({ "offset": super::files::received_len(&target, size), "skip": false }))
+                .into_response()
+        }
         Ok(None) => Json(json!({ "offset": 0, "skip": true })).into_response(),
         Err(r) => r,
     }
@@ -1655,7 +1874,10 @@ async fn upload_chunk(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) ->
                 return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
             }
             written += chunk.len() as u64;
-            let total = s.received.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::SeqCst) + chunk.len() as u64;
+            let total = s
+                .received
+                .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::SeqCst)
+                + chunk.len() as u64;
             s.handle.progress("downloading", total, 0);
             *s.last_chunk.lock().unwrap_or_else(|p| p.into_inner()) = std::time::Instant::now();
         }
@@ -1684,16 +1906,26 @@ struct UploadIdBody {
 /// The receiving user cancelled this upload: drop the session, mark it
 /// cancelled here, and answer 410 so the sender stops (and says why).
 fn abort_upload(ctx: &Ctx, id: &str, s: &UploadSession) -> Response {
-    ctx.uploads.lock().unwrap_or_else(|p| p.into_inner()).remove(id);
+    ctx.uploads
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(id);
     if !s.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
         s.handle.finish(Err("Cancelled".into()));
         tracing::info!(device = %s.device_id, "peer: upload cancelled by the receiver");
     }
-    err(StatusCode::GONE, format!("{} cancelled this transfer", my_name(ctx)))
+    err(
+        StatusCode::GONE,
+        format!("{} cancelled this transfer", my_name(ctx)),
+    )
 }
 
 /// `POST /api/fs/upload/finish` — close the session and report what landed.
-async fn upload_finish(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<UploadIdBody>) -> Response {
+async fn upload_finish(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Json(b): Json<UploadIdBody>,
+) -> Response {
     let peer = match authorize(&ctx, &headers) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1702,10 +1934,14 @@ async fn upload_finish(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json
         Ok(s) => s,
         Err(r) => return r,
     };
-    ctx.uploads.lock().unwrap_or_else(|p| p.into_inner()).remove(&b.id);
+    ctx.uploads
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&b.id);
     s.done.store(true, std::sync::atomic::Ordering::SeqCst);
     let summary = s.summary.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    s.handle.finish(Ok(Some(s.dest.to_string_lossy().into_owned())));
+    s.handle
+        .finish(Ok(Some(s.dest.to_string_lossy().into_owned())));
     tracing::info!(device = %peer.device_id, files = summary.files, "peer: upload finished");
     ctx.emit(
         "lan-sync-received",
@@ -1724,9 +1960,18 @@ mod tests {
         h.insert(super::super::PORT_HEADER, "47820".parse().unwrap());
         let lan: std::net::SocketAddr = "10.0.0.5:5555".parse().unwrap();
         let lo: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
-        assert_eq!(caller_addr(&h, Some(Remote(lan))).as_deref(), Some("10.0.0.5:47820"));
+        assert_eq!(
+            caller_addr(&h, Some(Remote(lan))).as_deref(),
+            Some("10.0.0.5:47820")
+        );
         assert_eq!(caller_addr(&h, Some(Remote(lo))), None);
-        h.insert(super::super::URL_HEADER, "https://x.trycloudflare.com/".parse().unwrap());
-        assert_eq!(caller_addr(&h, Some(Remote(lo))).as_deref(), Some("https://x.trycloudflare.com"));
+        h.insert(
+            super::super::URL_HEADER,
+            "https://x.trycloudflare.com/".parse().unwrap(),
+        );
+        assert_eq!(
+            caller_addr(&h, Some(Remote(lo))).as_deref(),
+            Some("https://x.trycloudflare.com")
+        );
     }
 }

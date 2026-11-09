@@ -56,7 +56,9 @@ pub fn validate_name(name: &str) -> Result<()> {
         return Err(anyhow!("name must be 1-64 characters"));
     }
     let mut chars = name.chars();
-    let first = chars.next().unwrap();
+    let Some(first) = chars.next() else {
+        return Err(anyhow!("name must be 1-64 characters"));
+    };
     if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return Err(anyhow!(
             "name must start with a lowercase letter or digit (got `{}`)",
@@ -129,6 +131,7 @@ pub fn audit(entry: &AuditEntry) {
 }
 
 /// Build a ready-to-write audit entry stamped with the current time.
+#[allow(clippy::too_many_arguments)]
 pub fn audit_entry(
     action: &str,
     kind: &str,

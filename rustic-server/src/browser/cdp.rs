@@ -41,7 +41,7 @@ pub async fn call(ws_url: &str, method: &str, params: Value) -> Result<Value, St
 
         let id: u64 = 1;
         let payload = json!({ "id": id, "method": method, "params": params });
-        ws.send(TMessage::Text(payload.to_string().into()))
+        ws.send(TMessage::Text(payload.to_string()))
             .await
             .map_err(|e| format!("CDP send failed: {e}"))?;
 

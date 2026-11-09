@@ -198,6 +198,9 @@ impl SessionManager {
     /// Declare the final size and wait for the apply result. Errors if chunks
     /// are still missing (the client resends them and calls finish again).
     pub fn finish_upload(&self, id: &str, total_size: u64) -> Result<Value, String> {
+        if total_size > super::MAX_TRANSFER_BYTES {
+            return Err("transfer exceeds the maximum size".into());
+        }
         let s = self.upload(id)?;
         s.asm.set_total(total_size);
         let missing = s.asm.missing();

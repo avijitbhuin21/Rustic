@@ -1,3 +1,7 @@
+// Every unwrap here is on a literal regex (validated by the tests) or on capture
+// group 0, which always exists for a match.
+#![allow(clippy::unwrap_used)]
+
 use regex::Regex;
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
@@ -63,9 +67,8 @@ fn highlight_to_token_class(name: &str) -> &'static str {
         "tag"
     } else if name.starts_with("constructor") {
         "type"
-    } else if name.starts_with("label") {
-        "variable"
     } else {
+        // includes "label"
         "variable"
     }
 }
@@ -129,6 +132,7 @@ fn build_capture_classes(query: &Query) -> Vec<Option<&'static str>> {
         .collect()
 }
 
+#[allow(clippy::large_enum_variant)] // one engine per buffer
 enum HighlightEngine {
     TreeSitter(TreeSitterEngine),
     Markdown(MarkdownHighlighter),
@@ -518,11 +522,7 @@ fn spans_to_lines(
                 rope.len_bytes()
             };
 
-            let span_start = if start > line_start_byte {
-                start - line_start_byte
-            } else {
-                0
-            };
+            let span_start = start.saturating_sub(line_start_byte);
             let span_end = if end < line_end_byte {
                 end - line_start_byte
             } else {

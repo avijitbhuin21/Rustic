@@ -24,7 +24,10 @@ fn http() -> Result<reqwest::Client, String> {
 }
 
 /// Log in to `url` with the saved password (or `password` when non-empty).
-async fn session(url: &str, password: Option<String>) -> Result<(reqwest::Client, String, String), String> {
+async fn session(
+    url: &str,
+    password: Option<String>,
+) -> Result<(reqwest::Client, String, String), String> {
     let base = normalize_base(url)?;
     let password = match password.filter(|p| !p.is_empty()) {
         Some(p) => p,
@@ -118,8 +121,7 @@ pub(crate) fn remembered_password(url: &str) -> Result<String, String> {
         .and_then(|a| KeychainSecretStore.get(&a).ok().flatten())
         .filter(|p| !p.is_empty());
     per_backend.or_else(legacy_password).ok_or_else(|| {
-        "No password saved for this backend — connect to it in Settings › Cloud first"
-            .to_string()
+        "No password saved for this backend — connect to it in Settings › Cloud first".to_string()
     })
 }
 
@@ -149,7 +151,16 @@ pub async fn cloud_sync_push_project(
     let reporter = pc::reporter(&host, "push");
     reporter.stage("connecting", &normalize_base(&url)?, 0, 1);
     let (client, base, token) = session(&url, None).await?;
-    pc::push_project_env(&host, &client, &base, &token, project_id, &reporter, pc::REMOTE_STREAMS).await
+    pc::push_project_env(
+        &host,
+        &client,
+        &base,
+        &token,
+        project_id,
+        &reporter,
+        pc::REMOTE_STREAMS,
+    )
+    .await
 }
 
 /// Pull ONE project's files from the server, replacing that project's local
@@ -195,7 +206,14 @@ pub async fn cloud_meta_preview(
     direction: String,
 ) -> Result<Vec<rustic_app::meta_sync::MetaDiffEntry>, String> {
     let (client, base, token) = session(&url, None).await?;
-    pc::meta_preview_env(&DesktopPeerHost::arc(&app), &client, &base, &token, &direction).await
+    pc::meta_preview_env(
+        &DesktopPeerHost::arc(&app),
+        &client,
+        &base,
+        &token,
+        &direction,
+    )
+    .await
 }
 
 /// Apply a metadata-only sync. `overwrite` lists the conflict keys the user
@@ -209,6 +227,14 @@ pub async fn cloud_meta_apply(
     only: Option<Vec<String>>,
 ) -> Result<rustic_app::meta_sync::MetaApplySummary, String> {
     let (client, base, token) = session(&url, None).await?;
-    pc::meta_apply_env(&DesktopPeerHost::arc(&app), &client, &base, &token, &direction, overwrite, only)
-        .await
+    pc::meta_apply_env(
+        &DesktopPeerHost::arc(&app),
+        &client,
+        &base,
+        &token,
+        &direction,
+        overwrite,
+        only,
+    )
+    .await
 }

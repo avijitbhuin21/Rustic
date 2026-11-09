@@ -153,9 +153,8 @@ pub fn parse_github_remote(url: &str) -> Option<String> {
         .or_else(|| url.strip_prefix("git://github.com/"))?;
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
     let rest = rest.trim_end_matches('/');
-    let mut parts = rest.splitn(2, '/');
-    let owner = parts.next()?;
-    let repo = parts.next()?;
+    let (owner, repo) = rest.split_once('/')?;
+
     if owner.is_empty() || repo.is_empty() || repo.contains('/') {
         return None;
     }

@@ -575,6 +575,12 @@ pub trait ToolExecutor: Send + Sync {
 /// Built-in tool executor combining all built-in tools.
 pub struct BuiltinTools;
 
+impl Default for BuiltinTools {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BuiltinTools {
     pub fn new() -> Self {
         Self

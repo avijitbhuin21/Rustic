@@ -85,8 +85,14 @@ fn parse_action(url: &Url) -> Option<Action> {
             .cloned()
     };
     match url.path().trim_matches('/') {
-        "drag" => Some(Action::Drag { token, path: field("path")? }),
-        "drop" => Some(Action::Drop { token, dir: field("dir")? }),
+        "drag" => Some(Action::Drag {
+            token,
+            path: field("path")?,
+        }),
+        "drop" => Some(Action::Drop {
+            token,
+            dir: field("dir")?,
+        }),
         _ => None,
     }
 }
@@ -133,8 +139,7 @@ pub fn handle_navigation(app: &AppHandle, label: &str, url: &Url) -> bool {
                 .unwrap_or_else(|p| p.into_inner())
                 .as_mut()
                 .and_then(|m| m.remove(&token));
-            let Some(drag) = drag.filter(|d| d.at.elapsed() < DRAG_TTL && d.label != label)
-            else {
+            let Some(drag) = drag.filter(|d| d.at.elapsed() < DRAG_TTL && d.label != label) else {
                 return false;
             };
             let app = app.clone();
@@ -143,7 +148,12 @@ pub fn handle_navigation(app: &AppHandle, label: &str, url: &Url) -> bool {
                 let name = base_name(&drag.path);
                 notify(&app, &dst_label, &format!("Copying {name}…"), false);
                 match relay(&app, &drag.label, &drag.path, &dst_label, &dir).await {
-                    Ok(saved) => notify(&app, &dst_label, &format!("Copied {}", base_name(&saved)), false),
+                    Ok(saved) => notify(
+                        &app,
+                        &dst_label,
+                        &format!("Copied {}", base_name(&saved)),
+                        false,
+                    ),
                     Err(e) => notify(&app, &dst_label, &format!("Copy failed: {e}"), true),
                 }
             });
@@ -155,7 +165,7 @@ pub fn handle_navigation(app: &AppHandle, label: &str, url: &Url) -> bool {
 
 fn notify(app: &AppHandle, label: &str, message: &str, error: bool) {
     if let Some(w) = app.get_webview_window(label) {
-        let _ = w.eval(&status_js(message, error));
+        let _ = w.eval(status_js(message, error));
     }
 }
 
@@ -176,7 +186,10 @@ async fn login(client: &reqwest::Client, base: &str) -> Result<String, String> {
         .await
         .map_err(|e| format!("Could not reach {base}: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("{base} rejected the saved password (HTTP {})", resp.status()));
+        return Err(format!(
+            "{base} rejected the saved password (HTTP {})",
+            resp.status()
+        ));
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     body.get("token")
@@ -232,17 +245,27 @@ async fn relay(
     }
 
     let tmp_dir = std::env::temp_dir().join("rustic-dnd");
-    tokio::fs::create_dir_all(&tmp_dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&tmp_dir)
+        .await
+        .map_err(|e| e.to_string())?;
     let tmp = tmp_dir.join(uuid::Uuid::new_v4().to_string());
     let result = async {
-        let mut f = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
-        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("download failed: {e}"))? {
+        let mut f = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| e.to_string())?;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("download failed: {e}"))?
+        {
             f.write_all(&chunk).await.map_err(|e| e.to_string())?;
         }
         f.flush().await.map_err(|e| e.to_string())?;
         drop(f);
 
-        let mut f = tokio::fs::File::open(&tmp).await.map_err(|e| e.to_string())?;
+        let mut f = tokio::fs::File::open(&tmp)
+            .await
+            .map_err(|e| e.to_string())?;
         let mut offset: u64 = 0;
         let mut saved: Option<String> = None;
         loop {
@@ -279,10 +302,16 @@ async fn relay(
             let ok = r.status().is_success();
             let body: serde_json::Value = r.json().await.unwrap_or_default();
             if !ok {
-                let msg = body.get("error").and_then(|v| v.as_str()).unwrap_or("upload rejected");
+                let msg = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("upload rejected");
                 return Err(format!("upload failed: {msg}"));
             }
-            saved = body.get("path").and_then(|v| v.as_str()).map(str::to_string);
+            saved = body
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             if saved.is_none() {
                 return Err("upload failed: server returned no path".into());
             }
@@ -380,23 +409,55 @@ mod tests {
     #[test]
     fn parses_drag_and_drop() {
         assert_eq!(
-            parse_action(&url("https://rustic-dnd.invalid/drag?token=abcd-1234-ef&path=%2Fsrv%2Fa+b.txt")),
-            Some(Action::Drag { token: "abcd-1234-ef".into(), path: "/srv/a b.txt".into() })
+            parse_action(&url(
+                "https://rustic-dnd.invalid/drag?token=abcd-1234-ef&path=%2Fsrv%2Fa+b.txt"
+            )),
+            Some(Action::Drag {
+                token: "abcd-1234-ef".into(),
+                path: "/srv/a b.txt".into()
+            })
         );
         assert_eq!(
-            parse_action(&url("https://rustic-dnd.invalid/drop?token=abcd1234&dir=C%3A%5Cwork")),
-            Some(Action::Drop { token: "abcd1234".into(), dir: "C:\\work".into() })
+            parse_action(&url(
+                "https://rustic-dnd.invalid/drop?token=abcd1234&dir=C%3A%5Cwork"
+            )),
+            Some(Action::Drop {
+                token: "abcd1234".into(),
+                dir: "C:\\work".into()
+            })
         );
     }
 
     #[test]
     fn rejects_malformed() {
-        assert_eq!(parse_action(&url("https://example.com/drag?token=abcd1234&path=x")), None);
-        assert_eq!(parse_action(&url("https://rustic-dnd.invalid/drag?token=short&path=x")), None);
-        assert_eq!(parse_action(&url("https://rustic-dnd.invalid/drag?token=abcd1234")), None);
-        assert_eq!(parse_action(&url("https://rustic-dnd.invalid/drop?token=abcd1234&dir=")), None);
-        assert_eq!(parse_action(&url("https://rustic-dnd.invalid/other?token=abcd1234&dir=x")), None);
-        assert_eq!(parse_action(&url("https://rustic-dnd.invalid/drag?token=bad%21token&path=x")), None);
+        assert_eq!(
+            parse_action(&url("https://example.com/drag?token=abcd1234&path=x")),
+            None
+        );
+        assert_eq!(
+            parse_action(&url("https://rustic-dnd.invalid/drag?token=short&path=x")),
+            None
+        );
+        assert_eq!(
+            parse_action(&url("https://rustic-dnd.invalid/drag?token=abcd1234")),
+            None
+        );
+        assert_eq!(
+            parse_action(&url("https://rustic-dnd.invalid/drop?token=abcd1234&dir=")),
+            None
+        );
+        assert_eq!(
+            parse_action(&url(
+                "https://rustic-dnd.invalid/other?token=abcd1234&dir=x"
+            )),
+            None
+        );
+        assert_eq!(
+            parse_action(&url(
+                "https://rustic-dnd.invalid/drag?token=bad%21token&path=x"
+            )),
+            None
+        );
     }
 
     #[test]
@@ -416,7 +477,13 @@ mod tests {
     #[test]
     fn navigation_passes_through_normal_urls_only() {
         // Pure check of the host gate used by handle_navigation.
-        assert_ne!(url("https://backend.example.com/").host_str(), Some(SENTINEL_HOST));
-        assert_eq!(url("https://rustic-dnd.invalid/x").host_str(), Some(SENTINEL_HOST));
+        assert_ne!(
+            url("https://backend.example.com/").host_str(),
+            Some(SENTINEL_HOST)
+        );
+        assert_eq!(
+            url("https://rustic-dnd.invalid/x").host_str(),
+            Some(SENTINEL_HOST)
+        );
     }
 }

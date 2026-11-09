@@ -51,13 +51,13 @@ impl CeilingBroker {
     pub async fn wait_for_resolution(&self, request_id: &str) -> Option<CeilingResolution> {
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.insert(request_id.to_string(), tx);
         }
         match tokio::time::timeout(Duration::from_secs(86_400), rx).await {
             Ok(Ok(resolution)) => Some(resolution),
             _ => {
-                let mut pending = self.pending.lock().unwrap();
+                let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
                 pending.remove(request_id);
                 None
             }
@@ -68,7 +68,7 @@ impl CeilingBroker {
     /// pending (already responded, timed out, or never existed).
     pub fn respond(&self, request_id: &str, resolution: CeilingResolution) {
         let sender = {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.remove(request_id)
         };
         if let Some(tx) = sender {

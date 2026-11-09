@@ -118,7 +118,7 @@ impl PermissionBroker {
         let (tx, rx) = oneshot::channel();
 
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.insert(
                 request_id.clone(),
                 PendingRequest {
@@ -142,7 +142,7 @@ impl PermissionBroker {
             Ok(Ok(approved)) => approved,
             _ => {
                 // Timeout or channel closed — auto-deny and clean up
-                let mut pending = self.pending.lock().unwrap();
+                let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
                 pending.remove(&request_id);
                 false
             }
@@ -168,14 +168,17 @@ impl PermissionBroker {
     /// tool — subsequent matching ops are auto-allowed without prompting.
     pub fn respond_with_decision(&self, request_id: &str, decision: NativePermissionDecision) {
         let pending = {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.remove(request_id)
         };
         let Some(req) = pending else { return };
 
         if matches!(decision, NativePermissionDecision::AcceptForSession) {
             if let Some(sig) = req.signature.clone() {
-                let mut allowlist = self.session_allowlist.lock().unwrap();
+                let mut allowlist = self
+                    .session_allowlist
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 allowlist
                     .entry(req.task_id.clone())
                     .or_default()
@@ -191,12 +194,18 @@ impl PermissionBroker {
     /// `delete_task` so a deleted task's rules don't leak — task ids are
     /// UUIDs so reuse is unlikely, but cleaning up is cheap insurance.
     pub fn clear_for_task(&self, task_id: &str) {
-        let mut allowlist = self.session_allowlist.lock().unwrap();
+        let mut allowlist = self
+            .session_allowlist
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         allowlist.remove(task_id);
     }
 
     fn is_allowed_for_session(&self, task_id: &str, signature: &str) -> bool {
-        let allowlist = self.session_allowlist.lock().unwrap();
+        let allowlist = self
+            .session_allowlist
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         allowlist
             .get(task_id)
             .map(|set| set.contains(signature))

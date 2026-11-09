@@ -192,8 +192,9 @@ impl SessionRunManager {
         // Rotate an aged run out for draining.
         if let Some(run) = &inner.run {
             if run.started_at.elapsed() >= RUN_MAX_AGE {
-                let old = inner.run.take().unwrap();
-                inner.draining.push(old);
+                if let Some(old) = inner.run.take() {
+                    inner.draining.push(old);
+                }
             }
         }
 
@@ -219,15 +220,18 @@ impl SessionRunManager {
         );
 
         // Ensure a run.
-        if inner.run.is_none() {
-            let run_id = self.client.start_run(token).await?;
-            inner.run = Some(RunState {
-                run_id,
-                started_at: Instant::now(),
-                step_count: 0,
-            });
-        }
-        let run_id = inner.run.as_ref().unwrap().run_id.clone();
+        let run_id = match &inner.run {
+            Some(run) => run.run_id.clone(),
+            None => {
+                let run_id = self.client.start_run(token).await?;
+                inner.run = Some(RunState {
+                    run_id: run_id.clone(),
+                    started_at: Instant::now(),
+                    step_count: 0,
+                });
+                run_id
+            }
+        };
 
         // Ensure a session bound to `model`.
         let instance_id = self.ensure_session(inner, token, model).await?;

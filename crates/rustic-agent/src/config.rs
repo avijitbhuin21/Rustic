@@ -288,6 +288,9 @@ pub struct AiConfig {
     pub source_control: Option<SourceControlConfig>,
     #[serde(default)]
     pub budget: crate::budget::BudgetSettings,
+    /// "Auto-condense at" token cap applied to every chat. 0 = automatic.
+    #[serde(default)]
+    pub condense_threshold: u32,
 }
 
 impl AiConfig {
@@ -303,6 +306,7 @@ impl AiConfig {
             audio_input: None,
             source_control: None,
             budget: crate::budget::BudgetSettings::default(),
+            condense_threshold: 0,
         }
     }
 
@@ -329,17 +333,12 @@ impl AiConfig {
 /// Supported client-side search backends. `Mcp` means "let the user's MCP
 /// server handle it" — our code registers no `web_search` tool in that case
 /// and the MCP-registered one takes over.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum WebSearchBackend {
+    #[default]
     Tavily,
     Brave,
     Mcp,
-}
-
-impl Default for WebSearchBackend {
-    fn default() -> Self {
-        WebSearchBackend::Tavily
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

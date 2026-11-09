@@ -1,22 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum PermissionLevel {
     /// Read-only. No file writes or command execution.
     Chat,
     /// File writes and commands require per-operation user approval. (Default)
+    #[default]
     ManualEdit,
     /// File writes auto-allowed. Command execution requires user approval.
     AutoEdit,
     /// File writes and commands all auto-allowed. No approval prompts.
     FullAuto,
-}
-
-impl Default for PermissionLevel {
-    fn default() -> Self {
-        Self::ManualEdit
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,18 +46,28 @@ impl SharedPermissions {
     }
 
     pub fn level(&self) -> PermissionLevel {
-        self.inner.lock().unwrap().level.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .level
+            .clone()
     }
 
     pub fn sensitive_files_allowed(&self) -> bool {
-        self.inner.lock().unwrap().sensitive_files_allowed
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sensitive_files_allowed
     }
 
     pub fn set_level(&self, level: PermissionLevel) {
-        self.inner.lock().unwrap().level = level;
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).level = level;
     }
 
     pub fn set_sensitive_files_allowed(&self, allowed: bool) {
-        self.inner.lock().unwrap().sensitive_files_allowed = allowed;
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sensitive_files_allowed = allowed;
     }
 }

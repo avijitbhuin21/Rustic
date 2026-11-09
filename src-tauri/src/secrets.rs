@@ -136,7 +136,9 @@ impl<B: ItemBackend> Vault<B> {
             Ok(()) => {
                 legacy_clear.insert(account.to_string());
             }
-            Err(e) => tracing::warn!(account = %account, error = %e, "[secrets] legacy keychain item not removed"),
+            Err(e) => {
+                tracing::warn!(account = %account, error = %e, "[secrets] legacy keychain item not removed")
+            }
         }
     }
 
@@ -164,7 +166,9 @@ impl<B: ItemBackend> Vault<B> {
                         tracing::info!(account = %account, "[secrets] migrated legacy keychain item into vault");
                         self.clear_legacy(account, legacy_clear);
                     }
-                    Err(e) => tracing::warn!(account = %account, error = %e, "[secrets] vault migration write failed; legacy item kept"),
+                    Err(e) => {
+                        tracing::warn!(account = %account, error = %e, "[secrets] vault migration write failed; legacy item kept")
+                    }
                 }
                 Ok(Some(secret))
             }
@@ -259,14 +263,20 @@ mod tests {
 
     impl ItemBackend for FakeItems {
         fn get(&self, account: &str) -> Result<Option<String>, String> {
-            *self.reads.borrow_mut().entry(account.to_string()).or_default() += 1;
+            *self
+                .reads
+                .borrow_mut()
+                .entry(account.to_string())
+                .or_default() += 1;
             if self.deny {
                 return Err("user denied".into());
             }
             Ok(self.items.borrow().get(account).cloned())
         }
         fn set(&self, account: &str, secret: &str) -> Result<(), String> {
-            self.items.borrow_mut().insert(account.into(), secret.into());
+            self.items
+                .borrow_mut()
+                .insert(account.into(), secret.into());
             Ok(())
         }
         fn delete(&self, account: &str) -> Result<(), String> {
@@ -299,7 +309,9 @@ mod tests {
     #[test]
     fn legacy_items_migrate_into_vault() {
         let fake = FakeItems::default();
-        fake.items.borrow_mut().insert("provider:claude".into(), "sk-old".into());
+        fake.items
+            .borrow_mut()
+            .insert("provider:claude".into(), "sk-old".into());
         let v = Vault::new(fake);
         assert_eq!(v.get("provider:claude").unwrap().as_deref(), Some("sk-old"));
         assert!(!v.items.items.borrow().contains_key("provider:claude"));
@@ -314,7 +326,9 @@ mod tests {
     #[test]
     fn delete_removes_stale_legacy_item() {
         let fake = FakeItems::default();
-        fake.items.borrow_mut().insert("git-token".into(), "old".into());
+        fake.items
+            .borrow_mut()
+            .insert("git-token".into(), "old".into());
         let v = Vault::new(fake);
         v.delete("git-token").unwrap();
         let reopened = Vault::new(v.items);
@@ -323,7 +337,10 @@ mod tests {
 
     #[test]
     fn denied_access_is_sticky_and_never_overwrites() {
-        let fake = FakeItems { deny: true, ..Default::default() };
+        let fake = FakeItems {
+            deny: true,
+            ..Default::default()
+        };
         let v = Vault::new(fake);
         assert!(v.get("a").is_err());
         assert!(v.get("b").is_err());

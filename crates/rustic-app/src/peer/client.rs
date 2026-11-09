@@ -666,7 +666,11 @@ pub async fn local_meta(host: &HostRef) -> Result<crate::meta_sync::MetaBundle, 
     let h = host.clone();
     tokio::task::spawn_blocking(move || {
         let data_dir = h.data_dir()?;
-        Ok(crate::meta_sync::export_bundle(h.state(), &data_dir, h.secrets()))
+        Ok(crate::meta_sync::export_bundle(
+            h.state(),
+            &data_dir,
+            h.secrets(),
+        ))
     })
     .await
     .map_err(|e| e.to_string())?

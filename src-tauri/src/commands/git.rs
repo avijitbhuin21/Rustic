@@ -19,7 +19,7 @@ fn get_project_path(state: &AppState, project_id: &str) -> Result<String, String
     let project = workspace
         .list_projects()
         .into_iter()
-        .find(|p| p.id.to_string() == project_id)
+        .find(|p| p.id == project_id)
         .ok_or_else(|| format!("Project not found: {}", project_id))?;
     Ok(project.root_path.to_string_lossy().to_string())
 }
@@ -995,9 +995,9 @@ fn validate_git_url(url: &str) -> Result<(), String> {
     // SCP-style: user@host:path  (no scheme, must contain ':' before any '/')
     let looks_scp = !trimmed.contains("://")
         && trimmed.contains('@')
-        && trimmed.find(':').map_or(false, |colon| {
-            trimmed[..colon].contains('@') && !trimmed[..colon].contains('/')
-        });
+        && trimmed
+            .find(':')
+            .is_some_and(|colon| trimmed[..colon].contains('@') && !trimmed[..colon].contains('/'));
 
     if looks_scp {
         return Ok(());
