@@ -35,6 +35,19 @@ fn sample(len: usize) -> Vec<u8> {
 }
 
 #[test]
+fn assembler_rejects_chunk_index_past_the_size_cap() {
+    let dir = scratch();
+    let asm = Assembler::create(&dir.join("cap.part")).unwrap();
+    let data = b"x";
+    let err = asm
+        .put(chunk_count(MAX_TRANSFER_BYTES), data, &sha256_hex(data))
+        .unwrap_err();
+    assert!(err.contains("limit"), "{err}");
+    assert!(asm.put(u64::MAX, data, &sha256_hex(data)).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn assembler_accepts_out_of_order_and_streams_prefix() {
     let dir = scratch();
     let data = sample((2 * CHUNK_SIZE + 1234) as usize);

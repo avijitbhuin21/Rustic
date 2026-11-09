@@ -39,6 +39,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { useAgent } from '@/state/agent';
+import { splitFileMentions, openFileMention } from '@/lib/file-mentions';
 import { useMascotRunState } from './agent-mascot';
 import { useTerminal } from '@/state/terminal';
 import { useCustomModels } from '@/state/custom-models';
@@ -318,7 +319,21 @@ function MentionMenu({ kind, items, activeIndex, onHover, onSelect, query }) {
               )}
             >
               <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-              <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              {item.kind === 'file' ? (
+                <span className="flex min-w-0 flex-1 items-baseline gap-2">
+                  <span className="shrink-0 truncate">{item.label}</span>
+                  {item.dir && (
+                    <span
+                      className="min-w-0 truncate text-[11px] text-muted-foreground"
+                      title={item.value}
+                    >
+                      {item.dir}
+                    </span>
+                  )}
+                </span>
+              ) : (
+                <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              )}
               {item.tag && (
                 <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-muted-foreground">
                   {item.tag}
@@ -1694,6 +1709,44 @@ export function PromptBox({
     autoGrow();
   }, [value, autoGrow]);
 
+  // Inline @file tokens are the source of truth: deleting the text drops the reference.
+  useEffect(() => {
+    setFileTags((prev) => {
+      const next = prev.filter((t) => !t.inline || value.includes(`@${t.relativePath}`));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [value]);
+
+  const inlineFilePaths = useMemo(
+    () => fileTags.filter((t) => t.inline).map((t) => t.relativePath),
+    [fileTags],
+  );
+  const mentionSegments = useMemo(
+    () => splitFileMentions(value, inlineFilePaths),
+    [value, inlineFilePaths],
+  );
+  const mirrorRef = useRef(null);
+  const syncMirrorScroll = useCallback(() => {
+    if (mirrorRef.current && textareaRef.current) {
+      mirrorRef.current.scrollTop = textareaRef.current.scrollTop;
+    }
+  }, []);
+
+  useEffect(() => {
+    syncMirrorScroll();
+  }, [value, syncMirrorScroll]);
+
+  // Plain click inside an @file token opens it in the editor.
+  const openMentionAtCaret = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el || el.selectionStart !== el.selectionEnd) return false;
+    const pos = el.selectionStart;
+    const seg = mentionSegments.find((s) => s.type === 'file' && pos > s.start && pos < s.end);
+    if (!seg) return false;
+    openFileMention(activeProjectRoot, seg.path);
+    return true;
+  }, [mentionSegments, activeProjectRoot]);
+
   // Re-measure when the width changes: a measurement taken while the panel was
   // collapsed (e.g. zero-width behind Cloud & Sync) wraps every character and
   // would otherwise leave the empty box stuck at the max height.
@@ -1880,6 +1933,7 @@ export function PromptBox({
           kind: 'file',
           value: p,
           label: slash >= 0 ? p.slice(slash + 1) : p,
+          dir: slash >= 0 ? p.slice(0, slash) : '',
           description: p,
           tag: null,
         };
@@ -1901,7 +1955,10 @@ export function PromptBox({
       const caret = el ? el.selectionStart ?? value.length : value.length;
       const before = value.slice(0, menu.triggerIndex);
       const after = value.slice(caret);
-      const nextValue = `${before}${after}`;
+      const inlineToken = item.kind === 'file' && menu.type === 'at'
+        ? `@${item.value}${after.startsWith(' ') ? '' : ' '}`
+        : '';
+      const nextValue = `${before}${inlineToken}${after}`;
       setValue(nextValue);
 
       if (item.kind === 'skill') {
@@ -1922,7 +1979,7 @@ export function PromptBox({
         setFileTags((prev) =>
           prev.some((t) => t.relativePath === item.value)
             ? prev
-            : [...prev, { id: `file-${item.value}`, relativePath: item.value }],
+            : [...prev, { id: `file-${item.value}`, relativePath: item.value, inline: true }],
         );
       } else if (item.kind === 'terminal') {
         addTerminalTag({ id: item.sessionId, label: item.label });
@@ -1934,7 +1991,7 @@ export function PromptBox({
         const node = textareaRef.current;
         if (!node) return;
         node.focus();
-        const pos = before.length;
+        const pos = before.length + inlineToken.length;
         node.setSelectionRange(pos, pos);
       });
     },
@@ -2193,7 +2250,7 @@ export function PromptBox({
         terminalTags.length > 0 ||
         skillTags.length > 0 ||
         workflowTags.length > 0 ||
-        fileTags.length > 0 ||
+        fileTags.some((t) => !t.inline) ||
         commandTag) && (
         <div className="mb-1 flex flex-wrap gap-1.5 px-1 pt-1">
           {commandTag && (
@@ -2236,7 +2293,7 @@ export function PromptBox({
               onRemove={() => removeWorkflowTag(tag.name)}
             />
           ))}
-          {fileTags.map((tag) => (
+          {fileTags.filter((tag) => !tag.inline).map((tag) => (
             <ContextChip
               key={tag.id}
               icon={FileText}
@@ -2258,10 +2315,33 @@ export function PromptBox({
             onSelect={acceptMention}
           />
         )}
+        {inlineFilePaths.length > 0 && (
+          <div
+            ref={mirrorRef}
+            aria-hidden
+            className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 py-2 text-xs leading-relaxed text-transparent [overflow-wrap:anywhere]"
+          >
+            {mentionSegments.map((seg, i) =>
+              seg.type === 'file' ? (
+                <span
+                  key={i}
+                  className="rounded-sm bg-muted-foreground/20 underline decoration-muted-foreground/50 underline-offset-2"
+                >
+                  @{seg.path}
+                </span>
+              ) : (
+                <span key={i}>{seg.text}</span>
+              ),
+            )}
+            {'\u200b'}
+          </div>
+        )}
         <textarea
           ref={textareaRef}
           rows={1}
           value={value}
+          onScroll={syncMirrorScroll}
+          title={inlineFilePaths.length > 0 ? 'Click an @file to open it in the editor' : undefined}
           onChange={(e) => {
             setValue(e.target.value);
             // Defer so selectionStart reflects the post-change caret.
@@ -2277,7 +2357,10 @@ export function PromptBox({
               return;
             refreshMenu();
           }}
-          onClick={refreshMenu}
+          onClick={() => {
+            if (openMentionAtCaret()) return;
+            refreshMenu();
+          }}
           onBlur={() => {
             // Close on blur, but a tick later so a menu item's onMouseDown pick
             // resolves first.
@@ -2290,7 +2373,7 @@ export function PromptBox({
             : placeholder}
           disabled={disabled}
           className={cn(
-            'flex min-h-[44px] w-full resize-none rounded-md border-none bg-transparent px-3 py-2 text-xs leading-relaxed text-foreground placeholder:text-muted-foreground',
+            'relative flex min-h-[44px] w-full resize-none rounded-md border-none bg-transparent px-3 py-2 text-xs leading-relaxed text-foreground placeholder:text-muted-foreground',
             'focus-visible:outline-none focus-visible:ring-0 disabled:cursor-not-allowed disabled:opacity-50',
           )}
         />

@@ -78,7 +78,7 @@ fn resolve_scope(state: &AppState, scopes: &[String]) -> Vec<PathBuf> {
         .filter_map(|scope_id| {
             all_projects
                 .iter()
-                .find(|p| p.id.to_string() == *scope_id)
+                .find(|p| p.id == *scope_id)
                 .map(|p| PathBuf::from(&p.root_path))
         })
         .collect()
@@ -181,7 +181,7 @@ pub fn start_search(state: &AppState, emitter: Arc<dyn EventEmitter>, params: Se
                     return false;
                 }
                 yield_counter = yield_counter.wrapping_add(1);
-                if yield_counter % 16 == 0 {
+                if yield_counter.is_multiple_of(16) {
                     std::thread::yield_now();
                 }
                 true

@@ -314,7 +314,12 @@ pub fn load_base64_for_request(name: &str) -> Option<(String, Option<&'static st
     match shrink_to(&bytes, REQUEST_IMAGE_SIDE) {
         Some((small, mt)) => {
             let _ = std::fs::write(&cache, &small);
-            tracing::info!(name, from = bytes.len(), to = small.len(), "[media_store] downscaled stored image for request");
+            tracing::info!(
+                name,
+                from = bytes.len(),
+                to = small.len(),
+                "[media_store] downscaled stored image for request"
+            );
             Some((b64(&small), Some(mt)))
         }
         None => Some((b64(&bytes), None)),
@@ -325,16 +330,27 @@ pub fn load_base64_for_request(name: &str) -> Option<(String, Option<&'static st
 /// `cap`. Returns true when the block changed. Used by history repair when a
 /// provider names a lower pixel limit than [`REQUEST_IMAGE_SIDE`].
 pub fn shrink_block(block: &mut ContentBlock, cap: u32) -> bool {
-    let ContentBlock::Image { media_type, data, path } = block else {
+    let ContentBlock::Image {
+        media_type,
+        data,
+        path,
+    } = block
+    else {
         return false;
     };
     let bytes = if !data.is_empty() {
-        base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok()
+        base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .ok()
     } else {
-        path.as_deref().and_then(path_for).and_then(|p| std::fs::read(p).ok())
+        path.as_deref()
+            .and_then(path_for)
+            .and_then(|p| std::fs::read(p).ok())
     };
     let Some(bytes) = bytes else { return false };
-    let Some((small, mt)) = shrink_to(&bytes, cap) else { return false };
+    let Some((small, mt)) = shrink_to(&bytes, cap) else {
+        return false;
+    };
     *media_type = mt.to_string();
     match store_bytes(&small) {
         Some(name) => {
@@ -357,11 +373,18 @@ pub fn shrink_block(block: &mut ContentBlock, cap: u32) -> bool {
 pub fn hydrate(content: &mut [ContentBlock]) -> usize {
     let mut filled = 0;
     for block in content.iter_mut() {
-        if let ContentBlock::Image { data, path, media_type } = block {
+        if let ContentBlock::Image {
+            data,
+            path,
+            media_type,
+        } = block
+        {
             if !data.is_empty() {
                 if path.is_none() {
                     // Legacy inline payload: shrink in place if it's oversized.
-                    if let Some(raw) = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok() {
+                    if let Ok(raw) =
+                        base64::engine::general_purpose::STANDARD.decode(data.as_bytes())
+                    {
                         if let Some((small, mt)) = shrink_to(&raw, REQUEST_IMAGE_SIDE) {
                             *data = base64::engine::general_purpose::STANDARD.encode(&small);
                             *media_type = mt.to_string();

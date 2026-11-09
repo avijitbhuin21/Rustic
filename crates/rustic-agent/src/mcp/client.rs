@@ -46,6 +46,7 @@ pub struct McpClient {
     broken: bool,
 }
 
+#[allow(clippy::large_enum_variant)] // one long-lived value per client
 enum ClientTransport {
     Stdio {
         child: Option<Child>,
@@ -464,6 +465,7 @@ struct RemoteTransport {
     broken: bool,
 }
 
+#[allow(clippy::large_enum_variant)] // one long-lived value per client
 enum RemoteMode {
     Streamable,
     Legacy {

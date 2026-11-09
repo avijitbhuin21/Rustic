@@ -89,7 +89,7 @@ export function WebSearchDialog({ open, onClose, value, providers, onSave }) {
   );
 }
 
-export function MediaToolDialog({ open, onClose, title, badge, hint, providers, maxLimit, value, onSave }) {
+export function MediaToolDialog({ open, onClose, title, badge, hint, providers, maxLimit, value, onSave, capability }) {
   const [providerKey, setProviderKey] = useState('');
   const [model, setModel] = useState('');
   const [maxPerCall, setMaxPerCall] = useState(1);
@@ -127,6 +127,7 @@ export function MediaToolDialog({ open, onClose, title, badge, hint, providers, 
           // chat-only filter would drop (e.g. Gemini VEO, Imagen, Nano Banana
           // variants that don't expose generateContent).
           includeAll: true,
+          capability: capability || null,
         });
         if (!cancelled) setProviderModels(Array.isArray(list) ? list : []);
       } catch {
@@ -136,7 +137,7 @@ export function MediaToolDialog({ open, onClose, title, badge, hint, providers, 
       }
     })();
     return () => { cancelled = true; };
-  }, [providerKey, providers]);
+  }, [providerKey, providers, capability]);
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
@@ -386,6 +387,7 @@ export function ToolsSection() {
         hint="Suggested: OpenAI gpt-image-1 · Gemini gemini-2.5-flash-image"
         providers={providers}
         maxLimit={10}
+        capability="image"
         value={media.image}
         onSave={(v) => update({ media: { ...media, image: v } })}
       />
@@ -397,6 +399,7 @@ export function ToolsSection() {
         hint="Suggested: OpenAI sora-2 · Gemini veo-3.1-generate-preview. Veo 3.1 also enables first+last frame interpolation."
         providers={providers}
         maxLimit={4}
+        capability="video"
         value={media.video}
         onSave={(v) => update({ media: { ...media, video: v } })}
       />
@@ -408,6 +411,7 @@ export function ToolsSection() {
         hint="Animates an existing project image into a short clip. With Veo 3.1 you can also pass an end frame to interpolate between two images."
         providers={providers}
         maxLimit={4}
+        capability="video"
         value={media.animate}
         onSave={(v) => update({ media: { ...media, animate: v } })}
       />

@@ -97,9 +97,9 @@ impl FileWatcher {
             notify::Config::default(),
         )
         .map_err(FileWatcherError::Notify)?;
-        let input = HANDOFF
-            .with(|h| h.borrow_mut().take())
-            .ok_or_else(|| FileWatcherError::Notify(notify::Error::generic("debouncer handler not captured")))?;
+        let input = HANDOFF.with(|h| h.borrow_mut().take()).ok_or_else(|| {
+            FileWatcherError::Notify(notify::Error::generic("debouncer handler not captured"))
+        })?;
 
         // Registers the root with the file-id cache (rename pairing); the
         // watcher half is a no-op.
@@ -283,7 +283,7 @@ fn path_is_in_hard_denied(p: &Path) -> bool {
     p.components().any(|c| {
         if let std::path::Component::Normal(name) = c {
             if let Some(s) = name.to_str() {
-                return HARD_DENY_DIRS.iter().any(|d| *d == s);
+                return HARD_DENY_DIRS.contains(&s);
             }
         }
         false

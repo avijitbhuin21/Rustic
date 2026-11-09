@@ -56,7 +56,7 @@ image = { workspace = true }
 #   but it reads docx body content via `read_docx` — sufficient for our
 #   paragraph-based extraction use case)
 pdf-extract = "0.12"
-calamine = "0.36"
+calamine = "0.38"
 docx-rs = "0.4.22"
 # Three-way merge + hidden-conflict detection at the write choke point
 # (tools/write_merge.rs). Pure in-process, MIT OR Apache-2.0, no store or

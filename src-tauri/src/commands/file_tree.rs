@@ -337,7 +337,7 @@ Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        return Ok(ClipboardFileDrop { paths, cut: false });
+        Ok(ClipboardFileDrop { paths, cut: false })
     }
 
     #[cfg(target_os = "linux")]
@@ -523,7 +523,7 @@ $dataObj.SetData('Preferred DropEffect',$ms)
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("clipboard write failed: {}", stderr.trim()));
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -693,7 +693,7 @@ end try
                 final_path.display()
             ));
         }
-        return Ok(Some(final_path.to_string_lossy().into_owned()));
+        Ok(Some(final_path.to_string_lossy().into_owned()))
     }
 
     #[cfg(target_os = "linux")]

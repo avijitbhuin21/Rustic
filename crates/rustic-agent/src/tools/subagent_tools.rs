@@ -43,8 +43,18 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 /// "under ~900 words", "(<400 words)", "at most 1,000 words".
 fn requested_word_limit(prompt: &str) -> Option<usize> {
     const LEADS: &[&str] = &[
-        "under", "<", "≤", "<=", "max", "maximum", "below", "at most", "within", "less than",
-        "no more than", "up to",
+        "under",
+        "<",
+        "≤",
+        "<=",
+        "max",
+        "maximum",
+        "below",
+        "at most",
+        "within",
+        "less than",
+        "no more than",
+        "up to",
     ];
     let lower = prompt.to_lowercase();
     for (idx, _) in lower.match_indices("words") {
@@ -1323,9 +1333,12 @@ async fn spawn_subagent_inner(
     };
     let report_word_limit = requested_word_limit(&prompt);
 
-    let chosen_config = if use_fast {
-        // unwrap is safe: `use_fast` checked is_some() above.
-        context.subagent_provider_config.as_ref().unwrap()
+    let fast_config = context
+        .subagent_provider_config
+        .as_ref()
+        .filter(|_| use_fast);
+    let chosen_config = if let Some(cfg) = fast_config {
+        cfg
     } else {
         context.parent_provider_config.as_ref().ok_or_else(|| {
             anyhow::anyhow!("No parent provider config available for sub-agent spawning")
@@ -1366,6 +1379,7 @@ async fn spawn_subagent_inner(
         system_prompt: Some(sub_system_prompt),
         thinking_budget: 0,
         context_window: chosen_config.context_window,
+        condense_threshold: chosen_config.condense_threshold,
         web_search_enabled: chosen_config.web_search_enabled,
         web_fetch_enabled: chosen_config.web_fetch_enabled,
         supports_temperature: chosen_config.supports_temperature,
@@ -1526,7 +1540,7 @@ async fn spawn_subagent_inner(
             let mut event_count = 0u64;
             while let Some(event) = child_event_rx.recv().await {
                 event_count += 1;
-                if event_count <= 5 || event_count % 50 == 0 {
+                if event_count <= 5 || event_count.is_multiple_of(50) {
                     tracing::trace!(
                         "[subagent] '{}' event #{}: {:?}",
                         fwd_agent_id,
@@ -1716,7 +1730,8 @@ async fn spawn_subagent_inner(
                 .map(|g| g.clone())
                 .unwrap_or_default();
             if !parent_snapshot.is_empty() {
-                let transcript = render_parent_transcript_capped(&parent_snapshot, inherit_char_cap);
+                let transcript =
+                    render_parent_transcript_capped(&parent_snapshot, inherit_char_cap);
                 if !transcript.trim().is_empty() {
                     let preface = format!(
                         "You are a sub-agent spawned by a parent agent that has been working \
@@ -2213,9 +2228,18 @@ mod budget_tests {
 
     #[test]
     fn parses_requested_word_limits() {
-        assert_eq!(requested_word_limit("Keep the report under ~900 words."), Some(900));
-        assert_eq!(requested_word_limit("Final report (<400 words): per item"), Some(400));
-        assert_eq!(requested_word_limit("at most 1,000 words please"), Some(1000));
+        assert_eq!(
+            requested_word_limit("Keep the report under ~900 words."),
+            Some(900)
+        );
+        assert_eq!(
+            requested_word_limit("Final report (<400 words): per item"),
+            Some(400)
+        );
+        assert_eq!(
+            requested_word_limit("at most 1,000 words please"),
+            Some(1000)
+        );
         assert_eq!(requested_word_limit("Report (under 600 words)"), Some(600));
         assert_eq!(requested_word_limit("list 5 words that rhyme"), None);
         assert_eq!(requested_word_limit("no limit here"), None);
@@ -2243,7 +2267,11 @@ mod budget_tests {
             .collect();
         let fast = render_parent_transcript_capped(&messages, FAST_PARENT_CONTEXT_CHAR_CAP);
         let full = render_parent_transcript_capped(&messages, PARENT_CONTEXT_CHAR_CAP);
-        assert!(fast.len() < FAST_PARENT_CONTEXT_CHAR_CAP + 1_000, "{}", fast.len());
+        assert!(
+            fast.len() < FAST_PARENT_CONTEXT_CHAR_CAP + 1_000,
+            "{}",
+            fast.len()
+        );
         assert!(full.len() > fast.len());
     }
 }

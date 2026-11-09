@@ -20,7 +20,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// dict (last bare expression is echoed like a REPL), and replies with one
 /// JSON line. Matplotlib figures are captured as base64 PNGs when available.
 const PY_BRIDGE: &str = r#"
-import sys, json, io, traceback, contextlib, ast, base64
+import sys
+_user_path = sys.path[:]
+sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+import json, io, traceback, contextlib, ast, base64
+sys.path[:] = _user_path
+del _user_path
 g = {'__name__': '__main__'}
 def _capture_figures():
     try:
@@ -129,6 +134,9 @@ pub fn start(notebook_id: &str, cwd: &str, emit: KernelEmit) -> Result<String, S
     stop(notebook_id);
 
     let cwd_path = PathBuf::from(cwd);
+    if !cwd_path.is_dir() {
+        return Err(format!("notebook folder not found: {cwd}"));
+    }
     let python = resolve_python(&cwd_path);
     let mut cmd = Command::new(&python);
     cmd.args(["-u", "-c", PY_BRIDGE])

@@ -122,18 +122,31 @@ impl HookPaths {
     }
 }
 
+/// True when `path` contains only characters every shell passes through
+/// unquoted and uninterpreted (no spaces, quotes, `&`, `;`, `$`, parens…).
+fn is_shell_safe(path: &Path) -> bool {
+    path.to_string_lossy()
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '\\' | ':' | '.' | '_' | '-'))
+}
+
+/// POSIX single-quote `s` so any byte survives `sh` unchanged.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// Pick a directory for the sink scripts whose path a shell can execute
-/// unquoted. Falls back to `%ProgramData%` when app data contains a space, and
-/// to the app-data root itself if even that is unusable.
+/// unquoted. Falls back to `%ProgramData%` when app data contains a space or
+/// shell metacharacter, and to the app-data root itself if even that is unusable.
 fn script_dir_for(root: &Path) -> PathBuf {
-    if !cfg!(windows) || !root.to_string_lossy().contains(' ') {
+    if !cfg!(windows) || is_shell_safe(root) {
         return root.to_path_buf();
     }
     let base = std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
     let fallback = base.join("rustic").join("external-agents");
-    if fallback.to_string_lossy().contains(' ') || std::fs::create_dir_all(&fallback).is_err() {
+    if !is_shell_safe(&fallback) || std::fs::create_dir_all(&fallback).is_err() {
         return root.to_path_buf();
     }
     fallback
@@ -162,9 +175,9 @@ fn sink_command(paths: &HookPaths) -> String {
         )
     } else {
         format!(
-            "sh '{}' '{}'",
-            script.replace('\'', ""),
-            paths.spool.to_string_lossy().replace('\'', "")
+            "sh {} {}",
+            sh_quote(&script),
+            sh_quote(&paths.spool.to_string_lossy())
         )
     }
 }
@@ -346,6 +359,22 @@ mod tests {
         } else {
             assert!(dir.to_string_lossy().contains(' '));
         }
+    }
+
+    #[test]
+    fn shell_metacharacters_force_a_safe_script_dir_and_quote_cleanly() {
+        assert!(is_shell_safe(Path::new(
+            r"C:\Users\ada\AppData\external-agents"
+        )));
+        for bad in [
+            r"C:\Users\A&B\x",
+            r"C:\Users\a;b\x",
+            r"C:\Users\$x\x",
+            r"C:\Users\a(1)\x",
+        ] {
+            assert!(!is_shell_safe(Path::new(bad)), "{bad}");
+        }
+        assert_eq!(sh_quote("/tmp/it's here"), r"'/tmp/it'\''s here'");
     }
 
     #[test]

@@ -174,12 +174,12 @@ fn origin_allowed(origin: &str, host: Option<&str>) -> bool {
         let same = origin
             .strip_prefix("http://")
             .or_else(|| origin.strip_prefix("https://"))
-            .map_or(false, |authority| authority == host);
+            .is_some_and(|authority| authority == host);
         if same {
             return true;
         }
     }
-    allowed_origins().iter().any(|o| *o == origin)
+    allowed_origins().contains(&origin)
 }
 
 /// CORS / cross-site enforcement: reject any request whose `Origin` is neither
@@ -954,6 +954,7 @@ async fn upload_stream_handler(
 
     let mut file = match tokio::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(&target)
         .await

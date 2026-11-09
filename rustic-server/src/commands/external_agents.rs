@@ -20,7 +20,7 @@ use rustic_app::sync_ext::MutexExt;
 
 use crate::api::{ok, parse, ApiError};
 use crate::commands::terminal::{
-    emit_terminal_list_changed, default_terminal_shell, spawn_output_reader, spawn_session_monitor,
+    default_terminal_shell, emit_terminal_list_changed, spawn_output_reader, spawn_session_monitor,
     wait_for_shell_output,
 };
 use crate::context::ServerContext;

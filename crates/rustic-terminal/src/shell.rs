@@ -30,6 +30,9 @@ pub struct SessionInfo {
     /// True while an agent-issued command is still executing in this shell.
     #[serde(default)]
     pub running: bool,
+    /// Shell is at its prompt but still has a child process (`cmd &` job).
+    #[serde(default)]
+    pub background_job: bool,
 }
 
 /// How many exited (retired) sessions to retain for the UI before evicting
@@ -50,6 +53,12 @@ struct ExitedSession {
 pub struct TerminalManager {
     sessions: HashMap<SessionId, PtySession>,
     exited: HashMap<SessionId, ExitedSession>,
+}
+
+impl Default for TerminalManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TerminalManager {
@@ -267,6 +276,7 @@ impl TerminalManager {
     /// gets `Some(..)` and proceeds to notify/emit; the loser gets `None` and
     /// does nothing. Returns `None` for an already-removed (or never-existing)
     /// session.
+    #[allow(clippy::type_complexity)] // (task_id, label, last_command, tail, in_flight)
     pub fn take_for_exit(
         &mut self,
         id: SessionId,
@@ -303,6 +313,7 @@ impl TerminalManager {
             let mut info = session_info(&session);
             info.exited = true;
             info.running = false;
+            info.background_job = false;
             let exited_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -334,6 +345,14 @@ impl TerminalManager {
 }
 
 fn session_info(s: &PtySession) -> SessionInfo {
+    let running = s
+        .command_in_flight
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false);
+    let background_job = !running
+        && s.pid
+            .is_some_and(|pid| shell_has_background_job(pid, s.foreground_pgid()));
     SessionInfo {
         id: s.id,
         label: s.label.clone(),
@@ -344,10 +363,13 @@ fn session_info(s: &PtySession) -> SessionInfo {
         task_id: s.task_id.lock().ok().and_then(|g| g.clone()),
         created_at_ms: s.created_at_ms,
         exited: false,
-        running: s
-            .command_in_flight
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false),
+        running,
+        background_job,
     }
+}
+
+/// Shell is idle at its prompt (no foreground job) yet still has children.
+pub fn shell_has_background_job(pid: u32, foreground_pgid: Option<i32>) -> bool {
+    crate::pty::shell_command_busy(pid, foreground_pgid) == Some(false)
+        && crate::pty::process_has_children(pid) == Some(true)
 }

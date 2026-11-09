@@ -441,7 +441,15 @@ async fn run_image_create(
             gemini_generate_images(&provider, &entry.model, &prompt, count, &input_images).await
         }
         ProviderType::OpenRouter => {
-            openrouter_generate_images(&provider, &entry.model, &prompt, count, &input_images).await
+            openrouter_generate_images(
+                &provider,
+                &entry.model,
+                &prompt,
+                count,
+                size.as_deref(),
+                &input_images,
+            )
+            .await
         }
         _ => Err(anyhow::anyhow!(
             "image_create does not support provider `{}` — supported: OpenAI, Gemini, OpenRouter.",
@@ -1300,18 +1308,174 @@ async fn gemini_generate_images(
     Ok(out)
 }
 
+/// OpenRouter image generation: the dedicated Images API (`/v1/images`) serves
+/// image-only models (FLUX, Seedream, GPT Image, …); a few models only generate
+/// through chat completions, so a rejected Images call falls back to that.
 async fn openrouter_generate_images(
     provider: &ResolvedProvider,
     model: &str,
     prompt: &str,
     count: u32,
+    size: Option<&str>,
     input_images: &[(&str, &str)],
 ) -> Result<Vec<Vec<u8>>> {
     let base = provider
         .base_url
         .clone()
         .unwrap_or_else(|| "https://openrouter.ai/api".to_string());
-    let url = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
+    let base = base.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+
+    match openrouter_images_api(
+        &client,
+        base,
+        provider,
+        model,
+        prompt,
+        count,
+        size,
+        input_images,
+    )
+    .await
+    {
+        Ok(out) if !out.is_empty() => Ok(out),
+        Ok(_) => {
+            openrouter_chat_images(&client, base, provider, model, prompt, count, input_images)
+                .await
+        }
+        Err(ImagesApiError::Fatal(e)) => Err(e),
+        Err(ImagesApiError::Unsupported(images_err)) => {
+            let chat =
+                openrouter_chat_images(&client, base, provider, model, prompt, count, input_images)
+                    .await;
+            chat.map_err(|chat_err| {
+                anyhow::anyhow!("OpenRouter Images API: {images_err} | chat fallback: {chat_err}")
+            })
+        }
+    }
+}
+
+enum ImagesApiError {
+    /// Auth / billing / rate-limit — the chat fallback would fail the same way.
+    Fatal(anyhow::Error),
+    /// The Images API rejected the request (often: model not served there).
+    Unsupported(String),
+}
+
+/// Map a `WxH` size hint to the aspect ratio the OpenRouter Images API expects.
+fn size_to_aspect_ratio(size: &str) -> Option<&'static str> {
+    let (w, h) = size.split_once(['x', 'X'])?;
+    let (w, h): (f64, f64) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let r = w / h;
+    let options = [
+        ("1:1", 1.0),
+        ("3:2", 1.5),
+        ("2:3", 2.0 / 3.0),
+        ("16:9", 16.0 / 9.0),
+        ("9:16", 9.0 / 16.0),
+        ("4:3", 4.0 / 3.0),
+        ("3:4", 0.75),
+    ];
+    options
+        .iter()
+        .min_by(|a, b| (a.1 - r).abs().total_cmp(&(b.1 - r).abs()))
+        .map(|o| o.0)
+}
+
+/// One `POST /v1/images` call per requested image (single-image providers reject `n > 1`).
+#[allow(clippy::too_many_arguments)]
+async fn openrouter_images_api(
+    client: &reqwest::Client,
+    base: &str,
+    provider: &ResolvedProvider,
+    model: &str,
+    prompt: &str,
+    count: u32,
+    size: Option<&str>,
+    input_images: &[(&str, &str)],
+) -> std::result::Result<Vec<Vec<u8>>, ImagesApiError> {
+    let url = format!("{base}/v1/images");
+    let mut body = json!({ "model": model, "prompt": prompt });
+    if let Some(ar) = size.and_then(size_to_aspect_ratio) {
+        body["aspect_ratio"] = json!(ar);
+    }
+    if !input_images.is_empty() {
+        let refs: Vec<Value> = input_images
+            .iter()
+            .map(|(b64, mime)| {
+                json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", mime, b64) }
+                })
+            })
+            .collect();
+        body["input_references"] = json!(refs);
+    }
+
+    let mut out = Vec::new();
+    for _ in 0..count.max(1) {
+        let resp = client
+            .post(&url)
+            .bearer_auth(&provider.api_key)
+            .header("HTTP-Referer", "https://github.com/avijitbhuin21/Rustic")
+            .header("X-Title", "Rustic")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ImagesApiError::Fatal(e.into()))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let msg = format!("{} → {}", status, truncate(&text, 600));
+            return Err(match status.as_u16() {
+                401 | 402 | 403 | 429 => ImagesApiError::Fatal(anyhow::anyhow!("OpenRouter {msg}")),
+                // A partial batch already succeeded: report rather than re-run via chat.
+                _ if !out.is_empty() => ImagesApiError::Fatal(anyhow::anyhow!("OpenRouter {msg}")),
+                _ => ImagesApiError::Unsupported(msg),
+            });
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| ImagesApiError::Unsupported(format!("unparseable response: {e}")))?;
+        for item in v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(b64) = item.get("b64_json").and_then(|s| s.as_str()) {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                    out.push(bytes);
+                }
+            } else if let Some(u) = item.get("url").and_then(|s| s.as_str()) {
+                if let Some(bytes) = decode_data_url(u) {
+                    out.push(bytes);
+                } else if let Ok(r) = client.get(u).send().await {
+                    if let Ok(b) = r.bytes().await {
+                        out.push(b.to_vec());
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Chat-completions image generation (`modalities: ["image","text"]`) for chat-only image models.
+async fn openrouter_chat_images(
+    client: &reqwest::Client,
+    base: &str,
+    provider: &ResolvedProvider,
+    model: &str,
+    prompt: &str,
+    count: u32,
+    input_images: &[(&str, &str)],
+) -> Result<Vec<Vec<u8>>> {
+    let url = format!("{}/v1/chat/completions", base);
 
     let content_value: Value = if input_images.is_empty() {
         json!(prompt)
@@ -1334,9 +1498,6 @@ async fn openrouter_generate_images(
         "n": count,
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()?;
     let resp = client
         .post(&url)
         .bearer_auth(&provider.api_key)
@@ -1397,6 +1558,7 @@ fn decode_data_url(url: &str) -> Option<Vec<u8>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn openai_generate_videos(
     provider: &ResolvedProvider,
     model: &str,
@@ -1532,6 +1694,7 @@ async fn openai_generate_videos(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn gemini_generate_videos(
     provider: &ResolvedProvider,
     model: &str,
@@ -1692,6 +1855,7 @@ async fn gemini_generate_videos(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn openrouter_generate_videos(
     provider: &ResolvedProvider,
     model: &str,
@@ -1811,7 +1975,7 @@ async fn openrouter_generate_videos(
             if st == "completed" || st == "succeeded" {
                 break j;
             }
-            if st == "failed" || st == "cancelled" || st == "error" {
+            if st == "failed" || st == "cancelled" || st == "error" || st == "expired" {
                 let msg = j
                     .get("error")
                     .and_then(|e| e.get("message"))
@@ -1900,4 +2064,136 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
     format!("{}…", &s[..end])
+}
+
+#[cfg(test)]
+mod openrouter_image_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Tiny HTTP mock: answers by path prefix with (status, body); records request paths.
+    async fn mock(
+        routes: Vec<(&'static str, u16, String)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 1 << 20];
+                let mut n = 0;
+                loop {
+                    let r = sock.read(&mut buf[n..]).await.unwrap_or(0);
+                    if r == 0 {
+                        break;
+                    }
+                    n += r;
+                    let s = String::from_utf8_lossy(&buf[..n]);
+                    if let Some(h) = s.find("\r\n\r\n") {
+                        let len = s[..h]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if n >= h + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                seen2.lock().unwrap().push(path.clone());
+                let (status, body) = routes
+                    .iter()
+                    .find(|(p, _, _)| path.starts_with(p))
+                    .map(|(_, s, b)| (*s, b.clone()))
+                    .unwrap_or((404, "{}".into()));
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn provider(base: String) -> ResolvedProvider {
+        ResolvedProvider {
+            kind: ProviderType::OpenRouter,
+            api_key: "k".into(),
+            base_url: Some(base),
+        }
+    }
+
+    #[tokio::test]
+    async fn uses_images_api_for_image_only_models() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"PNGDATA");
+        let body = format!(r#"{{"data":[{{"b64_json":"{b64}","media_type":"image/png"}}]}}"#);
+        let (base, seen) = mock(vec![("/v1/images", 200, body)]).await;
+        let out = openrouter_generate_images(
+            &provider(base),
+            "openai/gpt-image-2.6-sunburst",
+            "a cat",
+            2,
+            Some("1536x1024"),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, vec![b"PNGDATA".to_vec(), b"PNGDATA".to_vec()]);
+        assert_eq!(*seen.lock().unwrap(), vec!["/v1/images", "/v1/images"]);
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_chat_when_images_api_rejects_model() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"CHATIMG");
+        let chat = format!(
+            r#"{{"choices":[{{"message":{{"images":[{{"image_url":{{"url":"data:image/png;base64,{b64}"}}}}]}}}}]}}"#
+        );
+        let (base, seen) = mock(vec![
+            (
+                "/v1/images",
+                400,
+                r#"{"error":{"message":"model not supported"}}"#.into(),
+            ),
+            ("/v1/chat/completions", 200, chat),
+        ])
+        .await;
+        let out =
+            openrouter_generate_images(&provider(base), "x/chat-image", "a cat", 1, None, &[])
+                .await
+                .unwrap();
+        assert_eq!(out, vec![b"CHATIMG".to_vec()]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["/v1/images", "/v1/chat/completions"]
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_errors_do_not_fall_back() {
+        let (base, seen) = mock(vec![("/v1/images", 401, r#"{"error":"bad key"}"#.into())]).await;
+        let err = openrouter_generate_images(&provider(base), "m", "p", 1, None, &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("401"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn maps_sizes_to_aspect_ratios() {
+        assert_eq!(size_to_aspect_ratio("1024x1024"), Some("1:1"));
+        assert_eq!(size_to_aspect_ratio("1536x1024"), Some("3:2"));
+        assert_eq!(size_to_aspect_ratio("1024x1536"), Some("2:3"));
+        assert_eq!(size_to_aspect_ratio("1920x1080"), Some("16:9"));
+        assert_eq!(size_to_aspect_ratio("bogus"), None);
+    }
 }

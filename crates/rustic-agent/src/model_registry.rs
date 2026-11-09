@@ -547,7 +547,8 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
 /// Look up a model by its ID. Tries exact match first, then bidirectional prefix match:
 /// - Forward: model_id starts with m.id  (user gave a more specific version, e.g. with date suffix)
 /// - Reverse: m.id starts with model_id  (user gave a shorter alias, e.g. "claude-opus-4-6"
-///                                         matches registry entry "claude-opus-4-6-20260401")
+///   matches registry entry "claude-opus-4-6-20260401")
+///
 /// Longest common prefix wins to pick the most specific match.
 pub fn lookup(model_id: &str) -> Option<&'static ModelSpec> {
     if let Some(spec) = KNOWN_MODELS.iter().find(|m| m.id == model_id) {

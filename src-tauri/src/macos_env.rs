@@ -76,13 +76,19 @@ pub fn import_login_shell_path() {
 /// (tauri-apps/plugins-workspace#1983).
 pub fn keep_temp_on_app_volume() {
     use std::os::unix::fs::MetadataExt;
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     // <Name>.app/Contents/MacOS/<binary>
-    let Some(bundle) = exe.ancestors().nth(3) else { return };
-    if bundle.extension().map_or(true, |e| e != "app") {
+    let Some(bundle) = exe.ancestors().nth(3) else {
+        return;
+    };
+    if bundle.extension().is_none_or(|e| e != "app") {
         return;
     }
-    let Some(parent) = bundle.parent() else { return };
+    let Some(parent) = bundle.parent() else {
+        return;
+    };
     let tmp = std::env::temp_dir();
     let (Ok(app_meta), Ok(tmp_meta)) = (std::fs::metadata(parent), std::fs::metadata(&tmp)) else {
         return;

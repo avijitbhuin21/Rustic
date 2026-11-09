@@ -1,9 +1,9 @@
-//! `rustic-media://` — streams local audio files to the webview with HTTP Range
-//! support, so large previews play from disk instead of being base64-encoded
-//! over IPC (which is capped at 100 MB and fully decoded in memory).
+//! `rustic-media://` — streams local audio and video files to the webview with
+//! HTTP Range support, so large previews play from disk instead of being
+//! base64-encoded over IPC (which is capped at 100 MB and fully decoded in memory).
 //!
-//! Deliberately narrow: audio extensions only, the shared readable-path guard,
-//! and nothing under Rustic's own app-data directory.
+//! Deliberately narrow: audio/video extensions only, the shared readable-path
+//! guard, and nothing under Rustic's own app-data directory.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ pub const SCHEME: &str = "rustic-media";
 const AUDIO_EXT: &[&str] = &[
     "mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "aac", "weba", "aiff", "aif", "wma",
 ];
+const VIDEO_EXT: &[&str] = &["mp4", "m4v", "webm", "mov", "mkv", "ogv", "avi"];
 /// Largest slice served per request; media elements ask for the next range as they play.
 const MAX_CHUNK: u64 = 4 * 1024 * 1024;
 
@@ -30,15 +31,28 @@ pub fn handle(app: &tauri::AppHandle, req: &Request<Vec<u8>>) -> Response<Vec<u8
     })
 }
 
-fn serve(app: &tauri::AppHandle, req: &Request<Vec<u8>>) -> Result<Response<Vec<u8>>, (StatusCode, String)> {
+fn serve(
+    app: &tauri::AppHandle,
+    req: &Request<Vec<u8>>,
+) -> Result<Response<Vec<u8>>, (StatusCode, String)> {
     let raw = req.uri().path().trim_start_matches('/');
-    let path = PathBuf::from(percent_decode(raw).ok_or((StatusCode::BAD_REQUEST, "bad path encoding".into()))?);
-    let mime = audio_mime(&path).ok_or((StatusCode::FORBIDDEN, "only audio files can be streamed".into()))?;
-    rustic_app::path_scope::validate_readable_path(&path).map_err(|e| (StatusCode::FORBIDDEN, e))?;
+    let path = PathBuf::from(
+        percent_decode(raw).ok_or((StatusCode::BAD_REQUEST, "bad path encoding".into()))?,
+    );
+    let mime = media_mime(&path).ok_or((
+        StatusCode::FORBIDDEN,
+        "only audio and video files can be streamed".into(),
+    ))?;
+    rustic_app::path_scope::validate_readable_path(&path)
+        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
     deny_app_data(app, &path)?;
 
-    let mut file = std::fs::File::open(&path).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
-    let total = file.metadata().map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?.len();
+    let mut file =
+        std::fs::File::open(&path).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let total = file
+        .metadata()
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
+        .len();
     if total == 0 {
         return Response::builder()
             .status(StatusCode::OK)
@@ -46,19 +60,30 @@ fn serve(app: &tauri::AppHandle, req: &Request<Vec<u8>>) -> Result<Response<Vec<
             .body(Vec::new())
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
-    let range = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok());
-    let (start, end) = parse_range(range, total).ok_or((StatusCode::RANGE_NOT_SATISFIABLE, format!("bytes */{total}")))?;
+    let range = req
+        .headers()
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok());
+    let (start, end) = parse_range(range, total).ok_or((
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        format!("bytes */{total}"),
+    ))?;
     let end = end.min(start + MAX_CHUNK - 1);
     let len = end - start + 1;
-    file.seek(SeekFrom::Start(start)).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut buf = vec![0u8; len as usize];
-    file.read_exact(&mut buf).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    file.read_exact(&mut buf)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
         .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{total}"),
+        )
         .header(header::CONTENT_LENGTH, len.to_string())
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(buf)
@@ -67,18 +92,23 @@ fn serve(app: &tauri::AppHandle, req: &Request<Vec<u8>>) -> Result<Response<Vec<
 
 /// Refuse anything inside Rustic's own data directory (DB, secrets, history).
 fn deny_app_data(app: &tauri::AppHandle, path: &Path) -> Result<(), (StatusCode, String)> {
-    let Ok(data) = crate::app_paths::app_data_dir(app) else { return Ok(()) };
+    let Ok(data) = crate::app_paths::app_data_dir(app) else {
+        return Ok(());
+    };
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if canon(path).starts_with(canon(&data)) {
-        return Err((StatusCode::FORBIDDEN, "Rustic's internal data can't be streamed".into()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Rustic's internal data can't be streamed".into(),
+        ));
     }
     Ok(())
 }
 
-/// MIME type for a whitelisted audio extension.
-fn audio_mime(path: &Path) -> Option<&'static str> {
+/// MIME type for a whitelisted audio or video extension.
+fn media_mime(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !AUDIO_EXT.contains(&ext.as_str()) {
+    if !AUDIO_EXT.contains(&ext.as_str()) && !VIDEO_EXT.contains(&ext.as_str()) {
         return None;
     }
     Some(match ext.as_str() {
@@ -92,6 +122,12 @@ fn audio_mime(path: &Path) -> Option<&'static str> {
         "weba" => "audio/webm",
         "aiff" | "aif" => "audio/aiff",
         "wma" => "audio/x-ms-wma",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "ogv" => "video/ogg",
+        "avi" => "video/x-msvideo",
         _ => "application/octet-stream",
     })
 }
@@ -149,10 +185,21 @@ mod tests {
 
     #[test]
     fn decodes_paths_and_gates_extensions() {
-        assert_eq!(percent_decode("%2FUsers%2Fa%20b%2Fsong.mp3").as_deref(), Some("/Users/a b/song.mp3"));
-        assert_eq!(percent_decode("C%3A%5Cmusic%5Cx.wav").as_deref(), Some("C:\\music\\x.wav"));
+        assert_eq!(
+            percent_decode("%2FUsers%2Fa%20b%2Fsong.mp3").as_deref(),
+            Some("/Users/a b/song.mp3")
+        );
+        assert_eq!(
+            percent_decode("C%3A%5Cmusic%5Cx.wav").as_deref(),
+            Some("C:\\music\\x.wav")
+        );
         assert!(percent_decode("%zz").is_none());
-        assert_eq!(audio_mime(Path::new("/a/B.MP3")), Some("audio/mpeg"));
-        assert!(audio_mime(Path::new("/a/secrets.json")).is_none());
+        assert_eq!(media_mime(Path::new("/a/B.MP3")), Some("audio/mpeg"));
+        assert_eq!(
+            media_mime(Path::new("/a/clip.MOV")),
+            Some("video/quicktime")
+        );
+        assert_eq!(media_mime(Path::new("/a/clip.mp4")), Some("video/mp4"));
+        assert!(media_mime(Path::new("/a/secrets.json")).is_none());
     }
 }

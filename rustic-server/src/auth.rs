@@ -30,6 +30,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::expect_used)] // HMAC accepts keys of any length
 fn sign(secret: &[u8], msg: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(msg.as_bytes());
@@ -222,7 +223,7 @@ impl RateLimiter {
         if map.len() >= MAX_TRACKED_IPS && !map.contains_key(ip) {
             let lockout = self.lockout;
             map.retain(|_, e| {
-                e.locked_until.map_or(false, |until| until > now)
+                e.locked_until.is_some_and(|until| until > now)
                     || now.duration_since(e.last_failure) < lockout
             });
             if map.len() >= MAX_TRACKED_IPS {

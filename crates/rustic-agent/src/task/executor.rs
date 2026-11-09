@@ -214,13 +214,13 @@ async fn call_mcp_tool(
             // Resolve the owning client under the manager lock, then call
             // with only the per-client lock held.
             let client = {
-                let mut mgr = mcp_call.lock().unwrap();
+                let mut mgr = mcp_call.lock().unwrap_or_else(|p| p.into_inner());
                 mgr.client_providing(Some(&root), &name)
                     .or_else(|| mgr.reconnect_for_tool(Some(&root), &name))
             };
             let result = match client {
                 Some(c) => {
-                    let mut guard = c.lock().unwrap();
+                    let mut guard = c.lock().unwrap_or_else(|p| p.into_inner());
                     guard.call_tool(&name, tool_input)
                 }
                 None => Err(anyhow::anyhow!("No MCP server provides tool: {}", name)),
@@ -1162,6 +1162,7 @@ impl TaskExecutor {
                         self.config.context_window,
                         self.config.max_tokens,
                         self.config.thinking_budget,
+                        self.config.condense_threshold,
                     )
                 {
                     tracing::warn!(
@@ -1175,6 +1176,7 @@ impl TaskExecutor {
                             self.config.context_window,
                             self.config.max_tokens,
                             self.config.thinking_budget,
+                            self.config.condense_threshold,
                         ),
                     });
                     let original_count = messages.len() as u32;
@@ -1449,8 +1451,8 @@ impl TaskExecutor {
                             ..
                         } = b
                         {
-                            let superseded = shrink_ids.contains(tool_use_id)
-                                || aged_ids.contains(tool_use_id);
+                            let superseded =
+                                shrink_ids.contains(tool_use_id) || aged_ids.contains(tool_use_id);
                             let would_shrink = superseded && content.len() > SHRINK_MIN_BYTES;
                             if would_shrink && server_tool_use_ids.contains(tool_use_id) {
                                 dropped.insert(tool_use_id.clone());
@@ -1621,11 +1623,10 @@ impl TaskExecutor {
                                 tree_delta(&context.project_root, &a.rendered, &tree_block);
                             if added.len() + removed.len() <= TREE_DELTA_MAX_LINES {
                                 if !added.is_empty() || !removed.is_empty() {
-                                    delta = Some(
-                                        crate::system_prompt::build_project_tree_delta_block(
+                                    delta =
+                                        Some(crate::system_prompt::build_project_tree_delta_block(
                                             &added, &removed,
-                                        ),
-                                    );
+                                        ));
                                 }
                                 true
                             } else {
@@ -2144,7 +2145,7 @@ impl TaskExecutor {
                             // Same cancellable-sleep dance as the generic
                             // retry branch below. Bail to the cancel handler
                             // if the user clicks Stop during the backoff.
-                            let _ = crate::task::retry_now::take(&task_id);
+                            let _ = crate::task::retry_now::take(task_id);
                             let sleep_fut =
                                 tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
                             tokio::pin!(sleep_fut);
@@ -2161,7 +2162,7 @@ impl TaskExecutor {
                             tokio::pin!(cancel_check);
                             let retry_now_check = async {
                                 loop {
-                                    if crate::task::retry_now::take(&task_id) {
+                                    if crate::task::retry_now::take(task_id) {
                                         return;
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2305,7 +2306,7 @@ impl TaskExecutor {
                         }
                         if waiting_ms > 0 {
                             // Honour cancellation during the sleep, too.
-                            let _ = crate::task::retry_now::take(&task_id);
+                            let _ = crate::task::retry_now::take(task_id);
                             let sleep_fut =
                                 tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
                             tokio::pin!(sleep_fut);
@@ -2322,7 +2323,7 @@ impl TaskExecutor {
                             tokio::pin!(cancel_check);
                             let retry_now_check = async {
                                 loop {
-                                    if crate::task::retry_now::take(&task_id) {
+                                    if crate::task::retry_now::take(task_id) {
                                         return;
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2410,6 +2411,7 @@ impl TaskExecutor {
                             self.config.context_window,
                             self.config.max_tokens,
                             self.config.thinking_budget,
+                            self.config.condense_threshold,
                         ),
                     });
                     let original_count = messages.len() as u32;
@@ -2584,6 +2586,7 @@ impl TaskExecutor {
                     self.config.context_window,
                     self.config.max_tokens,
                     self.config.thinking_budget,
+                    self.config.condense_threshold,
                 ),
             });
             let _ = event_tx.try_send(TaskEvent::CostUpdate {
@@ -2682,7 +2685,7 @@ impl TaskExecutor {
             // is a no-op there. Cheap to run unconditionally.
             let fabricated_subagent_ids = detect_fabricated_subagent_blocks(
                 &response_content,
-                &task_id,
+                task_id,
                 &context.subagent_registry,
             );
             for id in &fabricated_subagent_ids {
@@ -3317,7 +3320,10 @@ impl TaskExecutor {
             // the UI re-renders the badge immediately rather than waiting for
             // the next provider call.
             let drained_tool_cost = {
-                let mut sink = context.tool_cost_sink.lock().unwrap();
+                let mut sink = context
+                    .tool_cost_sink
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 sink.take()
             };
             let extra_tool_cost = drained_tool_cost.total();
@@ -3609,6 +3615,7 @@ fn detect_fabricated_subagent_blocks(
 ) -> Vec<String> {
     use std::sync::OnceLock;
     static PAT: OnceLock<regex::Regex> = OnceLock::new();
+    #[allow(clippy::expect_used)] // literal pattern; covered by tests
     let pat = PAT.get_or_init(|| {
         // Capture group 1 = agent id. The id slug uses [a-z0-9-] in spawn but
         // we accept anything except a single quote so future schema changes
@@ -4541,7 +4548,9 @@ mod context_opt_tests {
     #[test]
     fn aging_keeps_newest_window_and_skips_small_or_protected() {
         // 12 results of 20K chars: newest 8 kept (160K bytes also reached).
-        let mut results: Vec<_> = (0..12).map(|i| r(&format!("t{i}"), 20_000, false)).collect();
+        let mut results: Vec<_> = (0..12)
+            .map(|i| r(&format!("t{i}"), 20_000, false))
+            .collect();
         results[1].3 = true; // protected (exempt tool / in-flight)
         results[2].2 = 900; // already tiny
         let cold = select_aged_results(&results, 8, 160_000, 1_500, true);
@@ -4552,13 +4561,23 @@ mod context_opt_tests {
 
     #[test]
     fn aging_waits_for_batch_when_cache_warm() {
-        let results: Vec<_> = (0..10).map(|i| r(&format!("t{i}"), 20_000, false)).collect();
+        let results: Vec<_> = (0..10)
+            .map(|i| r(&format!("t{i}"), 20_000, false))
+            .collect();
         // Only 2 × 20K reclaimable: below the warm batch threshold.
         assert!(select_aged_results(&results, 8, 160_000, 1_500, false).is_empty());
-        assert_eq!(select_aged_results(&results, 8, 160_000, 1_500, true).len(), 2);
+        assert_eq!(
+            select_aged_results(&results, 8, 160_000, 1_500, true).len(),
+            2
+        );
         // 8 × 20K = 160K reclaimable ≥ batch → cleared even with a warm cache.
-        let many: Vec<_> = (0..16).map(|i| r(&format!("t{i}"), 20_000, false)).collect();
-        assert_eq!(select_aged_results(&many, 8, 160_000, 1_500, false).len(), 8);
+        let many: Vec<_> = (0..16)
+            .map(|i| r(&format!("t{i}"), 20_000, false))
+            .collect();
+        assert_eq!(
+            select_aged_results(&many, 8, 160_000, 1_500, false).len(),
+            8
+        );
     }
 
     #[test]
@@ -4578,7 +4597,15 @@ mod context_opt_tests {
         let paths = tree_block_paths(old);
         assert_eq!(
             paths,
-            vec!["src/", "src/a.rs", "src/kept.rs", "src/util/", "src/util/b.rs", "icons/", "README.md"]
+            vec![
+                "src/",
+                "src/a.rs",
+                "src/kept.rs",
+                "src/util/",
+                "src/util/b.rs",
+                "icons/",
+                "README.md"
+            ]
         );
         // kept.rs dropped out of the render but still exists on disk → not
         // reported as removed; a.rs is really gone.
@@ -4598,6 +4625,9 @@ mod context_opt_tests {
                 is_error: false,
             }],
         };
-        assert_eq!(message_anchor_sig(&mk("full body")), message_anchor_sig(&mk("[stub]")));
+        assert_eq!(
+            message_anchor_sig(&mk("full body")),
+            message_anchor_sig(&mk("[stub]"))
+        );
     }
 }

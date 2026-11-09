@@ -63,6 +63,7 @@ impl ReadPool {
 impl Deref for PooledDb<'_> {
     type Target = Database;
 
+    #[allow(clippy::expect_used)] // only None inside Drop
     fn deref(&self) -> &Database {
         self.db.as_ref().expect("pooled db present until drop")
     }
@@ -87,7 +88,8 @@ mod tests {
     use super::*;
 
     fn temp_db_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("rustic-readpool-{}-{}", tag, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rustic-readpool-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("rustic.db")
@@ -104,14 +106,20 @@ mod tests {
         let pool = ReadPool::new(&path, 2);
         {
             let r = pool.checkout().unwrap();
-            let v: i64 = r.conn().query_row("SELECT v FROM t", [], |row| row.get(0)).unwrap();
+            let v: i64 = r
+                .conn()
+                .query_row("SELECT v FROM t", [], |row| row.get(0))
+                .unwrap();
             assert_eq!(v, 7);
             assert!(r.conn().execute("INSERT INTO t VALUES (1)", []).is_err());
         }
         assert_eq!(pool.idle_count(), 1);
         writer.conn().execute("UPDATE t SET v = 9", []).unwrap();
         let r = pool.checkout().unwrap();
-        let v: i64 = r.conn().query_row("SELECT v FROM t", [], |row| row.get(0)).unwrap();
+        let v: i64 = r
+            .conn()
+            .query_row("SELECT v FROM t", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(v, 9);
     }
 

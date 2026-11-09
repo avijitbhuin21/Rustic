@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserSettings {
     #[serde(default)]
     pub general: GeneralSettings,
@@ -14,18 +14,6 @@ pub struct UserSettings {
     pub ai: AiSettings,
 }
 
-impl Default for UserSettings {
-    fn default() -> Self {
-        Self {
-            general: GeneralSettings::default(),
-            editor: EditorSettings::default(),
-            theme: ThemeSettings::default(),
-            keybindings: Vec::new(),
-            ai: AiSettings::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralSettings {
     pub font_family: String,
@@ -33,10 +21,12 @@ pub struct GeneralSettings {
     pub ui_scale: f32,
     pub auto_save: bool,
     pub auto_save_delay_ms: u64,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub restore_last_session: bool,
     #[serde(default)]
     pub confirm_quit: bool,
+    #[serde(default = "default_true")]
+    pub notify_task_events: bool,
 }
 
 impl Default for GeneralSettings {
@@ -47,8 +37,9 @@ impl Default for GeneralSettings {
             ui_scale: 1.0,
             auto_save: false,
             auto_save_delay_ms: 1000,
-            restore_last_session: false,
+            restore_last_session: true,
             confirm_quit: false,
+            notify_task_events: true,
         }
     }
 }
@@ -162,5 +153,29 @@ impl Default for AiSettings {
             max_tokens: 4096,
             temperature: 0.7,
         }
+    }
+}
+
+#[cfg(test)]
+mod restore_default_tests {
+    use super::GeneralSettings;
+
+    #[test]
+    fn restore_last_session_defaults_on_but_keeps_explicit_off() {
+        assert!(GeneralSettings::default().restore_last_session);
+        let base = r#"{"font_family":"x","font_size":14,"ui_scale":1,"auto_save":false,"auto_save_delay_ms":1000"#;
+        let missing: GeneralSettings = serde_json::from_str(&format!("{base}}}")).unwrap();
+        assert!(missing.restore_last_session);
+        let off: GeneralSettings =
+            serde_json::from_str(&format!("{base},\"restore_last_session\":false}}")).unwrap();
+        assert!(!off.restore_last_session);
+    }
+
+    #[test]
+    fn notify_task_events_defaults_on_for_old_settings_files() {
+        assert!(GeneralSettings::default().notify_task_events);
+        let old = r#"{"font_family":"x","font_size":14,"ui_scale":1,"auto_save":false,"auto_save_delay_ms":1000}"#;
+        let parsed: GeneralSettings = serde_json::from_str(old).unwrap();
+        assert!(parsed.notify_task_events);
     }
 }

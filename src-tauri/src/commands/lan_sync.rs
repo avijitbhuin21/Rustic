@@ -89,7 +89,11 @@ pub async fn lan_respond_pair(
 
 /// Forget a paired device (it must pair again to sync); tells it first.
 #[tauri::command]
-pub async fn lan_forget(app: AppHandle, lan: State<'_, LanState>, device_id: String) -> Result<(), String> {
+pub async fn lan_forget(
+    app: AppHandle,
+    lan: State<'_, LanState>,
+    device_id: String,
+) -> Result<(), String> {
     ops::forget(&DesktopPeerHost::arc(&app), lan.inner(), &device_id).await
 }
 
@@ -101,7 +105,13 @@ pub async fn lan_push(
     device_id: String,
     project_id: Option<String>,
 ) -> Result<String, String> {
-    ops::push(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, project_id).await
+    ops::push(
+        &DesktopPeerHost::arc(&app),
+        lan.inner(),
+        &device_id,
+        project_id,
+    )
+    .await
 }
 
 /// Pull from a paired device: everything, or one project (optionally into a chosen folder).
@@ -113,7 +123,14 @@ pub async fn lan_pull(
     project_id: Option<String>,
     target_parent: Option<String>,
 ) -> Result<String, String> {
-    ops::pull(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, project_id, target_parent).await
+    ops::pull(
+        &DesktopPeerHost::arc(&app),
+        lan.inner(),
+        &device_id,
+        project_id,
+        target_parent,
+    )
+    .await
 }
 
 /// Projects a paired device shares with us.
@@ -134,7 +151,13 @@ pub async fn lan_meta_preview(
     device_id: String,
     direction: String,
 ) -> Result<Vec<rustic_app::meta_sync::MetaDiffEntry>, String> {
-    ops::meta_preview(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, &direction).await
+    ops::meta_preview(
+        &DesktopPeerHost::arc(&app),
+        lan.inner(),
+        &device_id,
+        &direction,
+    )
+    .await
 }
 
 /// Metadata merge with a paired device.
@@ -146,7 +169,14 @@ pub async fn lan_meta_apply(
     direction: String,
     overwrite: Vec<String>,
 ) -> Result<rustic_app::meta_sync::MetaApplySummary, String> {
-    ops::meta_apply(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, &direction, overwrite).await
+    ops::meta_apply(
+        &DesktopPeerHost::arc(&app),
+        lan.inner(),
+        &device_id,
+        &direction,
+        overwrite,
+    )
+    .await
 }
 
 /// Called from app setup: restore "Allow local-network sync" (and the
@@ -173,7 +203,11 @@ pub async fn lan_get_share(app: AppHandle, device_id: String) -> Result<lan::Sha
 
 /// Replace what this machine shares with a paired device.
 #[tauri::command]
-pub async fn lan_set_share(app: AppHandle, device_id: String, share: lan::Share) -> Result<(), String> {
+pub async fn lan_set_share(
+    app: AppHandle,
+    device_id: String,
+    share: lan::Share,
+) -> Result<(), String> {
     ops::set_share(&DesktopPeerHost::arc(&app), &device_id, share)
 }
 
@@ -198,7 +232,15 @@ pub async fn lan_sync_items(
     projects: Vec<SyncProject>,
     meta: Vec<lan::consent::RequestedMeta>,
 ) -> Result<SyncItemsResult, String> {
-    ops::sync_items(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, &direction, projects, meta).await
+    ops::sync_items(
+        &DesktopPeerHost::arc(&app),
+        lan.inner(),
+        &device_id,
+        &direction,
+        projects,
+        meta,
+    )
+    .await
 }
 
 /// Advertise this machine on the local network (mDNS) or not — "internet only" when off.
@@ -222,10 +264,12 @@ pub async fn lan_set_internet_mode(
     ops::set_internet_mode(&DesktopPeerHost::arc(&app), lan.inner(), &mode).await
 }
 
-
 /// Stop waiting on our pairing / approval request to `device_id` (dismisses its prompt).
 #[tauri::command]
-pub async fn lan_cancel_outgoing(lan: State<'_, LanState>, device_id: String) -> Result<(), String> {
+pub async fn lan_cancel_outgoing(
+    lan: State<'_, LanState>,
+    device_id: String,
+) -> Result<(), String> {
     ops::cancel_outgoing(lan.inner(), &device_id)
 }
 
@@ -238,7 +282,14 @@ pub async fn lan_list_files(
     project_id: String,
     path: Option<String>,
 ) -> Result<Vec<lan::files::FsEntry>, String> {
-    ops::list_files(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, &project_id, path.as_deref().unwrap_or("")).await
+    ops::list_files(
+        &DesktopPeerHost::arc(&app),
+        lan.inner(),
+        &device_id,
+        &project_id,
+        path.as_deref().unwrap_or(""),
+    )
+    .await
 }
 
 /// One file of a shared project, loaded for the preview pane.
@@ -250,7 +301,14 @@ pub async fn lan_preview_file(
     project_id: String,
     path: String,
 ) -> Result<lan::files::Preview, String> {
-    ops::preview_file(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, &project_id, &path).await
+    ops::preview_file(
+        &DesktopPeerHost::arc(&app),
+        lan.inner(),
+        &device_id,
+        &project_id,
+        &path,
+    )
+    .await
 }
 
 /// Total size of a selection on a paired device.
@@ -266,7 +324,10 @@ pub async fn lan_remote_size(
 
 /// Names a pull into `dest_dir` would collide with.
 #[tauri::command]
-pub async fn lan_local_conflicts(dest_dir: String, items: Vec<lan::consent::RequestedFile>) -> Result<Vec<String>, String> {
+pub async fn lan_local_conflicts(
+    dest_dir: String,
+    items: Vec<lan::consent::RequestedFile>,
+) -> Result<Vec<String>, String> {
     Ok(ops::local_conflicts(&dest_dir, &items))
 }
 
@@ -280,7 +341,15 @@ pub async fn lan_remote_conflicts(
     dir: Option<String>,
     names: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    ops::remote_conflicts(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, &project_id, dir.as_deref().unwrap_or(""), names).await
+    ops::remote_conflicts(
+        &DesktopPeerHost::arc(&app),
+        lan.inner(),
+        &device_id,
+        &project_id,
+        dir.as_deref().unwrap_or(""),
+        names,
+    )
+    .await
 }
 
 /// Pull files / folders from a paired device into `dest_dir` (one approval).
@@ -293,7 +362,15 @@ pub async fn lan_pull_files(
     dest_dir: String,
     opts: Option<ops::FileTransferOpts>,
 ) -> Result<lan::files::UnpackSummary, String> {
-    ops::pull_files(&DesktopPeerHost::arc(&app), lan.inner(), &device_id, items, dest_dir, opts.unwrap_or_default()).await
+    ops::pull_files(
+        &DesktopPeerHost::arc(&app),
+        lan.inner(),
+        &device_id,
+        items,
+        dest_dir,
+        opts.unwrap_or_default(),
+    )
+    .await
 }
 
 /// Upload local files / folders to a paired device's project folder (one approval).
@@ -322,19 +399,31 @@ pub async fn lan_push_files(
 
 /// Ask a paired device for one-time permission to browse its metadata.
 #[tauri::command]
-pub async fn lan_request_meta_access(app: AppHandle, lan: State<'_, LanState>, device_id: String) -> Result<(), String> {
+pub async fn lan_request_meta_access(
+    app: AppHandle,
+    lan: State<'_, LanState>,
+    device_id: String,
+) -> Result<(), String> {
     ops::request_meta_access(&DesktopPeerHost::arc(&app), lan.inner(), &device_id).await
 }
 
 /// A paired device's metadata for browsing (`granted` + items).
 #[tauri::command]
-pub async fn lan_meta_browse(app: AppHandle, lan: State<'_, LanState>, device_id: String) -> Result<serde_json::Value, String> {
+pub async fn lan_meta_browse(
+    app: AppHandle,
+    lan: State<'_, LanState>,
+    device_id: String,
+) -> Result<serde_json::Value, String> {
     ops::meta_browse(&DesktopPeerHost::arc(&app), lan.inner(), &device_id).await
 }
 
 /// Grant / revoke a paired device's metadata browsing on this machine.
 #[tauri::command]
-pub async fn lan_set_meta_view(app: AppHandle, device_id: String, allowed: bool) -> Result<(), String> {
+pub async fn lan_set_meta_view(
+    app: AppHandle,
+    device_id: String,
+    allowed: bool,
+) -> Result<(), String> {
     ops::set_meta_view(&DesktopPeerHost::arc(&app), &device_id, allowed)
 }
 

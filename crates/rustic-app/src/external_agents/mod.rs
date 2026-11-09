@@ -231,10 +231,11 @@ impl ShellKind {
             };
         };
         let low = program.to_lowercase();
-        let low = Path::new(&low)
+        let base = low.rsplit(['/', '\\']).next().unwrap_or(&low);
+        let low = Path::new(base)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or(low);
+            .unwrap_or_else(|| base.to_string());
         match low.as_str() {
             "powershell" | "pwsh" => ShellKind::PowerShell,
             _ => ShellKind::Posix,
@@ -333,6 +334,7 @@ pub struct LaunchPlan {
 /// `launcher` is the absolute path of the copy to run — pass it so the launch
 /// can't land on a stale duplicate the shell happens to find first. `None` falls
 /// back to the bare program name.
+#[allow(clippy::too_many_arguments)]
 pub fn build_launch_plan(
     kind: AgentKind,
     mode: &LaunchMode,

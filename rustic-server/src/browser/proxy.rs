@@ -90,10 +90,10 @@ async fn pipe(client: WebSocket, upstream_url: String, browser: Arc<super::Brows
     let c2u = async move {
         while let Some(Ok(msg)) = client_rx.next().await {
             let out = match msg {
-                AxMessage::Text(t) => TMessage::Text(t.into()),
-                AxMessage::Binary(b) => TMessage::Binary(b.into()),
-                AxMessage::Ping(b) => TMessage::Ping(b.into()),
-                AxMessage::Pong(b) => TMessage::Pong(b.into()),
+                AxMessage::Text(t) => TMessage::Text(t),
+                AxMessage::Binary(b) => TMessage::Binary(b),
+                AxMessage::Ping(b) => TMessage::Ping(b),
+                AxMessage::Pong(b) => TMessage::Pong(b),
                 AxMessage::Close(_) => break,
             };
             if to_up_from_client.send(out).await.is_err() {
@@ -121,7 +121,7 @@ async fn pipe(client: WebSocket, upstream_url: String, browser: Arc<super::Brows
                             "params": { "sessionId": sid },
                         })
                         .to_string();
-                        if to_up_tx.send(TMessage::Text(ack.into())).await.is_err() {
+                        if to_up_tx.send(TMessage::Text(ack)).await.is_err() {
                             break;
                         }
                         // Latest-wins: replaces any frame the client hasn't sent yet.

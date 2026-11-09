@@ -181,11 +181,11 @@ export function MascotSendButton({
           )}
         </button>
       </TooltipTrigger>
-      <TooltipContent side="top" className="text-center">
-        <div>{label}</div>
-        {ctxLine && <div className="text-muted-foreground">{ctxLine}</div>}
+      <TooltipContent side="top" className="max-w-none flex-col items-center gap-0.5 text-center">
+        <div className="whitespace-nowrap">{label}</div>
+        {ctxLine && <div className="whitespace-nowrap opacity-70">{ctxLine}</div>}
         {pct != null && usage.threshold > 0 && (
-          <div className="text-muted-foreground">
+          <div className="whitespace-nowrap opacity-70">
             Auto-condenses at {fmtTokens(usage.threshold)}
             {usage.contextWindow > 0 ? ` · context window ${fmtTokens(usage.contextWindow)}` : ''}
           </div>

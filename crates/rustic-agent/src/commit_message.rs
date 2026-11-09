@@ -89,6 +89,7 @@ pub async fn generate_commit_message(
         system_prompt: Some(SYSTEM_PROMPT.to_string()),
         thinking_budget: 0,
         context_window: 0,
+        condense_threshold: 0,
         web_search_enabled: false,
         web_fetch_enabled: false,
         supports_temperature: req.capabilities.supports_temperature,

@@ -246,7 +246,9 @@ mod tests {
         use crate::provider::{Message, Role};
         let msg = |role: Role, text: &str| Message {
             role,
-            content: vec![ContentBlock::Text { text: text.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
         };
         let a = vec![msg(Role::User, "hello"), msg(Role::Assistant, "hi")];
         let same = vec![msg(Role::User, "hello"), msg(Role::Assistant, "hi")];

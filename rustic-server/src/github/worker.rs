@@ -62,7 +62,7 @@ fn project_root_for(ctx: &ServerContext, project_id: &str) -> Result<(PathBuf, S
     let ws = ctx.state.workspace.lock_safe();
     ws.list_projects()
         .into_iter()
-        .find(|p| p.id.to_string() == project_id)
+        .find(|p| p.id == project_id)
         .map(|p| (p.root_path.clone(), p.name.clone()))
         .ok_or_else(|| format!("project {project_id} not in workspace"))
 }
@@ -347,11 +347,11 @@ async fn await_terminal(ctx: &ServerContext, task_id: &str) -> TaskStatus {
         waited_secs += 2;
         let status = {
             let agent = ctx.state.agent.lock_safe();
-            agent.tasks.get(task_id).map(|t| t.info.status.clone())
+            agent.tasks.get(task_id).map(|t| t.info.status)
         };
         match status {
             Some(TaskStatus::Running) | Some(TaskStatus::Preparing) => {
-                if waited_secs % 600 == 0 {
+                if waited_secs.is_multiple_of(600) {
                     tracing::info!(task = %task_id, waited_secs, "github worker: fixer task still running");
                 }
             }

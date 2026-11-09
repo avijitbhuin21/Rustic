@@ -1096,7 +1096,7 @@ impl FileHistory {
             // Include both per-message and per-task final trees so neither set is pruned.
             db.fh_all_tree_oids()?
                 .into_iter()
-                .chain(db.fh_all_final_tree_oids()?.into_iter())
+                .chain(db.fh_all_final_tree_oids()?)
                 .filter_map(|s| Oid::from_hex(s.as_bytes()).ok())
                 .collect()
         };

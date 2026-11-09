@@ -89,7 +89,7 @@ pub async fn generate_commit_message(
         let project = workspace
             .list_projects()
             .into_iter()
-            .find(|p| p.id.to_string() == project_id)
+            .find(|p| p.id == project_id)
             .ok_or_else(|| format!("Project not found: {}", project_id))?;
         project.root_path.to_string_lossy().to_string()
     };

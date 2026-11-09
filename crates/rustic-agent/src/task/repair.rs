@@ -63,13 +63,15 @@ fn dimension_limit(error: &str) -> Option<u32> {
     if !(e.contains("image") && (e.contains("dimension") || e.contains("many-image"))) {
         return None;
     }
-    let num = e
-        .find("pixels")
-        .and_then(|end| {
-            let head = e[..end].trim_end();
-            let digits: String = head.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
-            digits.chars().rev().collect::<String>().parse::<u32>().ok()
-        });
+    let num = e.find("pixels").and_then(|end| {
+        let head = e[..end].trim_end();
+        let digits: String = head
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.chars().rev().collect::<String>().parse::<u32>().ok()
+    });
     Some(num.unwrap_or(crate::media_store::REQUEST_IMAGE_SIDE))
 }
 
@@ -80,14 +82,19 @@ fn dimension_limit(error: &str) -> Option<u32> {
 pub fn repair_history_for_provider_error(messages: &mut [Message], error: &str) -> RepairReport {
     if let Some(limit) = dimension_limit(error) {
         // A little under the stated limit so rounding never lands us on it.
-        let cap = limit.saturating_sub(16).clamp(256, crate::media_store::REQUEST_IMAGE_SIDE);
+        let cap = limit
+            .saturating_sub(16)
+            .clamp(256, crate::media_store::REQUEST_IMAGE_SIDE);
         let shrunk: usize = messages
             .iter_mut()
             .flat_map(|m| m.content.iter_mut())
             .map(|b| usize::from(crate::media_store::shrink_block(b, cap)))
             .sum();
         if shrunk > 0 {
-            return RepairReport { stubbed: shrunk, targeted: false };
+            return RepairReport {
+                stubbed: shrunk,
+                targeted: false,
+            };
         }
     }
     // Targeted pass: the Anthropic error path indexes the API request's
@@ -160,7 +167,9 @@ mod tests {
         use base64::Engine as _;
         let img = image::RgbImage::from_pixel(w, h, image::Rgb([200, 30, 30]));
         let mut out = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(img).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
         base64::engine::general_purpose::STANDARD.encode(out.into_inner())
     }
 
@@ -168,14 +177,28 @@ mod tests {
     fn parses_many_image_pixel_limit() {
         let err = r#"Claude API error 400 Bad Request: {"message":"messages.92.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 3000 pixels"}"#;
         assert_eq!(dimension_limit(err), Some(3000));
-        assert_eq!(dimension_limit("image dimensions too big"), Some(crate::media_store::REQUEST_IMAGE_SIDE));
-        assert_eq!(dimension_limit("messages.1.content.0.image.source: invalid base64"), None);
+        assert_eq!(
+            dimension_limit("image dimensions too big"),
+            Some(crate::media_store::REQUEST_IMAGE_SIDE)
+        );
+        assert_eq!(
+            dimension_limit("messages.1.content.0.image.source: invalid base64"),
+            None
+        );
     }
 
     #[test]
     fn pixel_limit_error_downscales_every_oversized_image_instead_of_stubbing() {
-        let big = || ContentBlock::Image { media_type: "image/png".into(), data: png_b64(3200, 900), path: None };
-        let small = ContentBlock::Image { media_type: "image/png".into(), data: png_b64(400, 300), path: None };
+        let big = || ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: png_b64(3200, 900),
+            path: None,
+        };
+        let small = ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: png_b64(400, 300),
+            path: None,
+        };
         let mut messages = vec![
             msg(Role::User, vec![text("first"), big()]),
             msg(Role::Assistant, vec![text("ok")]),
@@ -183,18 +206,30 @@ mod tests {
         ];
         let err = "Claude API error 400: messages.92.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 3000 pixels";
         let report = repair_history_for_provider_error(&mut messages, err);
-        assert_eq!(report.stubbed, 2, "both oversized images resized, the small one untouched");
+        assert_eq!(
+            report.stubbed, 2,
+            "both oversized images resized, the small one untouched"
+        );
         for m in &messages {
             for b in &m.content {
                 if let ContentBlock::Image { data, .. } = b {
                     use base64::Engine as _;
-                    let bytes = base64::engine::general_purpose::STANDARD.decode(data).unwrap();
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .unwrap();
                     let (w, h) = crate::media_store::image_dimensions(&bytes).unwrap();
                     assert!(w <= 2000 && h <= 2000, "still {w}x{h}");
                 }
             }
         }
-        assert!(messages.iter().flat_map(|m| &m.content).filter(|b| matches!(b, ContentBlock::Image { .. })).count() == 3);
+        assert!(
+            messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                .count()
+                == 3
+        );
     }
 
     fn img() -> ContentBlock {
@@ -439,7 +474,9 @@ fn text_tool_param_value(raw: &str) -> serde_json::Value {
 
 /// Splits text containing Qwen/MiMo-style `<function=name><parameter=k>v</parameter></function>`
 /// calls into the leading prose and the parsed `(name, input)` calls.
-pub(crate) fn parse_text_tool_calls(text: &str) -> Option<(String, Vec<(String, serde_json::Value)>)> {
+pub(crate) fn parse_text_tool_calls(
+    text: &str,
+) -> Option<(String, Vec<(String, serde_json::Value)>)> {
     let first = text.find("<function=")?;
     let mut prose = text[..first].to_string();
     if let Some(stripped) = prose.trim_end().strip_suffix("<tool_call>") {
@@ -484,7 +521,10 @@ pub(crate) fn parse_text_tool_calls(text: &str) -> Option<(String, Vec<(String, 
 /// Converts tool calls a model wrote as plain text into real ToolUse blocks
 /// when the response carries no structured tool calls; returns true if any were recovered.
 pub(crate) fn recover_text_tool_calls(content: &mut Vec<ContentBlock>) -> bool {
-    if content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })) {
+    if content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+    {
         return false;
     }
     let mut recovered = false;
@@ -543,7 +583,9 @@ mod text_tool_call_tests {
     #[test]
     fn recover_skips_when_structured_calls_exist() {
         let mut c = vec![
-            ContentBlock::Text { text: "<function=a><parameter=b>c".into() },
+            ContentBlock::Text {
+                text: "<function=a><parameter=b>c".into(),
+            },
             ContentBlock::ToolUse {
                 id: "1".into(),
                 name: "x".into(),
@@ -552,7 +594,9 @@ mod text_tool_call_tests {
             },
         ];
         assert!(!recover_text_tool_calls(&mut c));
-        let mut c = vec![ContentBlock::Text { text: "hi <function=a><parameter=b>c".into() }];
+        let mut c = vec![ContentBlock::Text {
+            text: "hi <function=a><parameter=b>c".into(),
+        }];
         assert!(recover_text_tool_calls(&mut c));
         assert_eq!(c.len(), 2);
     }

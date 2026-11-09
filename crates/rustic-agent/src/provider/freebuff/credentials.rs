@@ -86,6 +86,22 @@ pub fn read_account() -> Result<(String, Option<String>)> {
     Ok((a.auth_token, a.email.or(a.name)))
 }
 
+/// Non-failing probe for the Settings toggle.
+pub fn detect() -> DetectInfo {
+    match load() {
+        Ok(acct) => DetectInfo {
+            available: true,
+            email: acct.email.or(acct.name),
+            reason: None,
+        },
+        Err(e) => DetectInfo {
+            available: false,
+            email: None,
+            reason: Some(e.to_string()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,21 +129,5 @@ mod tests {
         let parsed: CredentialsFile = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.default.auth_token, "only-token");
         assert!(parsed.default.email.is_none());
-    }
-}
-
-/// Non-failing probe for the Settings toggle.
-pub fn detect() -> DetectInfo {
-    match load() {
-        Ok(acct) => DetectInfo {
-            available: true,
-            email: acct.email.or(acct.name),
-            reason: None,
-        },
-        Err(e) => DetectInfo {
-            available: false,
-            email: None,
-            reason: Some(e.to_string()),
-        },
     }
 }

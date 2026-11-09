@@ -269,6 +269,9 @@ pub struct ProviderConfig {
     /// When 0, condensing is disabled.
     #[serde(default)]
     pub context_window: u32,
+    /// User "auto-condense at" token cap. 0 → automatic (93% of headroom).
+    #[serde(default)]
+    pub condense_threshold: u32,
     /// Whether the user has enabled web_search. Consumed by provider adapters
     /// that support server-side tools (Claude, Gemini) to inject the native
     /// tool declaration. Client-side providers ignore this flag — the tool
@@ -900,7 +903,10 @@ mod helper_tests {
     fn sse_buffer_splits_lines_across_chunks_and_flushes_tail() {
         let mut b = SseLineBuffer::new();
         assert!(b.push(b"data: a").is_empty());
-        assert_eq!(b.push(b"bc\r\ndata: x\n\ndata: tai"), vec!["data: abc", "data: x", ""]);
+        assert_eq!(
+            b.push(b"bc\r\ndata: x\n\ndata: tai"),
+            vec!["data: abc", "data: x", ""]
+        );
         assert_eq!(b.push(b"l"), Vec::<String>::new());
         assert_eq!(b.flush().as_deref(), Some("data: tail"));
         assert_eq!(b.flush(), None);
@@ -923,24 +929,42 @@ mod helper_tests {
         assert_eq!(classify_sse_line(""), SseLine::Skip);
         assert_eq!(classify_sse_line("data: [DONE]"), SseLine::Done);
         assert_eq!(classify_sse_line("data:[DONE] "), SseLine::Done);
-        assert_eq!(classify_sse_line("data: {\"a\":1}"), SseLine::Data("{\"a\":1}"));
+        assert_eq!(
+            classify_sse_line("data: {\"a\":1}"),
+            SseLine::Data("{\"a\":1}")
+        );
         assert_eq!(classify_sse_line("data:{}"), SseLine::Data("{}"));
-        assert!(matches!(parse_sse_json::<serde_json::Value>("data: {nope", "t"), SseJson::Invalid));
-        assert!(matches!(parse_sse_json::<serde_json::Value>("data: {\"a\":1}", "t"), SseJson::Value(v) if v["a"] == 1));
+        assert!(matches!(
+            parse_sse_json::<serde_json::Value>("data: {nope", "t"),
+            SseJson::Invalid
+        ));
+        assert!(
+            matches!(parse_sse_json::<serde_json::Value>("data: {\"a\":1}", "t"), SseJson::Value(v) if v["a"] == 1)
+        );
     }
 
     #[test]
     fn tools_sorted_by_name() {
-        let t = |n: &str| ToolDef { name: n.into(), description: String::new(), parameters: serde_json::json!({}) };
+        let t = |n: &str| ToolDef {
+            name: n.into(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        };
         let tools = vec![t("read_file"), t("mcp__z"), t("edit_file")];
-        let names: Vec<&str> = sorted_tools(&tools).iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = sorted_tools(&tools)
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
         assert_eq!(names, vec!["edit_file", "mcp__z", "read_file"]);
     }
 
     #[test]
     fn conversation_cache_key_stable_per_conversation() {
         let c = cfg();
-        let m = |s: &str| Message { role: Role::User, content: vec![ContentBlock::Text { text: s.into() }] };
+        let m = |s: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: s.into() }],
+        };
         let a = vec![m("task one")];
         let mut a_later = a.clone();
         a_later.push(m("follow-up"));

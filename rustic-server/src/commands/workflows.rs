@@ -73,7 +73,9 @@ pub async fn dispatch(
             Err(e) => Err(e),
         },
         "install_repo_workflows" => match parse::<InstallArg>(args) {
-            Ok(a) => reply(ops::install_repo_workflows(&a.source, &a.paths, a.names.as_deref()).await),
+            Ok(a) => {
+                reply(ops::install_repo_workflows(&a.source, &a.paths, a.names.as_deref()).await)
+            }
             Err(e) => Err(e),
         },
         _ => return None,

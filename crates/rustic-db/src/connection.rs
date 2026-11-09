@@ -156,7 +156,9 @@ impl Database {
         use rusqlite::OpenFlags;
         let conn = Connection::open_with_flags(
             path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         conn.execute_batch("PRAGMA cache_size=-8192;")?;
@@ -233,7 +235,7 @@ impl Database {
             return Ok(());
         }
 
-        if self.path != PathBuf::from(":memory:") && self.path.exists() {
+        if self.path.as_os_str() != ":memory:" && self.path.exists() {
             let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
             let mut backup = self.path.clone();
             let file_name = backup

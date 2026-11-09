@@ -48,7 +48,12 @@ fn to_skill_info(s: &SkillDef) -> SkillInfo {
 }
 
 fn global_info(name: String, description: String, allowed_tools: Option<Vec<String>>) -> SkillInfo {
-    SkillInfo { name, description, scope: "global".to_string(), allowed_tools }
+    SkillInfo {
+        name,
+        description,
+        scope: "global".to_string(),
+        allowed_tools,
+    }
 }
 
 fn skills_root() -> Result<PathBuf, String> {
@@ -84,8 +89,11 @@ pub fn create_skill(name: &str, body: &str) -> Result<SkillInfo, String> {
         return Err(format!("Skill already exists: {}", safe_name));
     }
     let description = summarize(body);
-    rustic_core::io_util::atomic_write(&skill_md_path, with_frontmatter(&safe_name, &description, body).as_bytes())
-        .map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(
+        &skill_md_path,
+        with_frontmatter(&safe_name, &description, body).as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(global_info(safe_name, description, None))
 }
 
@@ -150,9 +158,17 @@ pub async fn list_repo_skills(source: &str) -> Result<Vec<RepoSkillInfo>, String
                 Some((n, d, _)) => (n, d),
                 None => (filename_stem(&url), summarize(&text)),
             };
-            Ok(vec![RepoSkillInfo { name, description, path: url }])
+            Ok(vec![RepoSkillInfo {
+                name,
+                description,
+                path: url,
+            }])
         }
-        GithubSource::RepoZip { owner, repo, subpath } => {
+        GithubSource::RepoZip {
+            owner,
+            repo,
+            subpath,
+        } => {
             let zip_bytes = download_repo_zip(&owner, &repo).await?;
             scan_skills_in_zip(&zip_bytes, subpath.as_deref())
         }
@@ -214,7 +230,10 @@ fn install_skill_from_text(text: &str, override_name: Option<&str>) -> Result<Sk
     Ok(global_info(safe_name, description, allowed_tools))
 }
 
-pub fn scan_skills_in_zip(zip_bytes: &[u8], subpath_filter: Option<&str>) -> Result<Vec<RepoSkillInfo>, String> {
+pub fn scan_skills_in_zip(
+    zip_bytes: &[u8],
+    subpath_filter: Option<&str>,
+) -> Result<Vec<RepoSkillInfo>, String> {
     let mut results = Vec::new();
     scan_skills_in_zip_each(zip_bytes, subpath_filter, &mut |s| results.push(s))?;
     if results.is_empty() {
@@ -232,7 +251,7 @@ pub fn scan_skills_in_zip_each(
     let mut archive = open_zip(zip_bytes)?;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = file.name().to_string();
+        let name = file.name().map_err(|e| e.to_string())?.to_string();
         if !(name.ends_with("/SKILL.md") || name == "SKILL.md") {
             continue;
         }
@@ -242,11 +261,16 @@ pub fn scan_skills_in_zip_each(
             }
         }
         let mut content = String::new();
-        file.read_to_string(&mut content).map_err(|e| e.to_string())?;
+        file.read_to_string(&mut content)
+            .map_err(|e| e.to_string())?;
         let Some((skill_name, description, _)) = parse_skill_frontmatter(&content) else {
             continue;
         };
-        on_found(RepoSkillInfo { name: skill_name, description, path: name });
+        on_found(RepoSkillInfo {
+            name: skill_name,
+            description,
+            path: name,
+        });
     }
     Ok(())
 }
@@ -255,7 +279,11 @@ pub fn scan_skills_in_zip_each(
 /// of that directory and safe to write; `None` otherwise.
 fn top_level_relative<'a>(entry_name: &'a str, dir_prefix: &str) -> Option<&'a str> {
     let relative = entry_name.strip_prefix(dir_prefix)?;
-    if relative.is_empty() || relative.contains(['/', '\\', ':']) || relative == "." || relative == ".." {
+    if relative.is_empty()
+        || relative.contains(['/', '\\', ':'])
+        || relative == "."
+        || relative == ".."
+    {
         return None;
     }
     Some(relative)
@@ -277,10 +305,14 @@ fn extract_skills_from_zip(
             .map_err(|e| e.to_string())?
             .read_to_string(&mut content)
             .map_err(|e| e.to_string())?;
-        let Some((parsed_name, description, allowed_tools)) = parse_skill_frontmatter(&content) else {
+        let Some((parsed_name, description, allowed_tools)) = parse_skill_frontmatter(&content)
+        else {
             continue;
         };
-        let dir_prefix = skill_md_path.rfind('/').map(|i| &skill_md_path[..i + 1]).unwrap_or("");
+        let dir_prefix = skill_md_path
+            .rfind('/')
+            .map(|i| &skill_md_path[..i + 1])
+            .unwrap_or("");
         let safe_name = sanitize_name(&name_override(names, i).unwrap_or(parsed_name));
         let skill_out_dir = skills_dir.join(&safe_name);
         std::fs::create_dir_all(&skill_out_dir).map_err(|e| e.to_string())?;
@@ -291,7 +323,7 @@ fn extract_skills_from_zip(
             if entry.is_dir() {
                 continue;
             }
-            let entry_name = entry.name().to_string();
+            let entry_name = entry.name().map_err(|e| e.to_string())?.to_string();
             let Some(relative) = top_level_relative(&entry_name, dir_prefix) else {
                 continue;
             };

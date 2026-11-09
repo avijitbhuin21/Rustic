@@ -8,6 +8,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Copy,
+  FileText,
   HelpCircle,
   Image as ImageIcon,
   Loader2,
@@ -15,6 +16,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
+import { splitFileMentions, stripFileRefsFooter, openFileMention } from '@/lib/file-mentions';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAgent, fetchImageDataUrl } from '@/state/agent';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
@@ -530,7 +532,49 @@ function ImageAttachment({ src: srcProp, alt, attachment, galleryRef }) {
 // the wrapper height via framer-motion. The first render returns a plain div
 // so the initial measured → collapsed transition isn't animated; subsequent
 // expand / collapse interactions DO animate.
-function CollapsibleUserText({ text, actions }) {
+/** Renders user text with `@path` references as clickable links that open the file. */
+function MentionText({ text, fileRefs, projectRoot }) {
+  if (!fileRefs || fileRefs.length === 0) return text;
+  return splitFileMentions(text, fileRefs).map((seg, i) =>
+    seg.type === 'file' ? (
+      <button
+        key={i}
+        type="button"
+        onClick={() => openFileMention(projectRoot || activeChatRoot(), seg.path)}
+        title={`Open ${seg.path}`}
+        className="rounded-sm bg-muted-foreground/15 px-0.5 text-foreground underline decoration-muted-foreground/50 underline-offset-2 hover:bg-muted-foreground/25"
+      >
+        @{seg.path}
+      </button>
+    ) : (
+      <React.Fragment key={i}>{seg.text}</React.Fragment>
+    ),
+  );
+}
+
+/** Chips for referenced files that weren't mentioned inline (older messages). */
+function LooseFileRefs({ text, fileRefs, projectRoot }) {
+  const loose = (fileRefs || []).filter((p) => !(text || '').includes(`@${p}`));
+  if (loose.length === 0) return null;
+  return (
+    <div className="mt-1.5 flex flex-wrap gap-1">
+      {loose.map((p) => (
+        <button
+          key={p}
+          type="button"
+          onClick={() => openFileMention(projectRoot || activeChatRoot(), p)}
+          title={`Open ${p}`}
+          className="inline-flex max-w-full items-center gap-1 truncate rounded-md border border-border/60 bg-background/40 px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          <FileText className="size-3 shrink-0" />
+          <span className="truncate">{p}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function CollapsibleUserText({ text, actions, fileRefs, projectRoot }) {
   const [expanded, setExpanded] = useState(false);
   const innerRef = useRef(null);
   const [heights, setHeights] = useState(null);
@@ -558,7 +602,7 @@ function CollapsibleUserText({ text, actions }) {
         ref={innerRef}
         className="whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]"
       >
-        {text}
+        <MentionText text={text} fileRefs={fileRefs} projectRoot={projectRoot} />
       </div>
     );
   }
@@ -581,9 +625,10 @@ function CollapsibleUserText({ text, actions }) {
           ref={innerRef}
           className="whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]"
         >
-          {text}
+          <MentionText text={text} fileRefs={fileRefs} projectRoot={projectRoot} />
         </div>
       </motion.div>
+      <LooseFileRefs text={text} fileRefs={fileRefs} projectRoot={projectRoot} />
       {showActionRow && (
         <div className="mt-1 flex items-center justify-between gap-2">
           {canCollapse ? (
@@ -849,7 +894,8 @@ function InjectedPromptCapsule({ label, preview, text }) {
 
 function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
   const { user, blocks } = turn;
-  const text = userText(user);
+  const { text: strippedText, paths: fileRefs } = stripFileRefsFooter(userText(user));
+  const text = strippedText.trim();
   const escalation = parseEscalation(text);
   const peerMessage = parsePeerMessage(text);
   const injectedCapsule = peerMessage ? null : matchInjectedCapsule(text);
@@ -929,7 +975,12 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
               ) : text && injectedCapsule ? (
                 <InjectedPromptCapsule label={injectedCapsule.label} text={text} />
               ) : text ? (
-                <CollapsibleUserText text={text} actions={userActions} />
+                <CollapsibleUserText
+                  text={text}
+                  actions={userActions}
+                  fileRefs={fileRefs}
+                  projectRoot={projectRoot}
+                />
               ) : null}
             </div>
             )}

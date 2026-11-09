@@ -35,8 +35,8 @@ const WATCHER_SKIP_DIRS: &[&str] = &[
 /// than `contains("/node_modules/")` so `tmp/` at the project root is caught
 /// even when it's the very first segment after the root.
 fn path_has_skip_segment(s: &str) -> bool {
-    for seg in s.split(|c| c == '/' || c == '\\') {
-        if WATCHER_SKIP_DIRS.iter().any(|d| *d == seg) {
+    for seg in s.split(['/', '\\']) {
+        if WATCHER_SKIP_DIRS.contains(&seg) {
             return true;
         }
     }
@@ -69,7 +69,7 @@ fn is_interesting_git_file(rel: &str) -> bool {
 fn git_relative_part(path: &str) -> Option<String> {
     let mut rest: Vec<&str> = Vec::new();
     let mut found = false;
-    for seg in path.split(|c| c == '/' || c == '\\') {
+    for seg in path.split(['/', '\\']) {
         if found {
             rest.push(seg);
         } else if seg == ".git" {
@@ -186,12 +186,15 @@ impl FileWatcherManager {
         let raw = normalize(&project_root.to_string_lossy());
         let norm = strip_verbatim(&raw).to_string();
         let key = watch_key(&norm);
-        let subs = self.subscribers.entry(key.clone()).or_insert_with(|| Subscribers {
-            root: native_path(&norm),
-            feeds: Arc::new(Mutex::new(Vec::new())),
-        });
+        let subs = self
+            .subscribers
+            .entry(key.clone())
+            .or_insert_with(|| Subscribers {
+                root: native_path(&norm),
+                feeds: Arc::new(Mutex::new(Vec::new())),
+            });
         subs.feeds.lock_safe().push(feed);
-        if !self.watchers.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.watchers.entry(key) {
             let entry = Self::start_entry(
                 &norm,
                 native_path(&norm),
@@ -199,7 +202,7 @@ impl FileWatcherManager {
                 None,
                 Arc::new(std::sync::atomic::AtomicBool::new(true)),
             );
-            self.watchers.insert(key, entry);
+            e.insert(entry);
         }
     }
 
@@ -310,93 +313,92 @@ impl FileWatcherManager {
             let workspace_for_handler = workspace_services.clone();
             let project_path_for_handler = project_path_owned.clone();
             Arc::new(move |res: &Result<Event, notify::Error>| {
-                    let event = match res {
-                        Ok(event) => event,
-                        Err(e) => {
-                            // Typically a Windows ReadDirectoryChangesW buffer
-                            // overflow during a burst (venv / npm install /
-                            // checkout): the whole batch is gone, so ask the
-                            // frontend to rescan instead of silently going stale.
-                            tracing::warn!(error = %e, "file watcher error; requesting rescan");
-                            let mut lock = pending_for_handler.lock_safe();
-                            lock.rescan = true;
-                            lock.last_event = Some(Instant::now());
-                            return;
-                        }
-                    };
-                    if event.need_rescan() {
+                let event = match res {
+                    Ok(event) => event,
+                    Err(e) => {
+                        // Typically a Windows ReadDirectoryChangesW buffer
+                        // overflow during a burst (venv / npm install /
+                        // checkout): the whole batch is gone, so ask the
+                        // frontend to rescan instead of silently going stale.
+                        tracing::warn!(error = %e, "file watcher error; requesting rescan");
                         let mut lock = pending_for_handler.lock_safe();
                         lock.rescan = true;
                         lock.last_event = Some(Instant::now());
                         return;
                     }
-                    {
-                        // Only care about create/remove/modify/rename — skip access events
-                        let is_remove = matches!(event.kind, EventKind::Remove(_));
-                        match event.kind {
-                            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {}
-                            _ => return,
-                        }
-
-                        let mut lock = pending_for_handler.lock_safe();
-
-                        for path in &event.paths {
-                            // Use the parent directory as the key (that's what we refresh)
-                            let parent = path
-                                .parent()
-                                .unwrap_or(path)
-                                .to_string_lossy()
-                                .replace('\\', "/");
-
-                            let path_str = path.to_string_lossy().replace('\\', "/");
-
-                            // Git metadata is filtered from the generic pipeline
-                            // (WATCHER_SKIP_DIRS contains ".git") but staging,
-                            // commits and checkouts done from a terminal move the
-                            // repo state the SCM panel displays. Surface those as
-                            // a `git_changed` flag instead of dir refreshes.
-                            if let Some(rel) = git_relative_part(&path_str) {
-                                if is_interesting_git_file(&rel) {
-                                    lock.git_changed = true;
-                                    lock.last_event = Some(Instant::now());
-                                }
-                                continue;
-                            }
-
-                            // Drop events INSIDE any WATCHER_SKIP_DIRS folder
-                            // (node_modules, target, .venv, tmp, …). Without this, a
-                            // Go `air` rebuild or `webpack` watch can fire hundreds
-                            // of events per second from inside `tmp/`, `target/`
-                            // or `node_modules/`. The folder ITSELF is still
-                            // reported (its parent isn't skipped), so creating
-                            // `.venv` or `build/` refreshes the tree (issue #12).
-                            // The check runs on the path RELATIVE to the project
-                            // root so a project that itself lives under a folder
-                            // named `tmp`/`build`/`out` doesn't lose every event.
-                            let rel_parent = parent
-                                .strip_prefix(&project_path_for_handler)
-                                .unwrap_or(&parent);
-                            if path_has_skip_segment(rel_parent) {
-                                continue;
-                            }
-
-                            lock.dirs.insert(parent, ());
-                            if lock.paths.len() < CHANGED_PATHS_CAP {
-                                lock.paths.insert(path_str.clone(), ());
-                            }
-
-                            // P1.2: keep the agent's workspace symbol index in
-                            // sync with external file changes. Only QUEUE the
-                            // work here; the flush thread applies it outside the
-                            // lock so the notify thread keeps draining OS events.
-                            if workspace_for_handler.is_some() && lock.index.len() < INDEX_QUEUE_CAP
-                            {
-                                lock.index.insert(path_str.clone(), is_remove);
-                            }
-                        }
-
-                        lock.last_event = Some(Instant::now());
+                };
+                if event.need_rescan() {
+                    let mut lock = pending_for_handler.lock_safe();
+                    lock.rescan = true;
+                    lock.last_event = Some(Instant::now());
+                    return;
+                }
+                {
+                    // Only care about create/remove/modify/rename — skip access events
+                    let is_remove = matches!(event.kind, EventKind::Remove(_));
+                    match event.kind {
+                        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {}
+                        _ => return,
                     }
+
+                    let mut lock = pending_for_handler.lock_safe();
+
+                    for path in &event.paths {
+                        // Use the parent directory as the key (that's what we refresh)
+                        let parent = path
+                            .parent()
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+
+                        let path_str = path.to_string_lossy().replace('\\', "/");
+
+                        // Git metadata is filtered from the generic pipeline
+                        // (WATCHER_SKIP_DIRS contains ".git") but staging,
+                        // commits and checkouts done from a terminal move the
+                        // repo state the SCM panel displays. Surface those as
+                        // a `git_changed` flag instead of dir refreshes.
+                        if let Some(rel) = git_relative_part(&path_str) {
+                            if is_interesting_git_file(&rel) {
+                                lock.git_changed = true;
+                                lock.last_event = Some(Instant::now());
+                            }
+                            continue;
+                        }
+
+                        // Drop events INSIDE any WATCHER_SKIP_DIRS folder
+                        // (node_modules, target, .venv, tmp, …). Without this, a
+                        // Go `air` rebuild or `webpack` watch can fire hundreds
+                        // of events per second from inside `tmp/`, `target/`
+                        // or `node_modules/`. The folder ITSELF is still
+                        // reported (its parent isn't skipped), so creating
+                        // `.venv` or `build/` refreshes the tree (issue #12).
+                        // The check runs on the path RELATIVE to the project
+                        // root so a project that itself lives under a folder
+                        // named `tmp`/`build`/`out` doesn't lose every event.
+                        let rel_parent = parent
+                            .strip_prefix(&project_path_for_handler)
+                            .unwrap_or(&parent);
+                        if path_has_skip_segment(rel_parent) {
+                            continue;
+                        }
+
+                        lock.dirs.insert(parent, ());
+                        if lock.paths.len() < CHANGED_PATHS_CAP {
+                            lock.paths.insert(path_str.clone(), ());
+                        }
+
+                        // P1.2: keep the agent's workspace symbol index in
+                        // sync with external file changes. Only QUEUE the
+                        // work here; the flush thread applies it outside the
+                        // lock so the notify thread keeps draining OS events.
+                        if workspace_for_handler.is_some() && lock.index.len() < INDEX_QUEUE_CAP {
+                            lock.index.insert(path_str.clone(), is_remove);
+                        }
+                    }
+
+                    lock.last_event = Some(Instant::now());
+                }
             })
         };
 
@@ -615,7 +617,10 @@ mod tests {
     #[test]
     fn watch_key_ignores_verbatim_separator_and_trailing_slash() {
         assert_eq!(watch_key("//?/C:/proj/"), watch_key("C:/proj"));
-        assert_eq!(watch_key(&normalize("\\\\?\\UNC\\srv\\share")), watch_key("//srv/share"));
+        assert_eq!(
+            watch_key(&normalize("\\\\?\\UNC\\srv\\share")),
+            watch_key("//srv/share")
+        );
     }
 
     #[test]
@@ -633,7 +638,8 @@ mod tests {
 
         let acc = Arc::new(rustic_agent::DirtyPathAccumulator::new(root.clone()));
         acc.set_active("t", "m");
-        let (fh_watcher, feed) = rustic_agent::FileWatcher::attach(root.clone(), Arc::clone(&acc)).unwrap();
+        let (fh_watcher, feed) =
+            rustic_agent::FileWatcher::attach(root.clone(), Arc::clone(&acc)).unwrap();
 
         let mut mgr = FileWatcherManager::new();
         // File history first: must work before the UI watcher exists.
@@ -643,7 +649,11 @@ mod tests {
         let emitter = Arc::new(RecordingEmitter(Mutex::new(Vec::new())));
         let ui_path = strip_verbatim(&normalize(&root.to_string_lossy())).to_string();
         mgr.watch_project(&ui_path, emitter.clone(), None);
-        assert_eq!(mgr.watchers.len(), 1, "UI must reuse the project's single OS watcher");
+        assert_eq!(
+            mgr.watchers.len(),
+            1,
+            "UI must reuse the project's single OS watcher"
+        );
         assert!(mgr.watchers.values().all(|e| e.has_ui));
 
         // The UI re-arm sends a rescan to file history; drain it so the
@@ -658,9 +668,10 @@ mod tests {
         while Instant::now() < deadline && !(ui_seen && fh_seen) {
             std::thread::sleep(Duration::from_millis(100));
             ui_seen = emitter.0.lock_safe().iter().any(|p| {
-                p["changed_paths"]
-                    .as_array()
-                    .is_some_and(|a| a.iter().any(|v| v.as_str().is_some_and(|s| s.ends_with("/hello.txt"))))
+                p["changed_paths"].as_array().is_some_and(|a| {
+                    a.iter()
+                        .any(|v| v.as_str().is_some_and(|s| s.ends_with("/hello.txt")))
+                })
             });
             fh_seen = acc
                 .peek_active()
@@ -671,7 +682,10 @@ mod tests {
 
         drop(fh_watcher);
         mgr.unwatch_project(&ui_path);
-        assert!(mgr.watchers.is_empty(), "dropped file-history consumer must not re-arm a watcher");
+        assert!(
+            mgr.watchers.is_empty(),
+            "dropped file-history consumer must not re-arm a watcher"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

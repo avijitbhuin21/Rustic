@@ -271,7 +271,13 @@ impl rustic_app::EventEmitter for HubEmitter {
 /// global prefix, GOPATH…). The volume is mounted over `/data` at runtime, so
 /// anything the image created there is hidden and must be recreated on boot.
 fn ensure_persistent_install_dirs() {
-    for var in ["HOME", "NPM_CONFIG_PREFIX", "GOPATH", "CARGO_INSTALL_ROOT", "BUN_INSTALL"] {
+    for var in [
+        "HOME",
+        "NPM_CONFIG_PREFIX",
+        "GOPATH",
+        "CARGO_INSTALL_ROOT",
+        "BUN_INSTALL",
+    ] {
         let Some(dir) = std::env::var_os(var).filter(|v| !v.is_empty()) else {
             continue;
         };

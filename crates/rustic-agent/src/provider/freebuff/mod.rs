@@ -71,7 +71,9 @@ pub fn set_pool_tokens(tokens: Vec<String>) {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect();
-    *pool_tokens_store().lock().unwrap() = cleaned;
+    *pool_tokens_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = cleaned;
 }
 
 /// The ordered, deduped token pool: the live CLI `default` token first (so the
@@ -84,7 +86,11 @@ fn all_tokens() -> Vec<String> {
             out.push(t);
         }
     }
-    for t in pool_tokens_store().lock().unwrap().iter() {
+    for t in pool_tokens_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+    {
         if !out.iter().any(|x| x == t) {
             out.push(t.clone());
         }
@@ -456,6 +462,7 @@ mod tests {
             system_prompt: Some("you are helpful".into()),
             thinking_budget: 0,
             context_window: 0,
+            condense_threshold: 0,
             web_search_enabled: false,
             web_fetch_enabled: false,
             supports_temperature: true,

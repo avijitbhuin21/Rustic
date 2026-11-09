@@ -172,7 +172,11 @@ impl SymbolIndex {
                 None => Arc::from(entry.name.as_str()),
             };
             let scope = entry.scope.map(|s| {
-                Arc::clone(scopes.entry(s).or_insert_with_key(|k| Arc::from(k.as_str())))
+                Arc::clone(
+                    scopes
+                        .entry(s)
+                        .or_insert_with_key(|k| Arc::from(k.as_str())),
+                )
             });
             inner
                 .by_name
@@ -283,7 +287,10 @@ impl SymbolIndex {
 }
 
 impl SymbolIndexInner {
-    fn resolve<'a>(&'a self, (file, idx): &'a (Arc<Path>, u32)) -> Option<(&'a StoredEntry, &'a Path)> {
+    fn resolve<'a>(
+        &'a self,
+        (file, idx): &'a (Arc<Path>, u32),
+    ) -> Option<(&'a StoredEntry, &'a Path)> {
         self.by_file
             .get(file)
             .and_then(|v| v.get(*idx as usize))

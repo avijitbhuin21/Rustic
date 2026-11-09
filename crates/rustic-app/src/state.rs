@@ -64,6 +64,12 @@ pub struct AgentState {
     pub ceiling_broker: Arc<rustic_agent::task::ceiling_broker::CeilingBroker>,
 }
 
+impl Default for AgentState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentState {
     pub fn new() -> Self {
         Self {
@@ -149,6 +155,7 @@ impl AgentRuntime {
 impl std::ops::Deref for AgentRuntime {
     type Target = tokio::runtime::Runtime;
 
+    #[allow(clippy::expect_used)] // only None after Drop
     fn deref(&self) -> &Self::Target {
         self.0.as_ref().expect("agent runtime used after shutdown")
     }
@@ -179,6 +186,7 @@ pub struct FileHistoryHandle {
 }
 
 impl AppState {
+    #[allow(clippy::expect_used)] // no agent runtime = app cannot start
     pub fn new(db: Database) -> Self {
         let agent = Arc::new(Mutex::new(AgentState::new()));
         let db_read = (db.path() != std::path::Path::new(":memory:"))

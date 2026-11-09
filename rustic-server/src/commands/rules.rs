@@ -56,7 +56,9 @@ pub async fn dispatch(
     args: &Value,
 ) -> Option<Result<Value, ApiError>> {
     Some(match command {
-        "list_rules" => handle(args, |a: ListArg| Ok(ops::list_rules(a.project_root.as_deref()))),
+        "list_rules" => handle(args, |a: ListArg| {
+            Ok(ops::list_rules(a.project_root.as_deref()))
+        }),
         "get_rule_body" => handle(args, |a: NameArg| ops::get_rule_body(&a.name)),
         "create_rule" => handle(args, |a: CreateArg| ops::create_rule(&a.name, &a.body)),
         "update_rule" => handle(args, |a: UpdateArg| {

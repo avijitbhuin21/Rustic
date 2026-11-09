@@ -120,6 +120,20 @@ export function GeneralSettings() {
         </SettingRow>
       </SettingsSection>
 
+      <SettingsSection title="Notifications">
+        <SettingRow
+          label="Notify about chat activity"
+          description="When a chat finishes, fails, or needs your input. Shows an in-app toast for chats you aren't viewing, and a system notification when Rustic isn't focused."
+          htmlFor="notify-task-events"
+        >
+          <Switch
+            id="notify-task-events"
+            checked={g.notify_task_events !== false}
+            onCheckedChange={(v) => update({ general: { ...g, notify_task_events: v } })}
+          />
+        </SettingRow>
+      </SettingsSection>
+
       {isWindows && (
         <SettingsSection title="OS Integration">
           <SettingRow

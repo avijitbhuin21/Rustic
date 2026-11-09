@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { isTauriAvailable } from '@/lib/platform';
 import { toast } from 'sonner';
+import { notifyTaskEvent, primeNotificationPermission } from '@/lib/task-notify';
 import { confirm } from '@/components/confirm-dialog';
 
 // IMPORTANT: these names must match the strings the Rust backend passes to
@@ -1716,6 +1717,36 @@ export const useAgent = create((set, get) => ({
   setCost: (taskId, cost) =>
     set((s) => ({ costByTask: { ...s.costByTask, [taskId]: cost } })),
 
+  /** Raise a chat-activity notification for a known (non sub-agent) task. */
+  _notifyTask(taskId, kind, detail, { inApp = true } = {}) {
+    const s = get();
+    const task = [...(s.tasks || []), ...Object.values(s.tasksByProject).flat()].find((t) => t.id === taskId);
+    if (!task) return;
+    notifyTaskEvent({
+      taskId,
+      kind,
+      title: task.title,
+      detail,
+      isViewing: s.activeTaskId === taskId,
+      inApp,
+      onOpen: () => get()._openTaskFromNotification(taskId, task.project_id),
+    });
+  },
+
+  /** Switch to the task's project (if needed) and open its chat. */
+  async _openTaskFromNotification(taskId, projectId) {
+    const [{ useExplorer }, { useLayout }] = await Promise.all([
+      import('@/state/explorer'),
+      import('@/state/layout'),
+    ]);
+    const proj = (useExplorer.getState().projects || []).find((p) => p.id === projectId);
+    if (proj && proj.id !== get().activeProject?.id) {
+      get().setActiveProject({ id: proj.id, name: proj.name, root: proj.root_path });
+    }
+    get().setActiveTask(taskId);
+    useLayout.getState().openChatDock?.();
+  },
+
   setStatus: (taskId, status) => {
     // Terminal statuses can arrive with deltas still buffered (cancel/error
     // paths never emit agent-task-complete) — apply them first.
@@ -1737,6 +1768,7 @@ export const useAgent = create((set, get) => ({
       'waitingonsubagents',
     ]);
     const isTerminal = TERMINAL.has(String(status).toLowerCase());
+    const prevStatus = String(get().statusByTask[taskId] ?? '').toLowerCase();
     set((s) => {
       const patch = { statusByTask: { ...s.statusByTask, [taskId]: status } };
       if (isTerminal && s.streamingByTask[taskId] !== false) {
@@ -1744,6 +1776,18 @@ export const useAgent = create((set, get) => ({
       }
       return patch;
     });
+    // Only a live run ending counts: re-delivered terminal events (status +
+    // agent-task-complete both arrive) see a terminal prevStatus and stay quiet.
+    const nextStatus = String(status).toLowerCase();
+    const wasActive = ['preparing', 'running', 'waitingonsubagents', 'waiting'].includes(prevStatus);
+    if (wasActive && nextStatus !== prevStatus) {
+      if (nextStatus === 'failed' || nextStatus === 'error') {
+        get()._notifyTask(taskId, 'failed');
+      } else if ((nextStatus === 'completed' || nextStatus === 'complete') && !get().goalByTask[taskId]) {
+        // Active goals re-run turn after turn; their outcome is notified via agent-goal-update.
+        get()._notifyTask(taskId, 'completed');
+      }
+    }
     // A terminal status while the condensing flag is still set means the
     // condense-completed event was lost (run cancelled / superseded mid-
     // condense). Without this, the stuck flag makes every subsequent send
@@ -1874,6 +1918,7 @@ export const useAgent = create((set, get) => ({
       return;
     }
     set({ pendingPermission: req });
+    get()._notifyTask(req?.task_id, 'input', req?.operation ? `Permission needed: ${req.operation}` : 'Permission needed');
   },
   closePermission: () => set({ pendingPermission: null }),
   openQuestion: (req) => set({ pendingQuestion: req }),
@@ -2126,6 +2171,7 @@ export const useAgent = create((set, get) => ({
   },
 
   async sendMessage(text, attachments = [], extras = {}) {
+    primeNotificationPermission();
     const state = get();
     let taskId;
     try {
@@ -3156,8 +3202,11 @@ export const useAgent = create((set, get) => ({
         get().refreshTaskFiles(p.task_id);
       },
       'agent-permission-request': (p) => get().openPermission(p),
-      'agent-ask-user-request': (p) =>
-        get().appendAskUserBlock(p?.task_id, p?.request_id, p?.questions),
+      'agent-ask-user-request': (p) => {
+        get().appendAskUserBlock(p?.task_id, p?.request_id, p?.questions);
+        const q = Array.isArray(p?.questions) ? p.questions[0]?.text : null;
+        get()._notifyTask(p?.task_id, 'input', q || 'The agent has a question for you.');
+      },
       'agent-ask-user-cancelled': (p) => get().markAskUserInterrupted(p?.request_id),
       'agent-todo-updated': (p) => get().setTodos(p.task_id, p.todos || []),
       'agent-peer-message': (p) => {
@@ -3181,8 +3230,10 @@ export const useAgent = create((set, get) => ({
       if (status === 'met') {
         toast.success('Goal met — the loop has finished.', { duration: 8000 });
         get()._patchTaskRecord(taskId, { goal: null });
+        get()._notifyTask(taskId, 'goal', condition || undefined, { inApp: false });
       } else if (status === 'error') {
         toast.error(`Goal loop stopped: ${reason || 'evaluator failed'}`, { duration: 8000 });
+        get()._notifyTask(taskId, 'failed', reason || 'Goal loop stopped', { inApp: false });
       }
     },
       'agent-title-changed': (p) => get().setTitle(p.task_id, p.title),

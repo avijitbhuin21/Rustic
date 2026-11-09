@@ -82,7 +82,10 @@ fn find_rule(name: &str) -> Result<RuleDef, String> {
 
 pub fn list_rules(project_root: Option<&str>) -> Vec<RuleInfo> {
     let root = project_root.map(Path::new);
-    discover_global_rules().iter().map(|r| to_info(r, root)).collect()
+    discover_global_rules()
+        .iter()
+        .map(|r| to_info(r, root))
+        .collect()
 }
 
 pub fn get_rule_body(name: &str) -> Result<String, String> {
@@ -103,8 +106,11 @@ pub fn create_rule(name: &str, body: &str) -> Result<RuleInfo, String> {
         return Err(format!("Rule already exists: {}", safe_name));
     }
     let description = summarize(body);
-    rustic_core::io_util::atomic_write(&rule_path, rule_file_content(&safe_name, &description, body).as_bytes())
-        .map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(
+        &rule_path,
+        rule_file_content(&safe_name, &description, body).as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(RuleInfo {
         name: safe_name,
         description,
@@ -153,13 +159,20 @@ pub fn update_rule(original_name: &str, name: &str, body: &str) -> Result<RuleIn
     };
 
     let description = summarize(body);
-    rustic_core::io_util::atomic_write(&final_path, rule_file_content(&new_safe_name, &description, body).as_bytes())
-        .map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(
+        &final_path,
+        rule_file_content(&new_safe_name, &description, body).as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
 
     let s = rustic_agent::load_rules_state();
     let state_str = if s.active_global.iter().any(|n| n == &new_safe_name) {
         "global"
-    } else if s.active_project.values().any(|v| v.iter().any(|n| n == &new_safe_name)) {
+    } else if s
+        .active_project
+        .values()
+        .any(|v| v.iter().any(|n| n == &new_safe_name))
+    {
         // Best-effort display when project_root is unknown.
         "project"
     } else {
@@ -190,7 +203,11 @@ pub fn delete_rule(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn set_rule_activation(name: &str, state: &str, project_root: Option<&str>) -> Result<RuleInfo, String> {
+pub fn set_rule_activation(
+    name: &str,
+    state: &str,
+    project_root: Option<&str>,
+) -> Result<RuleInfo, String> {
     validate_simple_name(name)?;
     let new_state = parse_state(state)?;
     if matches!(new_state, RuleState::Project) && project_root.is_none() {

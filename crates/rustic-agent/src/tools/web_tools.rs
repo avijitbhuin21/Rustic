@@ -535,7 +535,7 @@ async fn summarize_page(
             && small_model
                 .chars()
                 .nth(1)
-                .map_or(false, |c| c.is_ascii_digit()))
+                .is_some_and(|c| c.is_ascii_digit()))
     {
         Arc::new(crate::provider::openai::OpenAiProvider::new())
     } else {
@@ -569,6 +569,7 @@ async fn summarize_page(
         system_prompt: Some(system.to_string()),
         thinking_budget: 0,
         context_window: 0,
+        condense_threshold: 0,
         web_search_enabled: false,
         web_fetch_enabled: false,
         supports_temperature: parent.supports_temperature,

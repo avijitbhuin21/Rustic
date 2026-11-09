@@ -29,6 +29,10 @@ use sha2::{Digest, Sha256};
 /// archive is still being packed; big enough that per-request overhead is noise.
 pub const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
+/// Upper bound on one transfer; caps chunk indices so a bogus index can't
+/// overflow the seek offset or grow a sparse file without limit.
+pub const MAX_TRANSFER_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+
 /// Lowercase hex SHA-256.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -259,6 +263,9 @@ impl Assembler {
                 "chunk {index} has an invalid size ({} bytes)",
                 data.len()
             ));
+        }
+        if index >= chunk_count(MAX_TRANSFER_BYTES) {
+            return Err(format!("chunk {index} is beyond the transfer size limit"));
         }
         {
             let st = self.state();

@@ -161,8 +161,8 @@ pub fn is_sensitive_file_name(name: &str) -> bool {
 /// navigational value file-by-file, so it renders as one summary line.
 const ASSET_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "ico", "icns", "bmp", "tif", "tiff", "svg", "avif",
-    "woff", "woff2", "ttf", "otf", "eot", "mp3", "wav", "ogg", "flac", "m4a", "mp4", "webm",
-    "mov", "pdf", "zip", "gz", "bin", "wasm",
+    "woff", "woff2", "ttf", "otf", "eot", "mp3", "wav", "ogg", "flac", "m4a", "mp4", "webm", "mov",
+    "pdf", "zip", "gz", "bin", "wasm",
 ];
 /// Companion files tolerated (at most one) inside an asset directory, e.g. a
 /// font LICENSE.txt or an Android icon XML.
@@ -287,9 +287,8 @@ fn collapse_summary(root: &Path, dir: &Path) -> Option<String> {
 /// Per-walk memo of [`collapse_summary`] keyed by directory, shared between
 /// the walker's entry filter (hides a collapsed dir's children) and the
 /// renderer (prints the summary next to the dir name).
-type CollapseCache = std::sync::Arc<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<String>>>,
->;
+type CollapseCache =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<String>>>>;
 
 fn cached_collapse(cache: &CollapseCache, root: &Path, dir: &Path) -> Option<String> {
     let mut guard = match cache.lock() {
@@ -448,7 +447,8 @@ fn generate_tree_inner(
 
     let top_dirs: Vec<&TopEntry> = top.iter().filter(|e| e.is_dir).collect();
     let top_files: Vec<&TopEntry> = top.iter().filter(|e| !e.is_dir).collect();
-    let top_summaries: Vec<Option<String>> = top_dirs.iter().map(|d| summary_for(&d.name)).collect();
+    let top_summaries: Vec<Option<String>> =
+        top_dirs.iter().map(|d| summary_for(&d.name)).collect();
     let walk_count = top_summaries.iter().filter(|s| s.is_none()).count();
 
     let mut remaining = max_entries.saturating_sub(top.len());
@@ -663,7 +663,11 @@ mod tests {
         assert!(tree.contains("suite/ (7 json)"), "Got:\n{}", tree);
         assert!(!tree.contains("case_1.json"), "Got:\n{}", tree);
         // Source dirs (not under a test dir, mixed content) stay expanded.
-        assert!(tree.contains("mod_1.json") && tree.contains("main.rs"), "Got:\n{}", tree);
+        assert!(
+            tree.contains("mod_1.json") && tree.contains("main.rs"),
+            "Got:\n{}",
+            tree
+        );
     }
 
     #[test]
@@ -700,7 +704,13 @@ mod tests {
         for bypass in [false, true] {
             let tree = generate_file_tree(root, bypass);
             for secret in [".updater-signing.key", ".env.local", "server.pem", "id_rsa"] {
-                assert!(!tree.contains(secret), "{} leaked (bypass={}):\n{}", secret, bypass, tree);
+                assert!(
+                    !tree.contains(secret),
+                    "{} leaked (bypass={}):\n{}",
+                    secret,
+                    bypass,
+                    tree
+                );
             }
             assert!(tree.contains(".env.example"), "Got:\n{}", tree);
             assert!(tree.contains("keymap.key"), "Got:\n{}", tree);

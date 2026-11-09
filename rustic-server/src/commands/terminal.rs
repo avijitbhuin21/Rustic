@@ -292,6 +292,9 @@ pub(crate) fn spawn_session_monitor(
     std::thread::spawn(move || {
         let mut idle_since: Option<Instant> = None;
         let mut seen_running = false;
+        // Last reported "idle with a background job" state, so the list is
+        // refreshed when a `cmd &` job starts or ends.
+        let mut last_bg = false;
         // Per-command completion tracking (agent sessions): the marker is the
         // send-instant of the current in-flight command; a marker change means
         // a new command was sent and the trackers reset.
@@ -347,6 +350,13 @@ pub(crate) fn spawn_session_monitor(
                         .ok()
                         .and_then(|m| m.command_busy(session_id))
                         .or(has_children);
+                    let bg = cmd_marker.is_none()
+                        && cmd_busy == Some(false)
+                        && has_children == Some(true);
+                    if bg != last_bg {
+                        last_bg = bg;
+                        emit_terminal_list_changed(&ctx);
+                    }
                     match cmd_busy {
                         Some(true) => {
                             if cmd_marker.is_some() {

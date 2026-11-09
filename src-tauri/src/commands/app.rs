@@ -160,8 +160,14 @@ pub fn toggle_simple_fullscreen(window: tauri::WebviewWindow) -> Result<bool, St
     let next = !SIMPLE_FULLSCREEN.load(Ordering::SeqCst);
     #[cfg(target_os = "macos")]
     {
-        window.set_simple_fullscreen(next).map_err(|e| e.to_string())?;
-        let radius = if next { crate::macos_window::FULLSCREEN_TOP_RADIUS } else { 0.0 };
+        window
+            .set_simple_fullscreen(next)
+            .map_err(|e| e.to_string())?;
+        let radius = if next {
+            crate::macos_window::FULLSCREEN_TOP_RADIUS
+        } else {
+            0.0
+        };
         crate::macos_window::set_top_corner_radius(&window, radius);
     }
     #[cfg(not(target_os = "macos"))]

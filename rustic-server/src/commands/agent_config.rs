@@ -15,6 +15,7 @@
 //!   - freebuff tokens `<app_data>/freebuff_tokens.json`-> `ctx.data_dir().join("freebuff_tokens.json")`
 //!   - freebuff models `<app_data>/freebuff_models.json`-> `ctx.data_dir().join("freebuff_models.json")`
 //!   - memory dir/index                                 -> resolved from project_root
+//!
 //! The MCP project-consent file is set on the manager by `rustic_app::bootstrap`
 //! (`<data_dir>/mcp_consent.json`), so the gated-load path resolves identically.
 //!
@@ -62,6 +63,7 @@ pub async fn dispatch(
         "set_budget_settings" => set_budget_settings(ctx, args),
         "get_budget_settings" => get_budget_settings(ctx),
         "set_subagent_concurrency_cap" => set_subagent_concurrency_cap(ctx, args),
+        "set_condense_threshold" => set_condense_threshold(ctx, args),
         "get_subagent_concurrency_cap" => get_subagent_concurrency_cap(ctx),
 
         // ── models ─────────────────────────────────────────────────────
@@ -593,6 +595,20 @@ fn get_subagent_concurrency_cap(ctx: &ServerContext) -> Result<Value, ApiError> 
     ok(agent.ai_config.budget.max_concurrent_subagents)
 }
 
+#[derive(Deserialize)]
+struct CondenseThresholdArg {
+    tokens: u32,
+}
+
+/// Set the global "auto-condense at" token cap (0 = automatic). Mirrors desktop.
+fn set_condense_threshold(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    let a: CondenseThresholdArg = parse(args)?;
+    let mut agent = ctx.state().agent.lock_safe();
+    agent.ai_config.condense_threshold = a.tokens;
+    persist_ai_config(ctx, &agent.ai_config)?;
+    ok(())
+}
+
 /// Persist `ai_config` to SQLite with API keys redacted (keychain owns the real
 /// secrets). Mirrors desktop `persist_ai_config`.
 fn persist_ai_config(ctx: &ServerContext, cfg: &AiConfig) -> Result<(), ApiError> {
@@ -625,50 +641,6 @@ fn parse_permission_level(level: &str) -> Result<rustic_agent::PermissionLevel, 
 // models  (reqwest-backed model-list fetching, cached per-process)
 // ════════════════════════════════════════════════════════════════════════
 
-const MODEL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
-type ModelCacheKey = (String, u64, String, bool);
-type ModelCacheEntry = (Vec<String>, std::time::Instant);
-
-static MODEL_CACHE: std::sync::OnceLock<
-    tokio::sync::Mutex<std::collections::HashMap<ModelCacheKey, ModelCacheEntry>>,
-> = std::sync::OnceLock::new();
-
-fn model_cache(
-) -> &'static tokio::sync::Mutex<std::collections::HashMap<ModelCacheKey, ModelCacheEntry>> {
-    MODEL_CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn hash_key(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
-fn freebuff_models_cache_path(ctx: &ServerContext) -> PathBuf {
-    ctx.data_dir().join("freebuff_models.json")
-}
-
-fn load_freebuff_models(ctx: &ServerContext) -> Option<Vec<String>> {
-    let raw = std::fs::read_to_string(freebuff_models_cache_path(ctx)).ok()?;
-    let list: Vec<String> = serde_json::from_str(&raw).ok()?;
-    if list.is_empty() {
-        None
-    } else {
-        Some(list)
-    }
-}
-
-fn save_freebuff_models(ctx: &ServerContext, models: &[String]) {
-    if models.is_empty() {
-        return;
-    }
-    if let Ok(json) = serde_json::to_string(models) {
-        let _ = std::fs::write(freebuff_models_cache_path(ctx), json);
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FetchModelsArg {
@@ -677,287 +649,26 @@ struct FetchModelsArg {
     base_url: Option<String>,
     force_refresh: Option<bool>,
     include_all: Option<bool>,
+    capability: Option<String>,
 }
 
 async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: FetchModelsArg = parse(args)?;
-    let provider_type = a.provider_type;
-    let base_url = a.base_url;
-    let force_refresh = a.force_refresh;
-    let include_all = a.include_all.unwrap_or(false);
-
-    if let Some(ref u) = base_url {
-        rustic_agent::provider::validate_provider_base_url(u)
-            .map_err(|e| format!("Invalid base_url: {}", e))?;
-    }
-
-    // FreeBuff: keyless, resolved from a live session / disk cache / probe.
-    if provider_type == "FreeBuff" {
-        let cache_key: ModelCacheKey = (
-            "FreeBuff".to_string(),
-            hash_key(""),
-            String::new(),
-            include_all,
-        );
-        if !force_refresh.unwrap_or(false) {
-            let cache = model_cache().lock().await;
-            if let Some((models, fetched_at)) = cache.get(&cache_key) {
-                if fetched_at.elapsed() < MODEL_CACHE_TTL {
-                    return ok(models.clone());
-                }
-            }
-        }
-        let mut models: Vec<String> =
-            if let Some(live) = rustic_agent::provider::freebuff::current_session_models().await {
-                save_freebuff_models(ctx, &live);
-                live
-            } else if let Some(disk) = load_freebuff_models(ctx) {
-                disk
-            } else {
-                match rustic_agent::provider::freebuff::probe_models().await {
-                    Ok(list) if !list.is_empty() => {
-                        save_freebuff_models(ctx, &list);
-                        list
-                    }
-                    _ => rustic_agent::provider::freebuff::seed_models()
-                        .into_iter()
-                        .map(|m| m.id)
-                        .collect(),
-                }
-            };
-        models.sort();
-        models.dedup();
-        let mut cache = model_cache().lock().await;
-        cache.insert(cache_key, (models.clone(), std::time::Instant::now()));
-        return ok(models);
-    }
-
-    // Resolve the `__STORED__` sentinel against the in-memory ai_config.
-    let api_key = if a.api_key == "__STORED__" {
-        let agent = ctx.state().agent.lock_safe();
-        let pt = match provider_type.as_str() {
-            "Claude" => Some(ProviderType::Claude),
-            "OpenAi" => Some(ProviderType::OpenAi),
-            "Gemini" => Some(ProviderType::Gemini),
-            "Compatible" => Some(ProviderType::Compatible),
-            "OpenRouter" => Some(ProviderType::OpenRouter),
-            _ => None,
-        };
-        match pt {
-            Some(pt) => {
-                let want = base_url.as_deref().map(|u| u.trim_end_matches('/'));
-                let is_compat = pt == ProviderType::Compatible;
-                let providers = &agent.ai_config.providers;
-                providers
-                    .iter()
-                    .find(|p| {
-                        p.provider_type == pt
-                            && !p.api_key.is_empty()
-                            && (!is_compat
-                                || want.map_or(true, |w| {
-                                    p.base_url.as_deref().map(|b| b.trim_end_matches('/'))
-                                        == Some(w)
-                                }))
-                    })
-                    .or_else(|| {
-                        providers
-                            .iter()
-                            .find(|p| p.provider_type == pt && !p.api_key.is_empty())
-                    })
-                    .map(|p| p.api_key.clone())
-                    .ok_or_else(|| {
-                        ApiError::from(format!("No API key configured for {}", provider_type))
-                    })?
-            }
-            None => {
-                return Err(ApiError::from(format!(
-                    "Unknown provider type: {}",
-                    provider_type
-                )))
-            }
-        }
-    } else {
-        a.api_key
-    };
-
-    let cache_key: ModelCacheKey = (
-        provider_type.clone(),
-        hash_key(&api_key),
-        base_url.clone().unwrap_or_default(),
-        include_all,
-    );
-
-    if !force_refresh.unwrap_or(false) {
-        let cache = model_cache().lock().await;
-        if let Some((models, fetched_at)) = cache.get(&cache_key) {
-            if fetched_at.elapsed() < MODEL_CACHE_TTL {
-                return ok(models.clone());
-            }
-        }
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_default();
-
-    let models: Vec<String> = match provider_type.as_str() {
-        "Claude" => {
-            let res = client
-                .get("https://api.anthropic.com/v1/models")
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .query(&[("limit", "1000")])
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                return Err(ApiError::from(format!("HTTP {}: {}", status, body)));
-            }
-            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let mut models: Vec<String> = data["data"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .collect();
-            models.sort_by(|a, b| b.cmp(a));
-            models
-        }
-        "OpenAi" => {
-            let res = client
-                .get("https://api.openai.com/v1/models")
-                .header("Authorization", format!("Bearer {}", api_key))
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                return Err(ApiError::from(format!("HTTP {}: {}", status, body)));
-            }
-            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let mut models: Vec<String> = data["data"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .collect();
-            models.sort_by(|a, b| b.cmp(a));
-            models
-        }
-        "Gemini" => {
-            let res = client
-                .get("https://generativelanguage.googleapis.com/v1beta/models")
-                .query(&[("key", api_key.as_str()), ("pageSize", "200")])
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                return Err(ApiError::from(format!("HTTP {}: {}", status, body)));
-            }
-            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let mut models: Vec<String> = data["models"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|m| m["name"].as_str().map(|s| s.replace("models/", "")))
-                .collect();
-            models.sort_by(|a, b| b.cmp(a));
-            models
-        }
-        "OpenRouter" => {
-            let url = "https://openrouter.ai/api/v1/models".to_string();
-            let res = client
-                .get(&url)
-                .bearer_auth(&api_key)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                return Err(ApiError::from(format!(
-                    "OpenRouter /v1/models returned {status}: {body}"
-                )));
-            }
-            #[derive(serde::Deserialize)]
-            struct ModelList {
-                data: Vec<ModelEntry>,
-            }
-            #[derive(serde::Deserialize)]
-            struct ModelEntry {
-                id: String,
-            }
-            let list: ModelList = res.json().await.map_err(|e| e.to_string())?;
-            let mut models: Vec<String> = list.data.into_iter().map(|m| m.id).collect();
-            models.sort();
-            models
-        }
-        "Compatible" => {
-            let raw = base_url.clone().unwrap_or_default();
-            let base = raw
-                .trim_end_matches('/')
-                .trim_end_matches("/chat/completions")
-                .trim_end_matches("/completions")
-                .trim_end_matches('/')
-                .to_string();
-            let url = format!("{}/models", base);
-            let res = client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .send()
-                .await
-                .map_err(|e| format!("Request to {} failed: {}", url, e))?;
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                return Err(ApiError::from(format!(
-                    "HTTP {} from {}: {}",
-                    status, url, body
-                )));
-            }
-            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let empty = vec![];
-            let from_data = data["data"].as_array().unwrap_or(&empty);
-            let from_models = data["models"].as_array().unwrap_or(&empty);
-            let from_root = data.as_array().unwrap_or(&empty);
-            let entries: Vec<&serde_json::Value> =
-                if !from_data.is_empty() || !from_models.is_empty() {
-                    from_data.iter().chain(from_models.iter()).collect()
-                } else {
-                    from_root.iter().collect()
-                };
-            let mut seen = std::collections::HashSet::new();
-            let mut models: Vec<String> = entries
-                .into_iter()
-                .filter_map(|m| {
-                    m["id"]
-                        .as_str()
-                        .or_else(|| m["name"].as_str())
-                        .map(|s| s.to_string())
-                })
-                .filter(|id| seen.insert(id.clone()))
-                .collect();
-            models.sort_by(|a, b| b.cmp(a));
-            models
-        }
-        _ => {
-            return Err(ApiError::from(format!(
-                "Unknown provider type: {}",
-                provider_type
-            )))
-        }
-    };
-
-    {
-        let mut cache = model_cache().lock().await;
-        cache.insert(cache_key, (models.clone(), std::time::Instant::now()));
-    }
+    let freebuff_cache = Some(rustic_app::host_ops::models::freebuff_cache_path(
+        &ctx.data_dir(),
+    ));
+    let models = rustic_app::host_ops::models::fetch_ai_models(
+        ctx.state(),
+        freebuff_cache,
+        a.provider_type,
+        a.api_key,
+        a.base_url,
+        a.force_refresh,
+        a.include_all,
+        a.capability,
+    )
+    .await
+    .map_err(ApiError::from)?;
     ok(models)
 }
 
@@ -997,39 +708,6 @@ fn list_known_models() -> Result<Value, ApiError> {
     ok(out)
 }
 
-fn price_per_m(pricing: &serde_json::Value, key: &str) -> f64 {
-    pricing
-        .get(key)
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|per_token| *per_token >= 0.0)
-        .map(|per_token| per_token * 1_000_000.0)
-        .unwrap_or(0.0)
-}
-
-#[derive(serde::Serialize, Clone)]
-struct OpenRouterModelSpec {
-    id: String,
-    name: String,
-    context_window: u32,
-    max_output_tokens: u32,
-    input_cost_per_m: f64,
-    output_cost_per_m: f64,
-    cache_read_cost_per_m: f64,
-    cache_write_cost_per_m: f64,
-    supports_temperature: bool,
-    supports_reasoning_effort: bool,
-}
-
-static OR_SPEC_CACHE: std::sync::OnceLock<
-    tokio::sync::Mutex<Option<(Vec<OpenRouterModelSpec>, std::time::Instant)>>,
-> = std::sync::OnceLock::new();
-
-fn or_spec_cache(
-) -> &'static tokio::sync::Mutex<Option<(Vec<OpenRouterModelSpec>, std::time::Instant)>> {
-    OR_SPEC_CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ForceRefreshArg {
@@ -1038,108 +716,10 @@ struct ForceRefreshArg {
 
 async fn fetch_openrouter_model_specs(args: &Value) -> Result<Value, ApiError> {
     let a: ForceRefreshArg = parse(args)?;
-    if !a.force_refresh.unwrap_or(false) {
-        let cache = or_spec_cache().lock().await;
-        if let Some((specs, fetched_at)) = cache.as_ref() {
-            if fetched_at.elapsed() < MODEL_CACHE_TTL {
-                return ok(specs.clone());
-            }
-        }
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .unwrap_or_default();
-
-    let res = client
-        .get("https://openrouter.ai/api/v1/models")
-        .send()
+    let specs = rustic_app::host_ops::openrouter::fetch_openrouter_model_specs(a.force_refresh)
         .await
-        .map_err(|e| e.to_string())?;
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(ApiError::from(format!(
-            "OpenRouter /v1/models returned {status}: {body}"
-        )));
-    }
-    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-    let empty = vec![];
-    let entries = json["data"].as_array().unwrap_or(&empty);
-
-    let mut specs: Vec<OpenRouterModelSpec> = Vec::with_capacity(entries.len());
-    for m in entries {
-        let id = match m["id"].as_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let pricing = &m["pricing"];
-        let params: Vec<&str> = m["supported_parameters"]
-            .as_array()
-            .unwrap_or(&empty)
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        let context_window = m["context_length"]
-            .as_u64()
-            .map(|v| std::cmp::min(v, 2_000_000))
-            .unwrap_or(0) as u32;
-        let max_output_tokens = m["top_provider"]["max_completion_tokens"]
-            .as_u64()
-            .map(|v| std::cmp::min(v, 131_072))
-            .unwrap_or(16_384) as u32;
-
-        specs.push(OpenRouterModelSpec {
-            id: id.clone(),
-            name: m["name"].as_str().unwrap_or(&id).to_string(),
-            context_window,
-            max_output_tokens,
-            input_cost_per_m: price_per_m(pricing, "prompt"),
-            output_cost_per_m: price_per_m(pricing, "completion"),
-            cache_read_cost_per_m: price_per_m(pricing, "input_cache_read"),
-            cache_write_cost_per_m: price_per_m(pricing, "input_cache_write"),
-            supports_temperature: params.contains(&"temperature"),
-            supports_reasoning_effort: params.contains(&"reasoning"),
-        });
-    }
-
-    specs.sort_by(|a, b| a.id.cmp(&b.id));
-    {
-        let mut cache = or_spec_cache().lock().await;
-        *cache = Some((specs.clone(), std::time::Instant::now()));
-    }
+        .map_err(ApiError::from)?;
     ok(specs)
-}
-
-#[derive(serde::Serialize, Clone, Default)]
-struct OpenRouterProvider {
-    provider_name: String,
-    provider_slug: String,
-    icon_url: Option<String>,
-    quantization: Option<String>,
-    context_length: u32,
-    max_completion_tokens: Option<u32>,
-    input_cost_per_m: f64,
-    output_cost_per_m: f64,
-    cache_read_cost_per_m: f64,
-    cache_write_cost_per_m: f64,
-    uptime_30m: Option<f64>,
-    throughput_tps: Option<f64>,
-    latency_ms: Option<f64>,
-    supported_parameters: Vec<String>,
-}
-
-static OR_PROVIDER_CACHE: std::sync::OnceLock<
-    tokio::sync::Mutex<
-        std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>,
-    >,
-> = std::sync::OnceLock::new();
-
-fn or_provider_cache() -> &'static tokio::sync::Mutex<
-    std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>,
-> {
-    OR_PROVIDER_CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 #[derive(Deserialize)]
@@ -1151,118 +731,10 @@ struct ProvidersArg {
 
 async fn fetch_openrouter_providers(args: &Value) -> Result<Value, ApiError> {
     let a: ProvidersArg = parse(args)?;
-    let model_id = a.model_id;
-    if !a.force_refresh.unwrap_or(false) {
-        let cache = or_provider_cache().lock().await;
-        if let Some((providers, fetched_at)) = cache.get(&model_id) {
-            if fetched_at.elapsed() < MODEL_CACHE_TTL {
-                return ok(providers.clone());
-            }
-        }
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_default();
-
-    let url = format!("https://openrouter.ai/api/v1/models/{}/endpoints", model_id);
-    let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(ApiError::from(format!(
-            "OpenRouter endpoints returned {status}: {body}"
-        )));
-    }
-    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-    let empty = vec![];
-    let endpoints = json["data"]["endpoints"].as_array().unwrap_or(&empty);
-
-    let mut permaslug: Option<String> = None;
-    let mut providers: Vec<OpenRouterProvider> = Vec::with_capacity(endpoints.len());
-    for ep in endpoints {
-        if permaslug.is_none() {
-            if let Some((_, slug)) = ep["name"].as_str().and_then(|n| n.split_once(" | ")) {
-                permaslug = Some(slug.trim().to_string());
-            }
-        }
-        let pricing = &ep["pricing"];
-        let provider_name = ep["provider_name"].as_str().unwrap_or("").to_string();
-        let provider_slug = ep["tag"]
-            .as_str()
-            .map(|t| t.split('/').next().unwrap_or(t).to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| provider_name.to_lowercase().replace(' ', "-"));
-        providers.push(OpenRouterProvider {
-            provider_name,
-            provider_slug,
-            icon_url: None,
-            quantization: ep["quantization"]
-                .as_str()
-                .filter(|s| *s != "unknown" && !s.is_empty())
-                .map(|s| s.to_string()),
-            context_length: ep["context_length"].as_u64().unwrap_or(0) as u32,
-            max_completion_tokens: ep["max_completion_tokens"].as_u64().map(|n| n as u32),
-            input_cost_per_m: price_per_m(pricing, "prompt"),
-            output_cost_per_m: price_per_m(pricing, "completion"),
-            cache_read_cost_per_m: price_per_m(pricing, "input_cache_read"),
-            cache_write_cost_per_m: price_per_m(pricing, "input_cache_write"),
-            uptime_30m: ep["uptime_last_30m"].as_f64(),
-            throughput_tps: ep["throughput_last_30m"].as_f64(),
-            latency_ms: ep["latency_last_30m"].as_f64(),
-            supported_parameters: ep["supported_parameters"]
-                .as_array()
-                .unwrap_or(&empty)
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect(),
-        });
-    }
-
-    if let Some(slug) = permaslug {
-        let furl = format!(
-            "https://openrouter.ai/api/frontend/stats/endpoint?permaslug={}&variant=standard",
-            slug
-        );
-        if let Ok(fres) = client.get(&furl).send().await {
-            if fres.status().is_success() {
-                if let Ok(fjson) = fres.json::<serde_json::Value>().await {
-                    if let Some(arr) = fjson["data"].as_array() {
-                        for item in arr {
-                            let pname = item["provider_name"].as_str().unwrap_or("");
-                            if let Some(p) = providers.iter_mut().find(|p| p.provider_name == pname)
-                            {
-                                let stats = &item["stats"];
-                                if p.throughput_tps.is_none() {
-                                    p.throughput_tps = stats["p50_throughput"].as_f64();
-                                }
-                                if p.latency_ms.is_none() {
-                                    p.latency_ms = stats["p50_latency"].as_f64();
-                                }
-                                p.icon_url = item["provider_info"]["icon"]["url"]
-                                    .as_str()
-                                    .map(|s| s.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    providers.sort_by(|a, b| {
-        b.throughput_tps
-            .unwrap_or(0.0)
-            .partial_cmp(&a.throughput_tps.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.provider_name.cmp(&b.provider_name))
-    });
-
-    {
-        let mut cache = or_provider_cache().lock().await;
-        cache.insert(model_id, (providers.clone(), std::time::Instant::now()));
-    }
+    let providers =
+        rustic_app::host_ops::openrouter::fetch_openrouter_providers(a.model_id, a.force_refresh)
+            .await
+            .map_err(ApiError::from)?;
     ok(providers)
 }
 

@@ -120,7 +120,9 @@ pub fn begin(
     total: u64,
     files: u64,
 ) -> Arc<Handle> {
-    let id = crate::peer::random_token().map(|t| t[..16].to_string()).unwrap_or_else(|_| now_ms().to_string());
+    let id = crate::peer::random_token()
+        .map(|t| t[..16].to_string())
+        .unwrap_or_else(|_| now_ms().to_string());
     let handle = Arc::new(Handle {
         id: id.clone(),
         cancel: AtomicBool::new(false),
@@ -162,7 +164,13 @@ pub fn begin(
         r.handles.insert(id.clone(), Arc::clone(&handle));
         // Keep the tray bounded: drop the oldest finished entries.
         while r.order.len() > 50 {
-            let Some(pos) = r.order.iter().position(|i| r.infos.get(i).is_some_and(|x| x.finished_ms.is_some())) else { break };
+            let Some(pos) = r
+                .order
+                .iter()
+                .position(|i| r.infos.get(i).is_some_and(|x| x.finished_ms.is_some()))
+            else {
+                break;
+            };
             let old = r.order.remove(pos);
             r.infos.remove(&old);
             r.handles.remove(&old);
@@ -174,8 +182,10 @@ pub fn begin(
 
 impl Handle {
     fn emit_info(&self, info: &TransferInfo) {
-        self.emitter
-            .emit_json("rustic:transfer", serde_json::to_value(info).unwrap_or_default());
+        self.emitter.emit_json(
+            "rustic:transfer",
+            serde_json::to_value(info).unwrap_or_default(),
+        );
     }
 
     /// Apply `f` to this transfer's info and emit it (throttled unless `force`).
@@ -204,7 +214,11 @@ impl Handle {
             let dt = s.last_at.elapsed().as_secs_f64();
             if dt >= 0.5 {
                 let inst = done.saturating_sub(s.last_done) as f64 / dt;
-                s.bps = if s.bps == 0.0 { inst } else { s.bps * 0.7 + inst * 0.3 };
+                s.bps = if s.bps == 0.0 {
+                    inst
+                } else {
+                    s.bps * 0.7 + inst * 0.3
+                };
                 s.last_at = Instant::now();
                 s.last_done = done;
             }
@@ -218,7 +232,8 @@ impl Handle {
                 i.total = total;
             }
             i.speed_bps = bps;
-            i.eta_secs = (i.total > done && bps > 1.0).then(|| ((i.total - done) as f64 / bps).ceil() as u64);
+            i.eta_secs = (i.total > done && bps > 1.0)
+                .then(|| ((i.total - done) as f64 / bps).ceil() as u64);
         });
     }
 
@@ -414,12 +429,16 @@ pub fn peer_reachable(peer: &str) {
     }
 }
 
-impl Handle {
-}
+impl Handle {}
 
 /// All transfers, oldest first.
 pub fn list() -> Vec<TransferInfo> {
-    with(|r| r.order.iter().filter_map(|i| r.infos.get(i).cloned()).collect())
+    with(|r| {
+        r.order
+            .iter()
+            .filter_map(|i| r.infos.get(i).cloned())
+            .collect()
+    })
 }
 
 /// Cancel a running transfer.

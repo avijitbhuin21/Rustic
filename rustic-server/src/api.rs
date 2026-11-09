@@ -84,7 +84,7 @@ pub fn project_root(ctx: &ServerContext, project_id: &str) -> Result<String, Api
     let ws = ctx.state().workspace.lock_safe();
     ws.list_projects()
         .into_iter()
-        .find(|p| p.id.to_string() == project_id)
+        .find(|p| p.id == project_id)
         .map(|p| p.root_path.to_string_lossy().to_string())
         .ok_or_else(|| ApiError::bad(format!("Project not found: {project_id}")))
 }

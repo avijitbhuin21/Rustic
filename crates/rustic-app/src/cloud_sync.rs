@@ -252,7 +252,7 @@ fn ensure_no_running_tasks(
                     TaskStatus::Preparing | TaskStatus::Running | TaskStatus::WaitingOnSubagents
                 )
             })
-            .filter(|t| project_ids.map_or(true, |ids| ids.contains(&t.info.project_id)))
+            .filter(|t| project_ids.is_none_or(|ids| ids.contains(&t.info.project_id)))
             .map(|t| t.info.project_id.clone())
             .collect()
     };
@@ -745,7 +745,10 @@ pub fn build_project_archive_into(
     sink: Box<dyn Write + Send>,
     reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
-    ensure_no_running_tasks(state, Some(&std::iter::once(project_id.to_string()).collect()))?;
+    ensure_no_running_tasks(
+        state,
+        Some(&std::iter::once(project_id.to_string()).collect()),
+    )?;
     reporter.stage("preparing", "reading project", 0, 1);
 
     let project = {
@@ -1284,11 +1287,9 @@ pub fn apply_sync_archive_from(
     let fh_dir = data_dir.join("file-history");
     force_remove_dir_all(&fh_dir);
     let staged_fh = staging.join("data/file-history");
-    if staged_fh.is_dir() {
-        if std::fs::rename(&staged_fh, &fh_dir).is_err() {
-            mirror_dir(&staged_fh, &fh_dir, &|_| {})
-                .map_err(|e| format!("file-history install failed: {e}"))?;
-        }
+    if staged_fh.is_dir() && std::fs::rename(&staged_fh, &fh_dir).is_err() {
+        mirror_dir(&staged_fh, &fh_dir, &|_| {})
+            .map_err(|e| format!("file-history install failed: {e}"))?;
     }
 
     // 5b. Replace the chat media store. Content-addressed, so a stale local

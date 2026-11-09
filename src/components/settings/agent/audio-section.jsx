@@ -78,6 +78,7 @@ export function AudioInputSection() {
           baseUrl: found.baseUrl || null,
           forceRefresh: false,
           includeAll: true,
+          capability: 'audio',
         });
         if (!cancelled) setProviderModels(Array.isArray(list) ? list : []);
       } catch {

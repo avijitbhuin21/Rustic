@@ -230,7 +230,10 @@ async fn run(ctx: &ServerContext, command: &str, args: &Value) -> Result<Value, 
         }
         "lan_remote_conflicts" => {
             let a: RemoteConflictsArg = parse(args)?;
-            ok(ops::remote_conflicts(&host, lan, &a.device_id, &a.project_id, &a.dir, a.names).await?)
+            ok(
+                ops::remote_conflicts(&host, lan, &a.device_id, &a.project_id, &a.dir, a.names)
+                    .await?,
+            )
         }
         "lan_pull_files" => {
             let a: PullFilesArg = parse(args)?;
@@ -238,7 +241,16 @@ async fn run(ctx: &ServerContext, command: &str, args: &Value) -> Result<Value, 
         }
         "lan_push_files" => {
             let a: PushFilesArg = parse(args)?;
-            ok(ops::push_files(&host, lan, &a.device_id, a.local_paths, a.project_id, a.dir, a.opts).await?)
+            ok(ops::push_files(
+                &host,
+                lan,
+                &a.device_id,
+                a.local_paths,
+                a.project_id,
+                a.dir,
+                a.opts,
+            )
+            .await?)
         }
         "lan_request_meta_access" => {
             let a: DeviceArg = parse(args)?;
@@ -263,15 +275,21 @@ async fn run(ctx: &ServerContext, command: &str, args: &Value) -> Result<Value, 
         "lan_transfers" => ok(rustic_app::transfers::list()),
         "lan_transfer_cancel" => {
             let a: TransferIdArg = parse(args)?;
-            ok(rustic_app::transfers::cancel(a.id.as_deref().unwrap_or_default())?)
+            ok(rustic_app::transfers::cancel(
+                a.id.as_deref().unwrap_or_default(),
+            )?)
         }
         "lan_transfer_pause" => {
             let a: TransferIdArg = parse(args)?;
-            ok(rustic_app::transfers::pause(a.id.as_deref().unwrap_or_default())?)
+            ok(rustic_app::transfers::pause(
+                a.id.as_deref().unwrap_or_default(),
+            )?)
         }
         "lan_transfer_resume" => {
             let a: TransferIdArg = parse(args)?;
-            ok(rustic_app::transfers::resume(a.id.as_deref().unwrap_or_default())?)
+            ok(rustic_app::transfers::resume(
+                a.id.as_deref().unwrap_or_default(),
+            )?)
         }
         "lan_transfer_clear" => {
             let a: TransferIdArg = parse(args)?;
@@ -325,6 +343,8 @@ async fn run(ctx: &ServerContext, command: &str, args: &Value) -> Result<Value, 
         "lan_set_internet_mode" => Err(ApiError::from(
             "The server is already reachable at its own URL — no tunnel needed.".to_string(),
         )),
-        other => Err(ApiError::from(format!("{other} isn't available on the server"))),
+        other => Err(ApiError::from(format!(
+            "{other} isn't available on the server"
+        ))),
     }
 }

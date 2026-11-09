@@ -2,6 +2,7 @@ import React, { Suspense, useEffect, useMemo, useState } from 'react';
 import { Eye, Code2, Loader2 } from 'lucide-react';
 import { TabBar } from '@/components/editor/tab-bar';
 import { Breadcrumb } from '@/components/editor/breadcrumb';
+import { UnsupportedFileView } from '@/components/editor/unsupported-file-view';
 import { useEditor, TOGGLEABLE_PREVIEW_KINDS } from '@/state/editor';
 import { useSettings } from '@/state/settings';
 import { useSessionRestore } from '@/lib/session-restore';
@@ -204,6 +205,7 @@ function ActiveView({ tab }) {
     case 'notebook': return <NotebookPreview tab={tab} />;
     case 'hex':      return <HexPreview tab={tab} />;
     case 'diff':     return <DiffView file={tab.diff} />;
+    case 'unsupported': return <UnsupportedFileView tab={tab} />;
     default:         return <MonacoEditor tab={tab} />;
   }
 }

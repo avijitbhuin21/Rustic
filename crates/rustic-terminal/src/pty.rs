@@ -255,37 +255,16 @@ pub fn append_output(buffer: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
 /// which case the caller treats it as "busy" and declines to auto-close.
 #[cfg(windows)]
 pub fn process_has_children(pid: u32) -> Option<bool> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
+    let procs = windows_process_table()?;
+    let root_is_launcher = match windows_image_path(pid) {
+        Some(path) => is_git_bash_launcher_path(&path),
+        None => procs
+            .iter()
+            .find(|p| p.0 == pid)
+            .map(|p| is_posix_shell_exe(&p.2))
+            .unwrap_or(false),
     };
-
-    // SAFETY: standard Toolhelp snapshot walk. We zero-init the entry, set its
-    // dwSize as the API requires, and close the snapshot handle on every exit
-    // path. All pointers passed are to stack locals that outlive the calls.
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return None;
-        }
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut has_child = false;
-        if Process32FirstW(snap, &mut entry) != 0 {
-            loop {
-                if entry.th32ParentProcessID == pid {
-                    has_child = true;
-                    break;
-                }
-                if Process32NextW(snap, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-        Some(has_child)
-    }
+    Some(resolve_shell_busy(pid, &procs, root_is_launcher))
 }
 
 #[cfg(target_os = "linux")]
@@ -337,11 +316,7 @@ fn child_pids(pid: u32) -> Option<Vec<u32>> {
     // Returns the number of child pids written into the buffer, or -1 on
     // error. A NULL-buffer size probe is only an estimate, so pass a real buffer.
     extern "C" {
-        fn proc_listchildpids(
-            ppid: i32,
-            buffer: *mut std::ffi::c_void,
-            buffersize: i32,
-        ) -> i32;
+        fn proc_listchildpids(ppid: i32, buffer: *mut std::ffi::c_void, buffersize: i32) -> i32;
     }
     let ppid = i32::try_from(pid).ok()?;
     let mut pids = [0i32; 64];
@@ -390,15 +365,197 @@ pub fn shell_command_busy(shell_pid: u32, foreground_pgid: Option<i32>) -> Optio
     }
     let same_group = children.iter().any(|&c| {
         // SAFETY: as above.
-        i32::try_from(c).map(|c| unsafe { getpgid(c) } == shell_pgid).unwrap_or(false)
+        i32::try_from(c)
+            .map(|c| unsafe { getpgid(c) } == shell_pgid)
+            .unwrap_or(false)
     });
     Some(same_group)
 }
 
-/// Platforms without process groups (Windows): any child counts as busy.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Platforms without process groups (Windows): busy when the shell has a
+/// child. Git for Windows' `<Git>\bin\bash.exe` is a native launcher that keeps
+/// the real MSYS shell (`<Git>\usr\bin\bash.exe`) as its child for the whole
+/// session, so measuring the launcher reported every finished command as still
+/// running — look one level down through it.
+#[cfg(windows)]
 pub fn shell_command_busy(shell_pid: u32, _foreground_pgid: Option<i32>) -> Option<bool> {
     process_has_children(shell_pid)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn shell_command_busy(shell_pid: u32, _foreground_pgid: Option<i32>) -> Option<bool> {
+    process_has_children(shell_pid)
+}
+
+/// Busy-ness of a shell from a `(pid, ppid, exe_name)` process table, stepping
+/// through a launcher whose only job is to host the real shell.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn resolve_shell_busy(root: u32, procs: &[(u32, u32, String)], root_is_launcher: bool) -> bool {
+    let kids = |pid: u32| -> Vec<&(u32, u32, String)> {
+        procs
+            .iter()
+            .filter(|p| p.1 == pid && p.0 != pid && !is_console_host_exe(&p.2))
+            .collect()
+    };
+    let mut shell = root;
+    if root_is_launcher {
+        let k = kids(root);
+        if k.len() == 1 && is_posix_shell_exe(&k[0].2) {
+            shell = k[0].0;
+        }
+    }
+    !kids(shell).is_empty()
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn is_posix_shell_exe(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "bash.exe" || n == "sh.exe"
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn is_console_host_exe(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "conhost.exe" || n == "openconsole.exe"
+}
+
+/// True for Git for Windows' `<Git>\bin\{bash,sh}.exe` launcher (not the real
+/// `<Git>\usr\bin\bash.exe` shell).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn is_git_bash_launcher_path(path: &str) -> bool {
+    let p = path.replace('/', "\\").to_ascii_lowercase();
+    (p.ends_with("\\bin\\bash.exe") || p.ends_with("\\bin\\sh.exe")) && !p.contains("\\usr\\bin\\")
+}
+
+/// Snapshot of every process as `(pid, parent_pid, exe_name)`.
+#[cfg(windows)]
+fn windows_process_table() -> Option<Vec<(u32, u32, String)>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: same Toolhelp walk as `process_has_children`.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut out = Vec::new();
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                out.push((entry.th32ProcessID, entry.th32ParentProcessID, name));
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        Some(out)
+    }
+}
+
+/// Full executable path of `pid`, or `None` when it can't be queried.
+#[cfg(windows)]
+fn windows_image_path(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is checked for null and always closed; the buffer is
+    // a stack array whose capacity is passed in `len`.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+#[cfg(test)]
+mod shell_busy_tests {
+    use super::*;
+
+    fn t(rows: &[(u32, u32, &str)]) -> Vec<(u32, u32, String)> {
+        rows.iter()
+            .map(|(a, b, c)| (*a, *b, c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn git_bash_launcher_at_prompt_is_idle() {
+        // launcher(10) → real bash(11), nothing else: the prompt is waiting.
+        let procs = t(&[
+            (10, 1, "bash.exe"),
+            (11, 10, "bash.exe"),
+            (12, 10, "conhost.exe"),
+        ]);
+        assert!(!resolve_shell_busy(10, &procs, true));
+    }
+
+    #[test]
+    fn git_bash_launcher_running_command_is_busy() {
+        let procs = t(&[
+            (10, 1, "bash.exe"),
+            (11, 10, "bash.exe"),
+            (13, 11, "python.exe"),
+        ]);
+        assert!(resolve_shell_busy(10, &procs, true));
+    }
+
+    #[test]
+    fn nested_bash_under_real_shell_still_counts_as_busy() {
+        // `bash script.sh` from the real shell: only the launcher is skipped.
+        let procs = t(&[
+            (10, 1, "bash.exe"),
+            (11, 10, "bash.exe"),
+            (14, 11, "bash.exe"),
+        ]);
+        assert!(resolve_shell_busy(10, &procs, true));
+    }
+
+    #[test]
+    fn non_launcher_shell_with_child_is_busy() {
+        let procs = t(&[(20, 1, "pwsh.exe"), (21, 20, "node.exe")]);
+        assert!(resolve_shell_busy(20, &procs, false));
+        let procs = t(&[(20, 1, "bash.exe"), (21, 20, "bash.exe")]);
+        assert!(
+            resolve_shell_busy(20, &procs, false),
+            "real shell running `bash x.sh`"
+        );
+    }
+
+    #[test]
+    fn launcher_path_detection() {
+        assert!(is_git_bash_launcher_path(
+            r"C:\Program Files\Git\bin\bash.exe"
+        ));
+        assert!(is_git_bash_launcher_path(
+            r"C:\Users\a\scoop\apps\git\current\bin\sh.exe"
+        ));
+        assert!(!is_git_bash_launcher_path(
+            r"C:\Program Files\Git\usr\bin\bash.exe"
+        ));
+        assert!(!is_git_bash_launcher_path(
+            r"C:\Program Files\PowerShell\7\pwsh.exe"
+        ));
+    }
 }
 
 #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
@@ -511,8 +668,15 @@ mod tests {
             if !std::path::Path::new(shell).is_file() {
                 continue;
             }
-            let mut s = PtySession::new(std::env::temp_dir(), "t".into(), true, Some(shell.to_string()), None, &[])
-                .expect("spawn pty shell");
+            let mut s = PtySession::new(
+                std::env::temp_dir(),
+                "t".into(),
+                true,
+                Some(shell.to_string()),
+                None,
+                &[],
+            )
+            .expect("spawn pty shell");
             let mut reader = s.take_reader().expect("reader");
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
@@ -529,21 +693,47 @@ mod tests {
                 }
                 false
             };
-            assert!(poll(&s, false, Duration::from_secs(5)), "{shell}: idle shell is not busy");
+            assert!(
+                poll(&s, false, Duration::from_secs(5)),
+                "{shell}: idle shell is not busy"
+            );
             s.write(b"sleep 3 &\r").expect("write");
             assert!(
-                super::process_has_children(pid) == Some(true)
-                    || {
-                        std::thread::sleep(Duration::from_millis(500));
-                        super::process_has_children(pid) == Some(true)
-                    },
+                super::process_has_children(pid) == Some(true) || {
+                    std::thread::sleep(Duration::from_millis(500));
+                    super::process_has_children(pid) == Some(true)
+                },
                 "{shell}: background job is a child"
             );
             std::thread::sleep(Duration::from_millis(400));
-            assert_eq!(shell_command_busy(pid, s.foreground_pgid()), Some(false), "{shell}: background job is not busy");
+            assert_eq!(
+                shell_command_busy(pid, s.foreground_pgid()),
+                Some(false),
+                "{shell}: background job is not busy"
+            );
+            assert!(
+                crate::shell::shell_has_background_job(pid, s.foreground_pgid()),
+                "{shell}: idle shell with `cmd &` reports a background job"
+            );
+            let start = Instant::now();
+            while crate::shell::shell_has_background_job(pid, s.foreground_pgid())
+                && start.elapsed() < Duration::from_secs(6)
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(
+                !crate::shell::shell_has_background_job(pid, s.foreground_pgid()),
+                "{shell}: background job flag clears once the job ends"
+            );
             s.write(b"sleep 2\r").expect("write");
-            assert!(poll(&s, true, Duration::from_secs(5)), "{shell}: foreground command is busy");
-            assert!(poll(&s, false, Duration::from_secs(6)), "{shell}: finished foreground command is not busy");
+            assert!(
+                poll(&s, true, Duration::from_secs(5)),
+                "{shell}: foreground command is busy"
+            );
+            assert!(
+                poll(&s, false, Duration::from_secs(6)),
+                "{shell}: finished foreground command is not busy"
+            );
             let _ = s.write(b"exit\r");
             if let Some(mut c) = s.take_child() {
                 let _ = c.kill();

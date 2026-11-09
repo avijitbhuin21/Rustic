@@ -27,9 +27,9 @@ pub async fn dispatch(
         "edit_buffer" => edit_buffer(ctx, args),
         "format_buffer" => format_buffer(ctx, args),
         "save_file" => save_file(ctx, args),
-        "buffer_external_change" => {
-            by_id(args, |id| wrap(ops::buffer_external_change(ctx.state(), id)))
-        }
+        "buffer_external_change" => by_id(args, |id| {
+            wrap(ops::buffer_external_change(ctx.state(), id))
+        }),
         "reload_buffer" => by_id(args, |id| wrap(ops::reload_buffer(ctx.state(), id))),
         "undo_edit" => by_id(args, |id| wrap(ops::undo_redo(ctx.state(), id, false))),
         "redo_edit" => by_id(args, |id| wrap(ops::undo_redo(ctx.state(), id, true))),
@@ -51,10 +51,7 @@ struct BufferIdArg {
     buffer_id: u64,
 }
 
-fn by_id(
-    args: &Value,
-    f: impl FnOnce(u64) -> Result<Value, ApiError>,
-) -> Result<Value, ApiError> {
+fn by_id(args: &Value, f: impl FnOnce(u64) -> Result<Value, ApiError>) -> Result<Value, ApiError> {
     let a: BufferIdArg = parse(args)?;
     f(a.buffer_id)
 }
@@ -68,7 +65,12 @@ fn open_scratch_buffer(ctx: &ServerContext, args: &Value) -> Result<Value, ApiEr
         language: Option<String>,
     }
     let a: A = parse(args)?;
-    wrap(ops::open_scratch_buffer(ctx.state(), &a.title, &a.content, a.language))
+    wrap(ops::open_scratch_buffer(
+        ctx.state(),
+        &a.title,
+        &a.content,
+        a.language,
+    ))
 }
 
 fn get_visible_lines(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -80,7 +82,12 @@ fn get_visible_lines(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         end: usize,
     }
     let a: A = parse(args)?;
-    wrap(ops::get_visible_lines(ctx.state(), a.buffer_id, a.start, a.end))
+    wrap(ops::get_visible_lines(
+        ctx.state(),
+        a.buffer_id,
+        a.start,
+        a.end,
+    ))
 }
 
 fn highlight_range(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -92,7 +99,12 @@ fn highlight_range(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
         end_line: usize,
     }
     let a: A = parse(args)?;
-    wrap(ops::highlight_range(ctx.state(), a.buffer_id, a.start_line, a.end_line))
+    wrap(ops::highlight_range(
+        ctx.state(),
+        a.buffer_id,
+        a.start_line,
+        a.end_line,
+    ))
 }
 
 fn edit_buffer(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {

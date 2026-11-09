@@ -92,16 +92,16 @@ function SortableTab({ session, active, onSelect, onClose }) {
           shows a steady green, and a retired one a muted dot. */}
       <span
         aria-hidden
-        title={
-          session.exited ? 'Shell exited' : session.running ? 'Command running' : 'Idle at prompt'
-        }
+        title={terminalStatusTitle(session)}
         className={cn(
           'mr-1 size-1.5 shrink-0 rounded-full',
           session.exited
             ? 'bg-muted-foreground/40'
             : session.running
                   ? 'animate-pulse bg-warning'
-                  : 'bg-success',
+                  : session.background_job
+                    ? 'bg-success ring-2 ring-info/50'
+                    : 'bg-success',
         )}
       />
       {editing ? (
@@ -151,6 +151,14 @@ function SortableTab({ session, active, onSelect, onClose }) {
   );
 }
 
+/** Hover text for a terminal's status dot. */
+function terminalStatusTitle(session) {
+  if (session.exited) return 'Shell exited';
+  if (session.running) return 'Command running';
+  if (session.background_job) return 'Idle · background job running';
+  return 'Idle at prompt';
+}
+
 /** Normalise a path for prefix comparison (case-insensitive, forward slashes, no trailing slash). */
 const normPath = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 
@@ -180,12 +188,18 @@ function AgentTerminalRow({ session, chatTitle, active, onSelect, onOpenChat, on
     >
       <span
         aria-hidden
-        title={session.running ? 'Command running' : 'Idle at prompt'}
-        className={cn('mt-1 size-1.5 shrink-0 rounded-full', session.running ? 'animate-pulse bg-warning' : 'bg-success')}
+        title={terminalStatusTitle(session)}
+        className={cn(
+          'mt-1 size-1.5 shrink-0 rounded-full',
+          session.running ? 'animate-pulse bg-warning' : session.background_job ? 'bg-success ring-2 ring-info/50' : 'bg-success',
+        )}
       />
       <div className="min-w-0 flex-1">
         <div className="truncate" title={label}>{label}</div>
         {chatTitle && <div className="truncate text-[10.5px] text-muted-foreground/80" title={chatTitle}>{chatTitle}</div>}
+        {!session.running && session.background_job && (
+          <div className="truncate text-[10px] text-muted-foreground/80">idle · background job</div>
+        )}
         {session.last_command && (
           <div className="truncate font-mono text-[10px] text-muted-foreground/70" title={session.last_command}>
             $ {session.last_command}

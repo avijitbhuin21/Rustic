@@ -3,6 +3,8 @@
 //! gate, login, the command dispatch, and the 501 fallback — the Phase 7
 //! "route ↔ command arg mapping" and "auth token issue/verify" gates.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 
@@ -224,10 +226,13 @@ fn upload_then_download_file_roundtrips() {
 
         let down = app
             .oneshot(
-                req("GET", &format!("/api/download?path={}", urlencode(&written)))
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
+                req(
+                    "GET",
+                    &format!("/api/download?path={}", urlencode(&written)),
+                )
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -319,10 +324,16 @@ fn download_refuses_internal_data() {
         let secret = data_dir.join("secrets.json");
         let resp = inner
             .oneshot(
-                req("GET", &format!("/api/download?path={}", urlencode(&secret.to_string_lossy())))
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
+                req(
+                    "GET",
+                    &format!(
+                        "/api/download?path={}",
+                        urlencode(&secret.to_string_lossy())
+                    ),
+                )
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -344,62 +355,62 @@ fn browser_open_starts_and_close_reaps_chromium() {
         return;
     }
     run("pw", |app| async move {
-    let token = login_token(&app, "pw").await;
+        let token = login_token(&app, "pw").await;
 
-    // Open → Chromium up, at least one tab.
-    let open = app
-        .clone()
-        .oneshot(
-            req("POST", "/api/browser_open")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(open.status(), StatusCode::OK);
-    let body = body_json(open).await;
-    assert_eq!(body["running"], true);
-    assert!(body["tabs"]
-        .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false));
+        // Open → Chromium up, at least one tab.
+        let open = app
+            .clone()
+            .oneshot(
+                req("POST", "/api/browser_open")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open.status(), StatusCode::OK);
+        let body = body_json(open).await;
+        assert_eq!(body["running"], true);
+        assert!(body["tabs"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false));
 
-    // The loopback CDP port answers while running.
-    let port: u16 = std::env::var("RUSTIC_BROWSER_DEBUG_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(9222);
-    let version_url = format!("http://127.0.0.1:{port}/json/version");
-    assert!(
-        http_ok(&version_url).await,
-        "CDP port should answer while the browser is open"
-    );
+        // The loopback CDP port answers while running.
+        let port: u16 = std::env::var("RUSTIC_BROWSER_DEBUG_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9222);
+        let version_url = format!("http://127.0.0.1:{port}/json/version");
+        assert!(
+            http_ok(&version_url).await,
+            "CDP port should answer while the browser is open"
+        );
 
-    // Close → Chromium reaped, port no longer answers.
-    let close = app
-        .oneshot(
-            req("POST", "/api/browser_close")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(close.status(), StatusCode::OK);
+        // Close → Chromium reaped, port no longer answers.
+        let close = app
+            .oneshot(
+                req("POST", "/api/browser_close")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(close.status(), StatusCode::OK);
 
-    // Give the port a moment to free, then confirm it's refused.
-    let mut refused = false;
-    for _ in 0..20 {
-        if !http_ok(&version_url).await {
-            refused = true;
-            break;
+        // Give the port a moment to free, then confirm it's refused.
+        let mut refused = false;
+        for _ in 0..20 {
+            if !http_ok(&version_url).await {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    assert!(refused, "CDP port must stop answering after browser_close");
+        assert!(refused, "CDP port must stop answering after browser_close");
     });
 }
 

@@ -176,6 +176,7 @@ pub async fn evaluate_goal(
         system_prompt: Some(EVALUATOR_SYSTEM_PROMPT.to_string()),
         thinking_budget: 0,
         context_window: 0,
+        condense_threshold: 0,
         web_search_enabled: false,
         web_fetch_enabled: false,
         supports_temperature: config.supports_temperature,

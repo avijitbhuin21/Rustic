@@ -350,7 +350,7 @@ impl SubagentRegistry {
         writes: Vec<String>,
         cancel_token: Option<Arc<AtomicBool>>,
     ) {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let task_agents = agents.entry(parent_task_id.to_string()).or_default();
         task_agents.insert(
             agent_id.to_string(),
@@ -366,12 +366,12 @@ impl SubagentRegistry {
                 last_action: None,
                 activity: VecDeque::new(),
                 files_written: std::collections::BTreeSet::new(),
-            pending_writes: std::collections::HashMap::new(),
+                pending_writes: std::collections::HashMap::new(),
                 text_buffer: String::new(),
             },
         );
         // Ensure a Notify exists for this parent task
-        let mut notifies = self.notifies.lock().unwrap();
+        let mut notifies = self.notifies.lock().unwrap_or_else(|p| p.into_inner());
         notifies
             .entry(parent_task_id.to_string())
             .or_insert_with(|| Arc::new(Notify::new()));
@@ -388,7 +388,7 @@ impl SubagentRegistry {
         kind: InboxKind,
         content: String,
     ) -> Result<(), String> {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let task_agents = agents
             .get_mut(parent_task_id)
             .ok_or_else(|| format!("No sub-agents registered for task `{}`", parent_task_id))?;
@@ -417,7 +417,7 @@ impl SubagentRegistry {
     /// FIFO order; the caller is responsible for formatting them into the
     /// next User message.
     pub fn drain_inbox(&self, parent_task_id: &str, agent_id: &str) -> Vec<InboxMessage> {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let Some(task_agents) = agents.get_mut(parent_task_id) else {
             return Vec::new();
         };
@@ -429,7 +429,7 @@ impl SubagentRegistry {
 
     /// Paths a sub-agent has written so far (from its write-tool calls).
     pub fn files_written(&self, parent_task_id: &str, agent_id: &str) -> Vec<String> {
-        let agents = self.agents.lock().unwrap();
+        let agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         agents
             .get(parent_task_id)
             .and_then(|m| m.get(agent_id))
@@ -447,7 +447,7 @@ impl SubagentRegistry {
         question: &str,
     ) -> Result<tokio::sync::oneshot::Receiver<String>, String> {
         {
-            let agents = self.agents.lock().unwrap();
+            let agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
             let entry = agents
                 .get(parent_task_id)
                 .and_then(|m| m.get(agent_id))
@@ -467,18 +467,23 @@ impl SubagentRegistry {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.escalations
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert((parent_task_id.to_string(), agent_id.to_string()), tx);
         self.pending
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .entry(parent_task_id.to_string())
             .or_default()
             .push_back(SubagentCompletionEvent::Escalation {
                 agent_id: agent_id.to_string(),
                 question: question.to_string(),
             });
-        if let Some(n) = self.notifies.lock().unwrap().get(parent_task_id) {
+        if let Some(n) = self
+            .notifies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(parent_task_id)
+        {
             n.notify_one();
         }
         Ok(rx)
@@ -490,7 +495,7 @@ impl SubagentRegistry {
     pub fn has_pending_escalation(&self, parent_task_id: &str, agent_id: &str) -> bool {
         self.escalations
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .contains_key(&(parent_task_id.to_string(), agent_id.to_string()))
     }
 
@@ -500,7 +505,7 @@ impl SubagentRegistry {
         let sender = self
             .escalations
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .remove(&(parent_task_id.to_string(), agent_id.to_string()));
         match sender {
             Some(tx) => tx.send(answer).is_ok(),
@@ -512,7 +517,7 @@ impl SubagentRegistry {
     /// sub-agent's executor watches. Returns true if a cancel token was
     /// wired (i.e. the signal will be observed); false otherwise.
     pub fn cancel(&self, parent_task_id: &str, agent_id: &str) -> bool {
-        let agents = self.agents.lock().unwrap();
+        let agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let Some(task_agents) = agents.get(parent_task_id) else {
             return false;
         };
@@ -537,7 +542,7 @@ impl SubagentRegistry {
         action: Option<String>,
         cost_delta_usd: f64,
     ) {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let Some(task_agents) = agents.get_mut(parent_task_id) else {
             return;
         };
@@ -575,7 +580,7 @@ impl SubagentRegistry {
         if delta.is_empty() {
             return;
         }
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let Some(task_agents) = agents.get_mut(parent_task_id) else {
             return;
         };
@@ -609,7 +614,7 @@ impl SubagentRegistry {
         tool_name: &str,
         input: &serde_json::Value,
     ) {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let Some(task_agents) = agents.get_mut(parent_task_id) else {
             return;
         };
@@ -643,7 +648,7 @@ impl SubagentRegistry {
         content: &str,
         is_error: bool,
     ) {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let Some(task_agents) = agents.get_mut(parent_task_id) else {
             return;
         };
@@ -677,7 +682,7 @@ impl SubagentRegistry {
         kind: InboxKind,
         content: &str,
     ) {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let Some(task_agents) = agents.get_mut(parent_task_id) else {
             return;
         };
@@ -705,7 +710,7 @@ impl SubagentRegistry {
     /// unflushed text buffer (so in-progress streaming text shows up too).
     /// `total_activity` is the un-trimmed count for "showing N of M" framing.
     pub fn read_activity(&self, parent_task_id: &str, agent_id: &str) -> Option<SubagentReadout> {
-        let agents = self.agents.lock().unwrap();
+        let agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let task_agents = agents.get(parent_task_id)?;
         let entry = task_agents.get(agent_id)?;
         let mut activity: Vec<SubagentActivity> = entry.activity.iter().cloned().collect();
@@ -740,11 +745,8 @@ impl SubagentRegistry {
         if candidate_writes.is_empty() {
             return None;
         }
-        let agents = self.agents.lock().unwrap();
-        let task_agents = match agents.get(parent_task_id) {
-            Some(m) => m,
-            None => return None,
-        };
+        let agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
+        let task_agents = agents.get(parent_task_id)?;
         for entry in task_agents.values() {
             if entry.status != SubagentStatus::Running {
                 continue;
@@ -760,7 +762,7 @@ impl SubagentRegistry {
 
     /// Count currently-running sub-agents for a parent task.
     pub fn running_count(&self, parent_task_id: &str) -> usize {
-        let agents = self.agents.lock().unwrap();
+        let agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         agents
             .get(parent_task_id)
             .map(|m| {
@@ -774,7 +776,7 @@ impl SubagentRegistry {
     /// Mark a sub-agent as completed and wake any waiting executor.
     pub fn complete(&self, parent_task_id: &str, result: SubagentResult) {
         {
-            let mut agents = self.agents.lock().unwrap();
+            let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(task_agents) = agents.get_mut(parent_task_id) {
                 if let Some(entry) = task_agents.get_mut(&result.agent_id) {
                     Self::flush_text_buffer_locked(entry);
@@ -783,13 +785,13 @@ impl SubagentRegistry {
             }
         }
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending
                 .entry(parent_task_id.to_string())
                 .or_default()
                 .push_back(SubagentCompletionEvent::Completed(result));
         }
-        let notifies = self.notifies.lock().unwrap();
+        let notifies = self.notifies.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(notify) = notifies.get(parent_task_id) {
             notify.notify_one();
         }
@@ -798,7 +800,7 @@ impl SubagentRegistry {
     /// Mark a sub-agent as failed and wake any waiting executor.
     pub fn fail(&self, parent_task_id: &str, agent_id: &str, error: String) {
         {
-            let mut agents = self.agents.lock().unwrap();
+            let mut agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(task_agents) = agents.get_mut(parent_task_id) {
                 if let Some(entry) = task_agents.get_mut(agent_id) {
                     Self::flush_text_buffer_locked(entry);
@@ -807,7 +809,7 @@ impl SubagentRegistry {
             }
         }
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending
                 .entry(parent_task_id.to_string())
                 .or_default()
@@ -816,7 +818,7 @@ impl SubagentRegistry {
                     error,
                 });
         }
-        let notifies = self.notifies.lock().unwrap();
+        let notifies = self.notifies.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(notify) = notifies.get(parent_task_id) {
             notify.notify_one();
         }
@@ -824,7 +826,7 @@ impl SubagentRegistry {
 
     /// Returns all Running sub-agents for the given parent task.
     pub fn active_for_task(&self, parent_task_id: &str) -> Vec<SubagentEntry> {
-        let agents = self.agents.lock().unwrap();
+        let agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         agents
             .get(parent_task_id)
             .map(|m| {
@@ -838,7 +840,7 @@ impl SubagentRegistry {
 
     /// Returns all sub-agents (any status) for the given parent task.
     pub fn all_for_task(&self, parent_task_id: &str) -> Vec<SubagentEntry> {
-        let agents = self.agents.lock().unwrap();
+        let agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         agents
             .get(parent_task_id)
             .map(|m| m.values().cloned().collect())
@@ -848,7 +850,7 @@ impl SubagentRegistry {
     /// Drain all pending (already-completed) events without blocking.
     /// Returns events for sub-agents that finished while the model was generating or tools were executing.
     pub fn drain_pending(&self, parent_task_id: &str) -> Vec<SubagentCompletionEvent> {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(queue) = pending.get_mut(parent_task_id) {
             queue.drain(..).collect()
         } else {
@@ -858,7 +860,7 @@ impl SubagentRegistry {
 
     /// Non-consuming check for queued completion events.
     pub fn has_pending(&self, parent_task_id: &str) -> bool {
-        let pending = self.pending.lock().unwrap();
+        let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         pending
             .get(parent_task_id)
             .map(|q| !q.is_empty())
@@ -870,13 +872,13 @@ impl SubagentRegistry {
     /// (a new run started first) so the running executor drains it instead.
     pub fn push_front_pending(&self, parent_task_id: &str, event: SubagentCompletionEvent) {
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending
                 .entry(parent_task_id.to_string())
                 .or_default()
                 .push_front(event);
         }
-        let notifies = self.notifies.lock().unwrap();
+        let notifies = self.notifies.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(notify) = notifies.get(parent_task_id) {
             notify.notify_one();
         }
@@ -885,7 +887,7 @@ impl SubagentRegistry {
     /// Flip the cancel token of every running sub-agent under a parent task.
     /// Returns how many were signalled. Used when the user aborts the task.
     pub fn cancel_all_for_task(&self, parent_task_id: &str) -> usize {
-        let agents = self.agents.lock().unwrap();
+        let agents = self.agents.lock().unwrap_or_else(|p| p.into_inner());
         let mut signalled = 0;
         if let Some(task_agents) = agents.get(parent_task_id) {
             for entry in task_agents.values() {
@@ -906,7 +908,7 @@ impl SubagentRegistry {
         loop {
             // Check the pending queue first
             {
-                let mut pending = self.pending.lock().unwrap();
+                let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(queue) = pending.get_mut(parent_task_id) {
                     if let Some(event) = queue.pop_front() {
                         return Some(event);
@@ -921,7 +923,7 @@ impl SubagentRegistry {
 
             // Get the Notify for this parent task
             let notify = {
-                let notifies = self.notifies.lock().unwrap();
+                let notifies = self.notifies.lock().unwrap_or_else(|p| p.into_inner());
                 notifies.get(parent_task_id)?.clone()
             };
 

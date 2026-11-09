@@ -2,6 +2,18 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.8.1',
+    date: 'November 2026',
+    entries: [
+      { tag: 'new', text: 'Task notifications — get a toast (or a system notification when Rustic is in the background) when an agent task finishes, fails or needs your input. Toggle it in Settings → General.' },
+      { tag: 'fixed', text: 'Videos larger than 100 MB now play and seek in the editor preview instead of failing to load.' },
+      { tag: 'fixed', text: 'OpenRouter image and video models show up again and generate correctly; the image, video and audio model pickers now only list models that can actually do the job.' },
+      { tag: 'improved', text: 'Voice input works with any audio-capable chat model (OpenRouter, OpenAI, Gemini), not just dedicated transcription models.' },
+      { tag: 'improved', text: 'macOS — the app icon now has a black background and no longer sits inside the grey tile on macOS 26.' },
+      { tag: 'fixed', text: 'Security — updated SQLite, TLS, QUIC, zip and zstd libraries to clear every published advisory.' },
+    ],
+  },
+  {
     version: '0.8.0',
     date: 'November 2026',
     entries: [

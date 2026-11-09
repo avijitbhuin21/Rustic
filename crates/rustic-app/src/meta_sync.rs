@@ -318,7 +318,9 @@ fn write_item(
             if !cfg.get("providers").is_some_and(|v| v.is_array()) {
                 cfg["providers"] = json!([]);
             }
-            let list = cfg["providers"].as_array_mut().expect("just ensured array");
+            let Some(list) = cfg["providers"].as_array_mut() else {
+                return Err("providers config is not an array".into());
+            };
             match list
                 .iter()
                 .position(|e| provider_name(e) == Some((pt.clone(), name.clone())))

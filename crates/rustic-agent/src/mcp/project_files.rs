@@ -89,7 +89,8 @@ fn object_entry<'a>(obj: &'a mut Value, key: &str) -> Result<&'a mut Map<String,
     if !slot.is_object() {
         *slot = json!({});
     }
-    Ok(slot.as_object_mut().expect("just ensured object"))
+    slot.as_object_mut()
+        .ok_or_else(|| anyhow!("expected a JSON object at `{key}`"))
 }
 
 /// Read one server entry from the project's `.mcp.json`, if present.
@@ -166,7 +167,7 @@ pub fn set_disabled(root: &Path, name: &str, disabled: bool) -> Result<()> {
     }
     let mut doc = read_json_object(&path).unwrap_or_else(|_| json!({}));
     doc.as_object_mut()
-        .expect("read_json_object returns objects")
+        .ok_or_else(|| anyhow!("expected a JSON object in {}", path.display()))?
         .insert(
             "disabled".into(),
             Value::Array(current.into_iter().map(Value::String).collect()),

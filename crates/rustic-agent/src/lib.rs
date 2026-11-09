@@ -30,7 +30,8 @@ pub use config::{
 pub use file_history::{
     BaselineGate, BaselineState, CaptureOutcome, ChangeCallback, DirtyPathAccumulator, DirtySet,
     FileChangeStats, FileDiff, FileHistory, FileHistoryError, FileWatcher, FileWatcherError,
-    FileWatcherFeed, RestoreOutcome, RevertPlanEntry, ShadowSnapshot, SweepJob, SweepWorker, TaskNetChange,
+    FileWatcherFeed, RestoreOutcome, RevertPlanEntry, ShadowSnapshot, SweepJob, SweepWorker,
+    TaskNetChange,
 };
 pub use file_tree::{generate_file_tree, generate_file_tree_with_limits, tool_mutates_file_tree};
 pub use index::{IndexStatus, SymbolEntry, SymbolIndex, SymbolKind};

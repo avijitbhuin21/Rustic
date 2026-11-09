@@ -21,34 +21,71 @@ const FLUSH_MS: u64 = 24;
 
 /// Appends `next` onto `pending` when both are the same delta kind for the
 /// same key. Returns `next` back when it can't be merged.
+#[allow(clippy::result_large_err)] // Err hands the unmerged event back by value
 fn try_merge(pending: &mut TaskEvent, next: TaskEvent) -> Result<(), TaskEvent> {
     use TaskEvent::*;
     match (pending, next) {
-        (TextDelta { task_id: a, text }, TextDelta { task_id: b, text: t }) if *a == b => {
-            text.push_str(&t);
-            Ok(())
-        }
-        (ThinkingDelta { task_id: a, text }, ThinkingDelta { task_id: b, text: t }) if *a == b => {
+        (
+            TextDelta { task_id: a, text },
+            TextDelta {
+                task_id: b,
+                text: t,
+            },
+        ) if *a == b => {
             text.push_str(&t);
             Ok(())
         }
         (
-            ToolUseInputDelta { task_id: a, tool_use_id: ai, partial_json },
-            ToolUseInputDelta { task_id: b, tool_use_id: bi, partial_json: p },
+            ThinkingDelta { task_id: a, text },
+            ThinkingDelta {
+                task_id: b,
+                text: t,
+            },
+        ) if *a == b => {
+            text.push_str(&t);
+            Ok(())
+        }
+        (
+            ToolUseInputDelta {
+                task_id: a,
+                tool_use_id: ai,
+                partial_json,
+            },
+            ToolUseInputDelta {
+                task_id: b,
+                tool_use_id: bi,
+                partial_json: p,
+            },
         ) if *a == b && *ai == bi => {
             partial_json.push_str(&p);
             Ok(())
         }
         (
-            SubagentTextDelta { task_id: a, agent_id: ai, text },
-            SubagentTextDelta { task_id: b, agent_id: bi, text: t },
+            SubagentTextDelta {
+                task_id: a,
+                agent_id: ai,
+                text,
+            },
+            SubagentTextDelta {
+                task_id: b,
+                agent_id: bi,
+                text: t,
+            },
         ) if *a == b && *ai == bi => {
             text.push_str(&t);
             Ok(())
         }
         (
-            SubagentThinkingDelta { task_id: a, agent_id: ai, text },
-            SubagentThinkingDelta { task_id: b, agent_id: bi, text: t },
+            SubagentThinkingDelta {
+                task_id: a,
+                agent_id: ai,
+                text,
+            },
+            SubagentThinkingDelta {
+                task_id: b,
+                agent_id: bi,
+                text: t,
+            },
         ) if *a == b && *ai == bi => {
             text.push_str(&t);
             Ok(())
@@ -106,9 +143,10 @@ pub fn batch_deltas(mut rx: Receiver<TaskEvent>) -> Receiver<TaskEvent> {
                         Some((p, _)) => match try_merge(p, ev) {
                             Ok(()) => continue,
                             Err(ev) => {
-                                let (flushed, _) = pending.take().expect("pending checked");
-                                if tx.send(flushed).await.is_err() {
-                                    break;
+                                if let Some((flushed, _)) = pending.take() {
+                                    if tx.send(flushed).await.is_err() {
+                                        break;
+                                    }
                                 }
                                 ev
                             }
@@ -132,7 +170,10 @@ mod tests {
     use super::*;
 
     fn text(t: &str) -> TaskEvent {
-        TaskEvent::TextDelta { task_id: "t".into(), text: t.into() }
+        TaskEvent::TextDelta {
+            task_id: "t".into(),
+            text: t.into(),
+        }
     }
 
     #[tokio::test]
@@ -141,9 +182,26 @@ mod tests {
         let mut out = batch_deltas(rx);
         tx.send(text("a")).await.unwrap();
         tx.send(text("b")).await.unwrap();
-        tx.send(TaskEvent::ToolUseInputDelta { task_id: "t".into(), tool_use_id: "x".into(), partial_json: "{\"p".into() }).await.unwrap();
-        tx.send(TaskEvent::ToolUseInputDelta { task_id: "t".into(), tool_use_id: "x".into(), partial_json: "\":1}".into() }).await.unwrap();
-        tx.send(TaskEvent::ToolUseStop { task_id: "t".into(), tool_use_id: "x".into() }).await.unwrap();
+        tx.send(TaskEvent::ToolUseInputDelta {
+            task_id: "t".into(),
+            tool_use_id: "x".into(),
+            partial_json: "{\"p".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(TaskEvent::ToolUseInputDelta {
+            task_id: "t".into(),
+            tool_use_id: "x".into(),
+            partial_json: "\":1}".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(TaskEvent::ToolUseStop {
+            task_id: "t".into(),
+            tool_use_id: "x".into(),
+        })
+        .await
+        .unwrap();
         tx.send(text("c")).await.unwrap();
         drop(tx);
         let mut got = Vec::new();
@@ -152,7 +210,9 @@ mod tests {
         }
         assert_eq!(got.len(), 4);
         assert!(matches!(&got[0], TaskEvent::TextDelta { text, .. } if text == "ab"));
-        assert!(matches!(&got[1], TaskEvent::ToolUseInputDelta { partial_json, .. } if partial_json == "{\"p\":1}"));
+        assert!(
+            matches!(&got[1], TaskEvent::ToolUseInputDelta { partial_json, .. } if partial_json == "{\"p\":1}")
+        );
         assert!(matches!(&got[2], TaskEvent::ToolUseStop { .. }));
         assert!(matches!(&got[3], TaskEvent::TextDelta { text, .. } if text == "c"));
     }
@@ -161,11 +221,26 @@ mod tests {
     async fn does_not_merge_different_keys_and_flushes_on_timer() {
         let (tx, rx) = mpsc::channel(64);
         let mut out = batch_deltas(rx);
-        tx.send(TaskEvent::SubagentTextDelta { task_id: "t".into(), agent_id: "a".into(), text: "1".into() }).await.unwrap();
-        tx.send(TaskEvent::SubagentTextDelta { task_id: "t".into(), agent_id: "b".into(), text: "2".into() }).await.unwrap();
+        tx.send(TaskEvent::SubagentTextDelta {
+            task_id: "t".into(),
+            agent_id: "a".into(),
+            text: "1".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(TaskEvent::SubagentTextDelta {
+            task_id: "t".into(),
+            agent_id: "b".into(),
+            text: "2".into(),
+        })
+        .await
+        .unwrap();
         // Keep the sender alive: the timer alone must flush.
         let first = out.recv().await.unwrap();
-        let second = tokio::time::timeout(Duration::from_secs(2), out.recv()).await.unwrap().unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), out.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(first, TaskEvent::SubagentTextDelta { agent_id, .. } if agent_id == "a"));
         assert!(matches!(second, TaskEvent::SubagentTextDelta { agent_id, .. } if agent_id == "b"));
         drop(tx);

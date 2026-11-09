@@ -39,9 +39,17 @@ export function BudgetSection() {
   const [ceilingUsd, setCeilingUsd] = useState(20);
   const [softTurnEnabled, setSoftTurnEnabled] = useState(true);
   const [softTurnLimit, setSoftTurnLimit] = useState(50);
+  const [condenseEnabled, setCondenseEnabled] = useState(false);
+  const [condenseK, setCondenseK] = useState(400);
 
   const refresh = async () => {
     if (!isTauri()) return;
+    try {
+      const cfg = await invoke('get_ai_config');
+      const th = Number(cfg?.condense_threshold) || 0;
+      setCondenseEnabled(th > 0);
+      if (th > 0) setCondenseK(Math.round(th / 1000));
+    } catch {}
     try {
       const b = await invoke('get_budget_settings');
       if (b.max_concurrent_streams === null || b.max_concurrent_streams === undefined) {
@@ -72,6 +80,9 @@ export function BudgetSection() {
         maxConcurrentStreams: streamsEnabled ? Number(streams) : null,
         dailyCostCeilingCents: ceilingEnabled ? Math.max(0, Math.round(Number(ceilingUsd) * 100)) : null,
         softTurnLimit: softTurnEnabled ? Math.max(1, Number(softTurnLimit) || 50) : null,
+      });
+      await invoke('set_condense_threshold', {
+        tokens: condenseEnabled ? Math.max(10, Number(condenseK) || 0) * 1000 : 0,
       });
       toast.success('Budget saved');
     } catch (e) { toastError(null, e); }
@@ -141,6 +152,29 @@ export function BudgetSection() {
               className="h-7 w-16 text-xs"
             />
             <span className="text-[11px] text-muted-foreground">calls</span>
+          </div>
+        </div>
+
+        <div className="flex items-start justify-between gap-3 px-3 py-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5 text-[13px] font-medium">
+              Auto-condense at
+              <InfoTip>
+                Off: history is condensed at ~93% of the model's context window (e.g. ~900k on a 1M model).
+                On: condense once a chat reaches this many tokens instead — lower values keep long sessions cheaper.
+                Never exceeds the model's own window. Applies to new turns.
+              </InfoTip>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <Switch checked={condenseEnabled} onCheckedChange={setCondenseEnabled} />
+            <Input
+              type="number" min={10} max={10000} value={condenseK}
+              onChange={(e) => setCondenseK(parseInt(e.target.value, 10) || 10)}
+              disabled={!condenseEnabled}
+              className="h-7 w-20 text-xs"
+            />
+            <span className="text-[11px] text-muted-foreground">k tokens</span>
           </div>
         </div>
       </RowGroup>

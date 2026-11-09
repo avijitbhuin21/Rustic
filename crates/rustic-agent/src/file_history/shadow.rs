@@ -982,8 +982,7 @@ fn write_blobs_parallel(
 /// point for `Repository::edit_tree`. Identical hex string for libgit2 and
 /// gitoxide because git's tree-hashing is content-defined.
 fn empty_tree_oid() -> ObjectId {
-    // 4b825dc642cb6eb9a060e54bf8d69288fbee4904
-    ObjectId::from_hex(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904").expect("hardcoded valid hex")
+    ObjectId::empty_tree(gix::hash::Kind::Sha1)
 }
 
 /// Convert a forward-slash relative path to a `BString` for gix APIs.

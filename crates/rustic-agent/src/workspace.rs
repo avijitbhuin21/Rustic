@@ -125,10 +125,7 @@ impl WorkspaceRegistry {
         let key = project_root
             .canonicalize()
             .unwrap_or_else(|_| project_root.to_path_buf());
-        let mut map = self
-            .inner
-            .lock()
-            .expect("workspace registry mutex poisoned");
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = map.get(&key) {
             return Arc::clone(existing);
         }
@@ -144,10 +141,7 @@ impl WorkspaceRegistry {
         let key = project_root
             .canonicalize()
             .unwrap_or_else(|_| project_root.to_path_buf());
-        let mut map = self
-            .inner
-            .lock()
-            .expect("workspace registry mutex poisoned");
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         map.remove(&key).is_some()
     }
 

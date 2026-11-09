@@ -204,7 +204,8 @@ fn load_state(state: &AppState) -> Result<FormattersState, String> {
 fn save_state(state: &AppState, s: &FormattersState) -> Result<(), String> {
     let db = state.db.lock_safe();
     let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
-    db.set_setting("formatters", &json).map_err(|e| e.to_string())
+    db.set_setting("formatters", &json)
+        .map_err(|e| e.to_string())
 }
 
 // ─── Public command shapes ────────────────────────────────────────────────────
@@ -275,7 +276,12 @@ fn which(binary: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn status(id: &str, kind: StatusKind, path: Option<String>, version: Option<String>) -> FormatterStatus {
+fn status(
+    id: &str,
+    kind: StatusKind,
+    path: Option<String>,
+    version: Option<String>,
+) -> FormatterStatus {
     FormatterStatus {
         id: id.to_string(),
         kind,
@@ -295,20 +301,35 @@ pub fn list(state: &AppState, data_dir: &Path) -> Result<Vec<FormatterListEntry>
         let bin = platform_binary_name(b.binary);
         let st = if let Some(rec) = persisted.installed.get(b.id) {
             if Path::new(&rec.path).is_file() {
-                status(b.id, StatusKind::Installed, Some(rec.path.clone()), Some(rec.version.clone()))
+                status(
+                    b.id,
+                    StatusKind::Installed,
+                    Some(rec.path.clone()),
+                    Some(rec.version.clone()),
+                )
             } else {
                 status(b.id, StatusKind::Missing, None, None)
             }
         } else if matches!(b.install_kind, InstallKind::Toolchain) {
             match which(&bin) {
-                Some(p) => status(b.id, StatusKind::Detected, Some(p.to_string_lossy().to_string()), None),
+                Some(p) => status(
+                    b.id,
+                    StatusKind::Detected,
+                    Some(p.to_string_lossy().to_string()),
+                    None,
+                ),
                 None => status(b.id, StatusKind::Missing, None, None),
             }
         } else {
             // Not recorded, but a previous session may have left the binary.
             let candidate = formatter_install_path(data_dir, b.id, &bin).ok();
             match candidate.filter(|p| p.is_file()) {
-                Some(p) => status(b.id, StatusKind::Installed, Some(p.to_string_lossy().to_string()), None),
+                Some(p) => status(
+                    b.id,
+                    StatusKind::Installed,
+                    Some(p.to_string_lossy().to_string()),
+                    None,
+                ),
                 None => status(b.id, StatusKind::Missing, None, None),
             }
         };
@@ -325,7 +346,11 @@ pub fn list(state: &AppState, data_dir: &Path) -> Result<Vec<FormatterListEntry>
         } else {
             which(&c.command).map(|p| p.to_string_lossy().to_string())
         };
-        let kind = if resolved.is_some() { StatusKind::Detected } else { StatusKind::Missing };
+        let kind = if resolved.is_some() {
+            StatusKind::Detected
+        } else {
+            StatusKind::Missing
+        };
         entries.push(FormatterListEntry {
             builtin: None,
             custom: Some(c.clone()),
@@ -337,7 +362,11 @@ pub fn list(state: &AppState, data_dir: &Path) -> Result<Vec<FormatterListEntry>
 }
 
 /// Install (or update — same thing: always fetches the latest release).
-pub async fn install(state: &AppState, data_dir: &Path, id: &str) -> Result<InstalledRecord, String> {
+pub async fn install(
+    state: &AppState,
+    data_dir: &Path,
+    id: &str,
+) -> Result<InstalledRecord, String> {
     let b = lookup(id).ok_or_else(|| format!("Unknown formatter '{id}'"))?;
     if !matches!(b.install_kind, InstallKind::Download) {
         return Err(format!(
@@ -362,7 +391,9 @@ pub async fn install(state: &AppState, data_dir: &Path, id: &str) -> Result<Inst
 
 pub async fn check_update(id: &str) -> Result<UpdateInfo, String> {
     let b = lookup(id).ok_or_else(|| format!("Unknown formatter '{id}'"))?;
-    let github = b.github.ok_or("No GitHub repo configured for update checks")?;
+    let github = b
+        .github
+        .ok_or("No GitHub repo configured for update checks")?;
     let release = fetch_latest_release(github).await?;
     Ok(UpdateInfo {
         latest_version: release.tag_name,
@@ -390,10 +421,16 @@ pub fn add_custom(state: &AppState, formatter: CustomFormatter) -> Result<(), St
 
 fn validate_new_custom(st: &FormattersState, formatter: &CustomFormatter) -> Result<(), String> {
     if st.custom.iter().any(|c| c.id == formatter.id) {
-        return Err(format!("A custom formatter with id '{}' already exists", formatter.id));
+        return Err(format!(
+            "A custom formatter with id '{}' already exists",
+            formatter.id
+        ));
     }
     if lookup(&formatter.id).is_some() {
-        return Err(format!("'{}' is reserved by a built-in formatter", formatter.id));
+        return Err(format!(
+            "'{}' is reserved by a built-in formatter",
+            formatter.id
+        ));
     }
     Ok(())
 }
@@ -436,14 +473,21 @@ fn resolve_formatter(state: &FormattersState, language: &str) -> Option<Resolved
 }
 
 fn substitute_args(raw_args: &[String], file_path: &str) -> Vec<String> {
-    let ext = Path::new(file_path).extension().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     raw_args
         .iter()
         .map(|a| a.replace("{file}", file_path).replace("{ext}", ext))
         .collect()
 }
 
-pub async fn format(state: &AppState, data_dir: &Path, req: FormatRequest) -> Result<FormatResponse, String> {
+pub async fn format(
+    state: &AppState,
+    data_dir: &Path,
+    req: FormatRequest,
+) -> Result<FormatResponse, String> {
     let persisted = load_state(state)?;
     let resolved = resolve_formatter(&persisted, &req.language)
         .ok_or_else(|| format!("No formatter configured for language '{}'", req.language))?;
@@ -507,7 +551,9 @@ async fn run_formatter(
     // Command IO is blocking; keep it off the async runtime.
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(&cmd_path);
-        cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if use_stdin {
             cmd.stdin(Stdio::piped());
         }
@@ -520,7 +566,9 @@ async fn run_formatter(
         let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
         if use_stdin {
             if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(source.as_bytes()).map_err(|e| e.to_string())?;
+                stdin
+                    .write_all(source.as_bytes())
+                    .map_err(|e| e.to_string())?;
             }
             // Send EOF — gofmt/ruff block forever otherwise.
             drop(child.stdin.take());
@@ -529,7 +577,8 @@ async fn run_formatter(
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
-        String::from_utf8(output.stdout).map_err(|e| format!("formatter produced invalid UTF-8: {e}"))
+        String::from_utf8(output.stdout)
+            .map_err(|e| format!("formatter produced invalid UTF-8: {e}"))
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -560,11 +609,17 @@ fn http_client() -> Result<reqwest::Client, String> {
 
 async fn fetch_latest_release(repo: &str) -> Result<GithubRelease, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let resp = http_client()?.get(&url).send().await.map_err(|e| e.to_string())?;
+    let resp = http_client()?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("GitHub API returned {}", resp.status()));
     }
-    resp.json::<GithubRelease>().await.map_err(|e| e.to_string())
+    resp.json::<GithubRelease>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// (asset-name substrings, is_zip) identifying the asset for `os`/`arch`.
@@ -629,9 +684,16 @@ async fn download_and_extract(
         .iter()
         .find(|a| {
             let name_lower = a.name.to_ascii_lowercase();
-            tokens.iter().all(|t| name_lower.contains(&t.to_ascii_lowercase()))
+            tokens
+                .iter()
+                .all(|t| name_lower.contains(&t.to_ascii_lowercase()))
         })
-        .ok_or_else(|| format!("no matching asset in release {} for tokens {:?}", release.tag_name, tokens))?;
+        .ok_or_else(|| {
+            format!(
+                "no matching asset in release {} for tokens {:?}",
+                release.tag_name, tokens
+            )
+        })?;
 
     let bytes = http_client()?
         .get(&asset.browser_download_url)
@@ -650,11 +712,16 @@ async fn download_and_extract(
 
     if is_archive {
         // ruff zips contain a top-level dir with the binary inside.
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_ref())).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_ref()))
+            .map_err(|e| e.to_string())?;
         let mut wrote = false;
         for i in 0..zip.len() {
             let mut file = zip.by_index(i).map_err(|e| e.to_string())?;
-            if file.name().to_ascii_lowercase().ends_with(&target_lower) && !file.is_dir() {
+            let name_matches = file
+                .name()
+                .map(|n| n.to_ascii_lowercase().ends_with(&target_lower))
+                .unwrap_or(false);
+            if name_matches && !file.is_dir() {
                 let mut buf = Vec::with_capacity(file.size() as usize);
                 file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
                 std::fs::File::create(&dest)
@@ -695,7 +762,9 @@ async fn download_and_extract(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest).map_err(|e| e.to_string())?.permissions();
+        let mut perms = std::fs::metadata(&dest)
+            .map_err(|e| e.to_string())?
+            .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
     }
@@ -721,27 +790,46 @@ mod tests {
     #[test]
     fn resolve_prefers_custom_then_builtin_case_insensitive() {
         let mut st = FormattersState::default();
-        assert!(matches!(resolve_formatter(&st, "Rust"), Some(ResolvedFormatter::Builtin(b)) if b.id == "rustfmt"));
-        assert!(matches!(resolve_formatter(&st, "BASH"), Some(ResolvedFormatter::Builtin(b)) if b.id == "shfmt"));
+        assert!(
+            matches!(resolve_formatter(&st, "Rust"), Some(ResolvedFormatter::Builtin(b)) if b.id == "rustfmt")
+        );
+        assert!(
+            matches!(resolve_formatter(&st, "BASH"), Some(ResolvedFormatter::Builtin(b)) if b.id == "shfmt")
+        );
         assert!(resolve_formatter(&st, "cobol").is_none());
         st.custom.push(custom("mine", &["rust"]));
-        assert!(matches!(resolve_formatter(&st, "rust"), Some(ResolvedFormatter::Custom(c)) if c.id == "mine"));
+        assert!(
+            matches!(resolve_formatter(&st, "rust"), Some(ResolvedFormatter::Custom(c)) if c.id == "mine")
+        );
     }
 
     #[test]
     fn custom_ids_cannot_clash() {
         let mut st = FormattersState::default();
-        assert!(validate_new_custom(&st, &custom("ruff", &[])).unwrap_err().contains("reserved"));
+        assert!(validate_new_custom(&st, &custom("ruff", &[]))
+            .unwrap_err()
+            .contains("reserved"));
         st.custom.push(custom("mine", &[]));
-        assert!(validate_new_custom(&st, &custom("mine", &[])).unwrap_err().contains("already exists"));
+        assert!(validate_new_custom(&st, &custom("mine", &[]))
+            .unwrap_err()
+            .contains("already exists"));
         assert!(validate_new_custom(&st, &custom("other", &[])).is_ok());
     }
 
     #[test]
     fn args_substitute_file_and_ext() {
-        let raw = vec!["--assume-filename={file}".to_string(), "-x={ext}".to_string()];
-        assert_eq!(substitute_args(&raw, "src/a.cpp"), vec!["--assume-filename=src/a.cpp", "-x=cpp"]);
-        assert_eq!(substitute_args(&raw, "stdin"), vec!["--assume-filename=stdin", "-x="]);
+        let raw = vec![
+            "--assume-filename={file}".to_string(),
+            "-x={ext}".to_string(),
+        ];
+        assert_eq!(
+            substitute_args(&raw, "src/a.cpp"),
+            vec!["--assume-filename=src/a.cpp", "-x=cpp"]
+        );
+        assert_eq!(
+            substitute_args(&raw, "stdin"),
+            vec!["--assume-filename=stdin", "-x="]
+        );
     }
 
     #[test]

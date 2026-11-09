@@ -84,11 +84,8 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
             "description": "OMIT THIS for a normal command — a fresh terminal is spawned automatically. Only pass it to reuse a specific existing session whose id you got from a previous run_command result or list_all_terminals (e.g. a shell with an activated venv), or to type into a USER-opened terminal (always requires explicit user approval). Never guess or default this value."
         }
     });
-    if let Some(schema) = shell_param {
-        run_command_props
-            .as_object_mut()
-            .unwrap()
-            .insert("shell".into(), schema);
+    if let (Some(schema), Some(props)) = (shell_param, run_command_props.as_object_mut()) {
+        props.insert("shell".into(), schema);
     }
 
     let run_command_desc = format!(

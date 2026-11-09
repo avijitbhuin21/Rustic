@@ -47,7 +47,7 @@ impl ParserPool {
             .inner
             .get_mut(lang_name)
             .and_then(|mut bucket| bucket.pop())
-            .unwrap_or_else(Parser::new);
+            .unwrap_or_default();
 
         // Always re-set the language — cheap, and the pool may have been
         // shared with another grammar revision after a hot reload.

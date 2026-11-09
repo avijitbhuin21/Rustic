@@ -498,7 +498,10 @@ mod tests {
 
     #[test]
     fn detects_tabs_spaces_and_none() {
-        assert_eq!(detect_indent_style("fn a() {\n\tx();\n\ty();\n}\n"), (true, 0));
+        assert_eq!(
+            detect_indent_style("fn a() {\n\tx();\n\ty();\n}\n"),
+            (true, 0)
+        );
         assert_eq!(
             detect_indent_style("a:\n    b\n    c\n        d\n"),
             (false, 4)

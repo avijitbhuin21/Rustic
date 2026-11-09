@@ -22,6 +22,7 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 use state::AppState;
 
+#[allow(clippy::expect_used)] // a failed Tauri run is fatal by design
 pub fn run() {
     #[cfg(target_os = "macos")]
     macos_env::import_login_shell_path();
@@ -35,11 +36,17 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         // Streams large audio previews from disk with Range support.
-        .register_asynchronous_uri_scheme_protocol(media_protocol::SCHEME, |ctx, request, responder| {
-            let app = ctx.app_handle().clone();
-            std::thread::spawn(move || responder.respond(media_protocol::handle(&app, &request)));
-        });
+        .register_asynchronous_uri_scheme_protocol(
+            media_protocol::SCHEME,
+            |ctx, request, responder| {
+                let app = ctx.app_handle().clone();
+                std::thread::spawn(move || {
+                    responder.respond(media_protocol::handle(&app, &request))
+                });
+            },
+        );
 
     // Single-instance is RELEASE-ONLY. The lock keys off the bundle
     // identifier, which dev and production share — with it installed, starting
@@ -530,6 +537,7 @@ pub fn run() {
             commands::agent::respond_to_ceiling_breach,
             commands::agent::set_budget_settings,
             commands::agent::get_budget_settings,
+            commands::agent::set_condense_threshold,
             commands::agent::set_subagent_concurrency_cap,
             commands::agent::get_subagent_concurrency_cap,
             commands::agent::get_task_cost,

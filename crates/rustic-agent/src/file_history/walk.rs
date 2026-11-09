@@ -63,7 +63,7 @@ pub fn walk_for_sweep(root: &Path) -> Vec<WalkedFile> {
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
-                    if HARD_DENY_DIRS.iter().any(|d| *d == name) {
+                    if HARD_DENY_DIRS.contains(&name) {
                         return false;
                     }
                 }

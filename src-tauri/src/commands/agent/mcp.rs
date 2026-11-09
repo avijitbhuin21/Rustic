@@ -78,7 +78,7 @@ fn resolve_scope_path(
             let project = workspace
                 .list_projects()
                 .into_iter()
-                .find(|p| p.id.to_string() == pid)
+                .find(|p| p.id == pid)
                 .ok_or_else(|| format!("Project not found: {}", pid))?;
             Ok(project.root_path.join(".mcp.json"))
         }
@@ -276,8 +276,7 @@ pub async fn test_mcp_server(
     let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || {
         mcp_arc
-            .lock()
-            .unwrap()
+            .lock_safe()
             .test_server(&id)
             .map_err(|e| e.to_string())
     })
@@ -289,7 +288,10 @@ pub async fn test_mcp_server(
 /// tools, then disconnect. Powers the Add MCP server dialog's Test button
 /// without touching any config file.
 #[tauri::command]
-pub async fn test_mcp_entry(name: String, entry: serde_json::Value) -> Result<Vec<ToolDef>, String> {
+pub async fn test_mcp_entry(
+    name: String,
+    entry: serde_json::Value,
+) -> Result<Vec<ToolDef>, String> {
     tokio::task::spawn_blocking(move || {
         let transport =
             rustic_agent::mcp::entry_transport(&name, &entry).map_err(|e| e.to_string())?;
@@ -322,8 +324,7 @@ pub async fn list_mcp_server_tools(
     let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || {
         mcp_arc
-            .lock()
-            .unwrap()
+            .lock_safe()
             .server_tools(&id)
             .map_err(|e| e.to_string())
     })
@@ -336,8 +337,7 @@ pub async fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result
     let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || {
         mcp_arc
-            .lock()
-            .unwrap()
+            .lock_safe()
             .remove_server(&id)
             .map_err(|e| e.to_string())
     })
