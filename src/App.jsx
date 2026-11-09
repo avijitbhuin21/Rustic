@@ -81,10 +81,17 @@ function useActiveProjectSync() {
   }, [hasLoaded, loadProjects]);
 
   const settingsLoaded = useSettings((s) => !!s.settings);
+  const settingsFailed = useSettings((s) => !!s.error && !s.settings);
   useEffect(() => {
-    if (!hasLoaded || !settingsLoaded) return;
+    // Nothing else loads settings until the Settings panel opens, and the
+    // restore below is gated on them — so fetch them once at startup.
+    const s = useSettings.getState();
+    if (!s.settings && !s.loading) s.load();
+  }, []);
+  useEffect(() => {
+    if (!hasLoaded || (!settingsLoaded && !settingsFailed)) return;
     restoreLastSession(!!useSettings.getState().settings?.general?.restore_last_session);
-  }, [hasLoaded, settingsLoaded]);
+  }, [hasLoaded, settingsLoaded, settingsFailed]);
 
   useEffect(() => {
     const project = projects.find((p) => p.id === activeProjectId);

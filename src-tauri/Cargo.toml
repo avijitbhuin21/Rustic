@@ -28,7 +28,9 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2"
-tauri-plugin-updater = "2"
+# `zip` (default) only unpacks v1-style `.msi.zip` / `.AppImage.tar.gz` bundles;
+# `createUpdaterArtifacts: true` ships raw installers, so it is off (drops zip 4).
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
 tauri-plugin-process = "2"
 sha2 = "0.10"
 serde = { workspace = true }

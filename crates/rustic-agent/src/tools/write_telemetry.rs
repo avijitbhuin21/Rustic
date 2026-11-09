@@ -161,7 +161,8 @@ mod tests {
             Event::Diverged,
         );
 
-        assert_eq!(count(&snapshot(), Event::Diverged), before + 1);
+        // The counter is process-global; parallel tests may also bump it.
+        assert!(count(&snapshot(), Event::Diverged) > before);
         let log = dir.path().join(".rustic").join("write-divergence.jsonl");
         let body = std::fs::read_to_string(&log).expect("jsonl row written");
         let row: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();

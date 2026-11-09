@@ -17,7 +17,7 @@ resolver = "2"
 # `[workspace]`, so it must be excluded here to avoid a "multiple workspace
 # roots" error. It is still built as a path dependency of rustic-agent; this
 # only keeps it out of our fmt / clippy / test gates.
-exclude = ["vendor/lattice-merge", "website"]
+exclude = ["vendor/lattice-merge", "vendor/docx-rs", "website"]
 
 # Single source of truth for every dependency shared by 2+ member crates.
 # Members inherit with `dep = { workspace = true }` and may ADD features via
@@ -88,3 +88,9 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 1
+
+# docx-rs 0.4.22 (latest) pins zip 8, which carries the RUSTSEC-2026-0367/0368/0369/0429
+# extract advisories. vendor/docx-rs is the unmodified 0.4.22 source with its zip
+# requirement raised to 9. Drop this patch once upstream docx-rs moves to zip >= 9.
+[patch.crates-io]
+docx-rs = { path = "vendor/docx-rs" }

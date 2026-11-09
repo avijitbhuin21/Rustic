@@ -1639,6 +1639,23 @@ mod c9_3_pdf_docx_xlsx_tests {
     }
 
     #[test]
+    fn docx_reader_round_trips_a_written_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.docx");
+        let file = std::fs::File::create(&path).unwrap();
+        docx_rs::Docx::new()
+            .add_paragraph(
+                docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Hello zip nine")),
+            )
+            .build()
+            .pack(file)
+            .unwrap();
+        let out = read_docx(&path, "hello.docx", None).unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("Hello zip nine"), "{}", out.content);
+    }
+
+    #[test]
     fn tool_attachment_pdf_variant_round_trips_through_json() {
         use crate::tools::ToolAttachment;
         let att = ToolAttachment::Pdf {

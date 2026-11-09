@@ -30,6 +30,9 @@ FROM chef AS server
 # state-mutating VCS ops, not for the build.
 COPY --from=planner /build/recipe.json recipe.json
 COPY rust-toolchain.toml rust-toolchain.toml
+# Vendored path crates (the docx-rs `[patch]` + lattice-merge) aren't in the
+# chef recipe; without them `cargo chef cook` cannot resolve the workspace.
+COPY vendor vendor
 # Cloud builders intermittently drop crates.io downloads mid-stream; each retry
 # resumes against the cargo cache populated by previous attempts.
 RUN for i in 1 2 3 4 5; do \
