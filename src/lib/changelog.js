@@ -2,6 +2,13 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.8.2',
+    date: 'November 2026',
+    entries: [
+      { tag: 'improved', text: 'Maintenance release — folds the 0.8.1 verification branch into main so every 0.8.1 fix (security updates, large video playback, task notifications, OpenRouter media models, voice input, macOS icon) ships from a single line of history. No behaviour changes since 0.8.1.' },
+    ],
+  },
+  {
     version: '0.8.1',
     date: 'November 2026',
     entries: [
