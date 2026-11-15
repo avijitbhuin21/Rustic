@@ -137,7 +137,7 @@ export function useCanvasView(frames) {
 /**
  * Renders artboards on an infinite pannable / zoomable canvas.
  */
-export function PreviewCanvas({ canvas, renderFrame, className }) {
+export function PreviewCanvas({ canvas, renderFrame, className, interactive = false }) {
   const { viewportRef, view, layout, zoomAt, panBy } = canvas;
   const [spaceHeld, setSpaceHeld] = useState(false);
   const [modHeld, setModHeld] = useState(false);
@@ -176,23 +176,50 @@ export function PreviewCanvas({ canvas, renderFrame, className }) {
   useEffect(() => {
     const el = viewportRef.current;
     if (!el) return;
+    // Same model as image/PDF/DOCX: wheel zooms around the cursor; Shift+wheel
+    // or a horizontal swipe pans. Batched to one update per frame so a fast
+    // trackpad stream doesn't re-render per event (that read as jitter).
+    let pending = null;
+    let raf = 0;
+    const flush = () => {
+      raf = 0;
+      const p = pending;
+      pending = null;
+      if (!p) return;
+      if (p.zoom !== 1) zoomAt(viewScaleRef.current * p.zoom, p.cx, p.cy);
+      if (p.dx || p.dy) panBy(p.dx, p.dy);
+    };
     const onWheel = (e) => {
       e.preventDefault();
       e.stopPropagation();
       const rect = el.getBoundingClientRect();
-      if (e.ctrlKey || e.metaKey) {
-        zoomAt(view.scale * Math.exp(-e.deltaY / 400), e.clientX - rect.left, e.clientY - rect.top);
+      const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+      const dx = e.deltaMode === 1 ? e.deltaX * 16 : e.deltaX;
+      pending = pending || { zoom: 1, dx: 0, dy: 0, cx: 0, cy: 0 };
+      if (e.shiftKey) {
+        pending.dy -= dy;
+      } else if (Math.abs(dx) > Math.abs(dy) && !e.ctrlKey) {
+        pending.dx -= dx;
       } else {
-        panBy(-e.deltaX, -e.deltaY);
+        pending.zoom *= Math.exp(-dy * (e.ctrlKey ? 0.012 : 0.0022));
+        pending.cx = e.clientX - rect.left;
+        pending.cy = e.clientY - rect.top;
       }
+      if (!raf) raf = requestAnimationFrame(flush);
     };
     el.addEventListener('wheel', onWheel, { passive: false });
-    return () => el.removeEventListener('wheel', onWheel);
-  }, [viewportRef, view.scale, zoomAt, panBy]);
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      cancelAnimationFrame(raf);
+    };
+  }, [viewportRef, zoomAt, panBy]);
+
+  const viewScaleRef = useRef(view.scale);
+  viewScaleRef.current = view.scale;
 
   const onPointerDown = (e) => {
     const onBackground = e.target === e.currentTarget || e.target.dataset?.canvasBackground === 'true';
-    const wantsPan = e.button === 1 || spaceHeld || (e.button === 0 && onBackground);
+    const wantsPan = e.button === 1 || spaceHeld || (e.button === 0 && (onBackground || !interactive));
     if (!wantsPan) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -223,7 +250,11 @@ export function PreviewCanvas({ canvas, renderFrame, className }) {
   // and pointer event before the host sees it. Cover the canvas for exactly
   // as long as a pan / zoom modifier is held; the rest of the time the
   // rendered page stays fully interactive.
-  const captureActive = spaceHeld || modHeld || panning;
+  // Opaque-origin iframes swallow every wheel and pointer event before the
+  // host sees them. In navigate mode (default) the capture layer stays on so
+  // wheel-zoom and drag-pan work over the page too; "Interact" mode hands the
+  // page back its events, with Space/Ctrl/Cmd still temporarily capturing.
+  const captureActive = !interactive || spaceHeld || modHeld || panning;
 
   return (
     <div
@@ -231,7 +262,7 @@ export function PreviewCanvas({ canvas, renderFrame, className }) {
       data-canvas-background="true"
       className={cn(
         'preview-checkerboard relative flex-1 overflow-hidden',
-        panning ? 'cursor-grabbing' : spaceHeld ? 'cursor-grab' : 'cursor-default',
+        panning ? 'cursor-grabbing' : spaceHeld || !interactive ? 'cursor-grab' : 'cursor-default',
         className,
       )}
       onPointerDown={onPointerDown}

@@ -2,6 +2,23 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.8.3',
+    date: 'November 2026',
+    entries: [
+      { tag: 'new', text: 'New file previews — iPhone photos (HEIC/HEIF), TIFF, camera RAW, app icons (ICNS), fonts, archives (zip/jar/apk/tar/tgz/gz) you can browse, a read-only SQLite browser, PowerPoint (.pptx) slides and 3D models (GLB/glTF/STL). TSV opens in the spreadsheet view.' },
+      { tag: 'improved', text: 'No more size limits on previews — everything streams from disk. Audio shows its full waveform at any length (a 3-hour file uses ~25 MB), and huge PDFs open instantly: only the pages you look at are loaded.' },
+      { tag: 'improved', text: 'Smooth zoom in image, PDF, DOCX and HTML previews — scroll to zoom around the cursor, drag to pan. PDFs re-render sharp after zooming. The Edit ⇄ Preview button now sits beside Reveal in the path bar.' },
+      { tag: 'fixed', text: 'Claude errors after switching model or effort ("Invalid signature in thinking block") and "assistant message prefill" errors no longer break a chat; commit messages work with Claude 5 models like Haiku 5.5.' },
+      { tag: 'new', text: '"Restart from transcript" recovers any chat a provider keeps rejecting, and auto-repair now actually fixes thinking and prefill errors.' },
+      { tag: 'fixed', text: 'Chat history no longer disappears during long tasks, replies that cite web results keep their formatting, and ask-user questions render markdown.' },
+      { tag: 'improved', text: 'Messages you send while the agent works reach it right after the current tool call; images attached to an answer (dragged, pasted or sent from the main box) reach the agent; each message has a delete button that removes it and everything after.' },
+      { tag: 'fixed', text: 'Agent terminals return exact command output — no more "(no output)", garbled echoes or dquote> prompts — and report non-zero exit codes.' },
+      { tag: 'fixed', text: 'Terminal resizing no longer scatters or repeats Claude Code / Codex output, full-screen programs (vim, less, htop) no longer leave copies in scrollback, and Claude Code symbols render instead of ???.' },
+      { tag: 'new', text: 'The agent reports bugs it hits in Rustic to the public issue tracker (deduplicated, private data scrubbed, at most 3 per task). Turn it off in Settings → Agent → Issue reporting.' },
+      { tag: 'improved', text: 'Notifications show your latest message rather than the chat\'s first one.' },
+    ],
+  },
+  {
     version: '0.8.2',
     date: 'November 2026',
     entries: [

@@ -1,6 +1,6 @@
 ---
 name: rustic-issues
-description: Search, read and file issues on Rustic's public issue tracker (rustic.avijitbhuin.com/issues) — no GitHub account needed. Use when you hit a bug in Rustic itself while working (a tool misbehaving, a crash, wrong UI state), when the user wants to report a bug or request a feature for Rustic, or asks what known issues exist. Always get the user's OK before filing.
+description: Search, read and file issues on Rustic's public issue tracker (rustic.avijitbhuin.com/issues) — no GitHub account needed. Use when you hit a bug in Rustic itself while working (a tool misbehaving, a crash, wrong UI state, a provider error Rustic caused — even minor ones), when the user wants to report a bug or request a feature for Rustic, or asks what known issues exist. Bugs you run into yourself are filed automatically when auto-reporting is on; user-requested reports are confirmed first.
 ---
 
 # Rustic issue tracker
@@ -18,11 +18,13 @@ Use `web_fetch` or `curl -s` for reads. Times are unix seconds.
 
 ## File an issue — workflow
 
-1. **Search first** for duplicates: `GET /api/issues?status=all&q=<key words>`. If one matches, show it to the user instead of filing a new one.
+1. **Search first** for duplicates: `GET /api/issues?status=all&q=<key words>`. If one matches, don't file a new one — mention the existing issue instead.
 2. **Draft** it: a specific title (4–160 chars); a body with what happened, what was expected, steps to reproduce, and the relevant error text; the Rustic version and OS if known. Kind is `bug`, `feature` or `question`.
 3. **Scrub** the draft: no API keys, tokens, passwords, emails or private source code. Trim long logs to the relevant lines. Replace private paths/usernames with placeholders.
-4. **Ask before posting.** Call `ask_user` with the full drafted title, kind, body and the list of files you'd attach, and options to post, edit or cancel. Never file without an explicit OK. If the user edits the draft, use their version.
-5. **Post** with `curl` (multipart, so files can ride along), then give the user the issue link from the response.
+4. **Decide whether to confirm.**
+   - **Auto-report mode** (your system prompt has a "Reporting Rustic bugs" section): a bug *you* ran into while working is filed straight away — no `ask_user`. At most 3 issues per task, one per problem. Attach only logs/screenshots you produced yourself, never the user's project files.
+   - **Otherwise**, or when the *user* asked you to file something: call `ask_user` with the full drafted title, kind, body and the list of files you'd attach, and options to post, edit or cancel. Never file without an explicit OK. If the user edits the draft, use their version.
+5. **Post** with `curl` (multipart, so files can ride along), then give the user the issue link from the response (in auto-report mode, list the links in your final summary).
 
 ```bash
 curl -sS -X POST https://rustic.avijitbhuin.com/api/issues \
@@ -49,6 +51,6 @@ curl -sS -X POST https://rustic.avijitbhuin.com/api/issues \
 
 ## Don'ts
 
-- Don't file without the user's approval, and don't file several issues for one problem.
+- Don't file user-requested reports without the user's approval, and don't file several issues for one problem. Auto-reporting (bugs you hit yourself) is the only no-confirmation path, and only while that system-prompt section is present.
 - Don't attach the user's project files unless they asked for that specific file to be included.
 - Issues can't be closed or edited through the API; maintainers handle that.

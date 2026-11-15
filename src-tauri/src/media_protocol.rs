@@ -1,9 +1,11 @@
-//! `rustic-media://` — streams local audio and video files to the webview with
-//! HTTP Range support, so large previews play from disk instead of being
-//! base64-encoded over IPC (which is capped at 100 MB and fully decoded in memory).
+//! `rustic-media://` — streams local files to the webview with HTTP Range
+//! support, so previews of any size load from disk instead of being
+//! base64-encoded over IPC (capped at 100 MB and fully held in memory).
+//! Mirrors the web server's `/api/asset`.
 //!
-//! Deliberately narrow: audio/video extensions only, the shared readable-path
-//! guard, and nothing under Rustic's own app-data directory.
+//! Guarded by the shared readable-path check and nothing under Rustic's own
+//! app-data directory; responses carry `sandbox` CSP so a navigated SVG/HTML
+//! asset can't run script in the app origin.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -12,11 +14,7 @@ use tauri::http::{header, Request, Response, StatusCode};
 
 pub const SCHEME: &str = "rustic-media";
 
-const AUDIO_EXT: &[&str] = &[
-    "mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "aac", "weba", "aiff", "aif", "wma",
-];
-const VIDEO_EXT: &[&str] = &["mp4", "m4v", "webm", "mov", "mkv", "ogv", "avi"];
-/// Largest slice served per request; media elements ask for the next range as they play.
+/// Largest slice served per request; callers ask for the next range as they read.
 const MAX_CHUNK: u64 = 4 * 1024 * 1024;
 
 /// Serve one `rustic-media://localhost/<encoded path>` request.
@@ -39,13 +37,13 @@ fn serve(
     let path = PathBuf::from(
         percent_decode(raw).ok_or((StatusCode::BAD_REQUEST, "bad path encoding".into()))?,
     );
-    let mime = media_mime(&path).ok_or((
-        StatusCode::FORBIDDEN,
-        "only audio and video files can be streamed".into(),
-    ))?;
+    let mime = media_mime(&path);
     rustic_app::path_scope::validate_readable_path(&path)
         .map_err(|e| (StatusCode::FORBIDDEN, e))?;
     deny_app_data(app, &path)?;
+    if path.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "path is a directory".into()));
+    }
 
     let mut file =
         std::fs::File::open(&path).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
@@ -64,6 +62,22 @@ fn serve(
         .headers()
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok());
+    if range.is_none() {
+        // Plain requests (<img>, fonts, iframes) never send Range — give them
+        // the whole file; a 4 MB partial would silently truncate big assets.
+        let mut buf = Vec::with_capacity(total as usize);
+        file.read_to_end(&mut buf)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_LENGTH, total.to_string())
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::CONTENT_SECURITY_POLICY, "sandbox")
+            .body(buf)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
     let (start, end) = parse_range(range, total).ok_or((
         StatusCode::RANGE_NOT_SATISFIABLE,
         format!("bytes */{total}"),
@@ -86,6 +100,11 @@ fn serve(
         )
         .header(header::CONTENT_LENGTH, len.to_string())
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            "Content-Range, Content-Length",
+        )
+        .header(header::CONTENT_SECURITY_POLICY, "sandbox")
         .body(buf)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
@@ -105,13 +124,14 @@ fn deny_app_data(app: &tauri::AppHandle, path: &Path) -> Result<(), (StatusCode,
     Ok(())
 }
 
-/// MIME type for a whitelisted audio or video extension.
-fn media_mime(path: &Path) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !AUDIO_EXT.contains(&ext.as_str()) && !VIDEO_EXT.contains(&ext.as_str()) {
-        return None;
-    }
-    Some(match ext.as_str() {
+/// MIME type guessed from the extension; unknown types are served as octet-stream.
+fn media_mime(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
         "flac" => "audio/flac",
@@ -128,8 +148,30 @@ fn media_mime(path: &Path) -> Option<&'static str> {
         "mkv" => "video/x-matroska",
         "ogv" => "video/ogg",
         "avi" => "video/x-msvideo",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "tif" | "tiff" => "image/tiff",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "pdf" => "application/pdf",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "glb" => "model/gltf-binary",
+        "gltf" => "model/gltf+json",
+        "stl" => "model/stl",
+        "json" | "jsonl" | "ndjson" => "application/json",
+        "txt" | "csv" | "tsv" | "md" | "log" => "text/plain",
+        "html" | "htm" => "text/html",
         _ => "application/octet-stream",
-    })
+    }
 }
 
 /// Inclusive `(start, end)` for a single `bytes=` range; a missing header means from 0.
@@ -194,12 +236,13 @@ mod tests {
             Some("C:\\music\\x.wav")
         );
         assert!(percent_decode("%zz").is_none());
-        assert_eq!(media_mime(Path::new("/a/B.MP3")), Some("audio/mpeg"));
+        assert_eq!(media_mime(Path::new("/a/B.MP3")), "audio/mpeg");
+        assert_eq!(media_mime(Path::new("/a/clip.MOV")), "video/quicktime");
+        assert_eq!(media_mime(Path::new("/a/clip.mp4")), "video/mp4");
+        assert_eq!(media_mime(Path::new("/a/scan.pdf")), "application/pdf");
         assert_eq!(
-            media_mime(Path::new("/a/clip.MOV")),
-            Some("video/quicktime")
+            media_mime(Path::new("/a/data.bin")),
+            "application/octet-stream"
         );
-        assert_eq!(media_mime(Path::new("/a/clip.mp4")), Some("video/mp4"));
-        assert!(media_mime(Path::new("/a/secrets.json")).is_none());
     }
 }

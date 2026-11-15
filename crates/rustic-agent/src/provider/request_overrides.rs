@@ -283,6 +283,9 @@ fn deep_merge(base: &mut Value, extra: &Value) {
 /// `Unrecognized request argument supplied: foo`.
 pub fn unsupported_param_from_error(err: &str) -> Option<String> {
     let lower = err.to_lowercase();
+    if let Some(p) = deprecated_param_from_error(err, &lower) {
+        return Some(p);
+    }
     let markers = [
         "unsupported parameter:",
         "unsupported parameter",
@@ -306,6 +309,19 @@ pub fn unsupported_param_from_error(err: &str) -> Option<String> {
         return None;
     }
     Some(ident)
+}
+
+/// Param named by Anthropic's "`temperature` is deprecated for this model." 400.
+fn deprecated_param_from_error(err: &str, lower: &str) -> Option<String> {
+    let at = lower.find("` is deprecated for this model")?;
+    let open = err[..at].rfind('`')?;
+    let ident = &err[open + 1..at];
+    (!ident.is_empty()
+        && ident.len() <= 64
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+    .then(|| ident.to_string())
 }
 
 /// The replacement key a provider names in a "use X instead" 400, if any.
@@ -380,6 +396,15 @@ mod tests {
         };
         apply_request_overrides(&mut body, &o, BodyDialect::Claude);
         assert_eq!(body, json!({ "tool_choice": { "type": "any" } }));
+    }
+
+    #[test]
+    fn parses_deprecated_parameter_errors() {
+        let e = r#"Claude API error 400 Bad Request: {"type":"error","error":{"type":"invalid_request_error","message":"`temperature` is deprecated for this model."}}"#;
+        assert_eq!(
+            unsupported_param_from_error(e).as_deref(),
+            Some("temperature")
+        );
     }
 
     #[test]

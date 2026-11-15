@@ -1,7 +1,7 @@
 // Agent settings tabs — sections live in ./agent/* (split per A4).
 import { IS_WEB } from '@/lib/platform';
 import { AudioInputSection } from './agent/audio-section';
-import { BudgetSection } from './agent/budget-section';
+import { BudgetSection, IssueReportingSection } from './agent/budget-section';
 import { GithubAutoResolveSection } from './agent/github-section';
 import { RulesSection, SkillsSection, WorkflowsSection } from './agent/library-sections';
 import { McpSection } from './agent/mcp-section';
@@ -57,6 +57,7 @@ export function AgentModelsTab() {
       <AudioInputSection />
       <SourceControlSection />
       <BudgetSection />
+      <IssueReportingSection />
     </AgentTab>
   );
 }
@@ -78,6 +79,7 @@ export function AgentSettings() {
         <AudioInputSection />
         <SourceControlSection />
         <BudgetSection />
+        <IssueReportingSection />
         {IS_WEB && <GithubAutoResolveSection />}
         <ToolsSection />
         <McpSection />

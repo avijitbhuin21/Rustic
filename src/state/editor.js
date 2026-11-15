@@ -34,23 +34,38 @@ const VIDEO_EXT  = new Set(['mp4','webm','mov','mkv','m4v','ogv','avi']);
 const AUDIO_EXT  = new Set(['mp3','wav','flac','ogg','oga','opus','m4a','aac','weba','aiff','aif','wma']);
 const DOCX_EXT   = new Set(['docx']);
 const NOTEBOOK_EXT = new Set(['ipynb']);
-const XLSX_EXT   = new Set(['xlsx','xls','xlsm','xlsb','ods','csv']);
+const XLSX_EXT   = new Set(['xlsx','xls','xlsm','xlsb','ods','csv','tsv']);
+// Formats the webview can't draw itself — decoded to PNG/JPEG by the backend
+// (HEIC/HEIF, TIFF, camera RAW embedded preview, ICNS).
+const DECODED_IMAGE_EXT = new Set([
+  'heic','heif','hif','tif','tiff','icns',
+  'raw','cr2','cr3','crw','nef','nrw','arw','srf','sr2','dng','orf','rw2','raf',
+  'pef','srw','3fr','erf','kdc','mos','mrw','x3f','iiq','rwl',
+]);
+const FONT_EXT   = new Set(['ttf','otf','woff','woff2']);
+// Zip-family containers (detected by magic bytes server-side), tar and gzip.
+const ARCHIVE_EXT = new Set([
+  'zip','jar','war','ear','apk','aab','aar','whl','nupkg','vsix','xpi','ipa',
+  'tar','tgz','gz',
+]);
+const SQLITE_EXT = new Set(['db','sqlite','sqlite3','db3']);
+const PPTX_EXT   = new Set(['pptx']);
+const MODEL3D_EXT = new Set(['glb','gltf','stl']);
 // Binary fallbacks. Audio/video deliberately removed — they have dedicated
 // previews now. Office formats route to docx/xlsx previews above the
 // binary fallback.
 const BINARY_EXT = new Set([
   'exe','dll','so','dylib','bin','o','a','class',
-  'zip','tar','gz','bz2','xz','7z','rar',
-  'ttf','otf','woff','woff2','eot',
-  'db','sqlite','sqlite3',
+  'bz2','xz','7z','rar',
+  'eot',
 ]);
 // Opaque formats with no preview yet: shown as "file type not supported yet"
 // instead of garbage in Monaco or a raw hex dump.
 const UNSUPPORTED_EXT = new Set([
-  'doc','ppt','pptx','key','pages','numbers','odt','odp','rtf',
-  'psd','ai','sketch','fig','xd','indd','heic','heif','tif','tiff','raw','cr2','nef','dng','icns',
-  'dmg','iso','pkg','msi','deb','rpm','apk','ipa','jar','war','appimage',
-  'blend','fbx','glb','gltf','stl','3ds','max','unitypackage',
+  'doc','ppt','key','pages','numbers','odt','odp','rtf',
+  'psd','ai','sketch','fig','xd','indd',
+  'dmg','iso','pkg','msi','deb','rpm','appimage',
+  'blend','fbx','3ds','max','unitypackage',
   'parquet','avro','pickle','pkl','npy','npz','h5','hdf5','onnx','pt','pth','safetensors','ckpt',
 ]);
 
@@ -74,6 +89,12 @@ export function getFileKind(path) {
   if (DOCX_EXT.has(ext))   return 'docx';
   if (NOTEBOOK_EXT.has(ext)) return 'notebook';
   if (XLSX_EXT.has(ext))   return 'xlsx';
+  if (DECODED_IMAGE_EXT.has(ext)) return 'decoded-image';
+  if (FONT_EXT.has(ext))   return 'font';
+  if (ARCHIVE_EXT.has(ext)) return 'archive';
+  if (SQLITE_EXT.has(ext)) return 'sqlite';
+  if (PPTX_EXT.has(ext))   return 'pptx';
+  if (MODEL3D_EXT.has(ext)) return 'model3d';
   if (BINARY_EXT.has(ext)) return 'hex';
   if (UNSUPPORTED_EXT.has(ext)) return 'unsupported';
   return 'code';

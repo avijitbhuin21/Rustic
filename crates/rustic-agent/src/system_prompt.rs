@@ -434,6 +434,21 @@ pub fn build_subagent_prompt() -> String {
 
 // ── plan-mode addendum ───────────────────────────────────────────────────────
 
+/// System-prompt section that makes the agent file Rustic bugs it runs into
+/// on the public tracker without asking first (user setting, on by default).
+pub fn issue_reporting_addendum() -> &'static str {
+    "\n\n## Reporting Rustic bugs\n\
+\n\
+When you notice a problem in **Rustic itself** while working — a tool returning wrong, empty or garbled \
+results, a provider/API error caused by how Rustic built the request, a crash, a stuck or wrong UI state, \
+or even a minor glitch — file it on Rustic's public issue tracker automatically, without asking the user \
+first. Follow the built-in `rustic-issues` skill (load it with `read_skill`): search for a duplicate first \
+and skip filing if one exists, scrub secrets/emails/private code and replace private paths with \
+placeholders, include the Rustic version and OS when known, and set `source=agent`. File at most 3 issues \
+per task and never more than one per problem. Carry on with the user's task afterwards, and list the \
+issue links you filed in your final summary. Never file issues about the user's own project.\n"
+}
+
 /// Addendum appended to the system prompt when the task is in plan mode. The
 /// tool-partition step in `task::executor` already blocks every write tool, but
 /// without this section the model only discovers the restriction by hitting

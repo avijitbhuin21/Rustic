@@ -7,15 +7,13 @@ import React, {
   useState,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { fetchFileBytes, fetchFileRange, fileSize } from '@/lib/file-bytes';
 import { useFileReloadVersion } from '@/lib/use-file-change';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
-  ZoomIn,
-  ZoomOut,
-  Maximize2,
   Pencil,
   MousePointer2,
   Type,
@@ -24,13 +22,18 @@ import {
   Trash2,
   Undo2,
   Save,
+  TextCursor,
 } from 'lucide-react';
-import { PreviewSurface } from './preview-surface';
+import { PanZoomControls, PanZoomSurface, usePanZoom } from './pan-zoom';
 import { useEditor } from '@/state/editor';
 import { setActiveSaver, clearActiveSaver } from '@/lib/active-editor';
 import { cn } from '@/lib/utils';
 import { MOD_LABEL } from '@/lib/platform';
 import './pdf-preview.css';
+
+// PDFs up to this size load whole (fast, and save keeps the bytes); larger
+// ones stream through pdf.js range requests.
+const SMALL_PDF_BYTES = 16 * 1024 * 1024;
 
 // PDF.js singleton loader. We import the bundled worker URL through Vite so
 // it gets fingerprinted and served from /assets; this avoids the cross-origin
@@ -151,22 +154,32 @@ function PdfPageCanvas({
     };
   }, [baseViewport, scale]);
 
-  // Mark visibility for lazy render. 800px rootMargin so the next page in
-  // either direction starts decoding before it scrolls into the viewport.
+  // Lazy render + release. Pages within 1500px of the viewport render; pages
+  // that leave that band drop their bitmap so a 400+ page document only ever
+  // holds the handful of canvases near what you're looking at.
   useEffect(() => {
     const node = wrapRef.current;
     if (!node) return;
     const io = new IntersectionObserver(
       (entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting) setVisible(true);
-        }
+        for (const e of entries) setVisible(e.isIntersecting);
       },
-      { rootMargin: '800px 0px', threshold: 0 },
+      { rootMargin: '1500px 1500px', threshold: 0 },
     );
     io.observe(node);
     return () => io.disconnect();
   }, [pageNumber]);
+
+  useEffect(() => {
+    if (visible) return;
+    const canvas = canvasRef.current;
+    if (canvas) {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+    textLayerRef.current?.replaceChildren();
+    setRendered(false);
+  }, [visible]);
 
   // Re-render whenever scale changes (canvas pixel size must match the
   // scaled viewport for the bitmap to stay sharp at zoom levels).
@@ -175,28 +188,38 @@ function PdfPageCanvas({
   useEffect(() => {
     if (!visible || !doc) return;
     let cancelled = false;
-    setRendered(false);
     (async () => {
       try {
         const pdfPage = await doc.getPage(pageNumber);
         if (cancelled) return;
-        // Use device pixel ratio so retina displays don't render fuzzy.
+        // Use device pixel ratio so retina displays don't render fuzzy, but
+        // cap the backing store: deep zoom on a big page would otherwise ask
+        // for a multi-hundred-MB bitmap. Past the cap CSS upscales.
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const viewport = pdfPage.getViewport({ scale: scale * dpr });
+        const base = pdfPage.getViewport({ scale: 1 });
+        const MAX_CANVAS_PX = 16_000_000;
+        const pxScale = Math.min(scale * dpr, Math.sqrt(MAX_CANVAS_PX / (base.width * base.height)));
+        const viewport = pdfPage.getViewport({ scale: pxScale });
         const canvas = canvasRef.current;
         if (!canvas) return;
-        canvas.width = Math.floor(viewport.width);
-        canvas.height = Math.floor(viewport.height);
-        canvas.style.width = `${dims.width}px`;
-        canvas.style.height = `${dims.height}px`;
-        const ctx = canvas.getContext('2d');
+        // Render off-screen, then copy: resizing the live canvas would blank
+        // it for the whole render and flash white after every zoom.
+        const off = document.createElement('canvas');
+        off.width = Math.floor(viewport.width);
+        off.height = Math.floor(viewport.height);
         if (renderTaskRef.current) {
           try { renderTaskRef.current.cancel(); } catch {}
         }
-        const task = pdfPage.render({ canvasContext: ctx, viewport });
+        const task = pdfPage.render({ canvasContext: off.getContext('2d'), viewport });
         renderTaskRef.current = task;
         await task.promise;
-        if (!cancelled) setRendered(true);
+        if (cancelled) return;
+        canvas.width = off.width;
+        canvas.height = off.height;
+        canvas.getContext('2d').drawImage(off, 0, 0);
+        off.width = 0;
+        off.height = 0;
+        setRendered(true);
 
         // Text layer overlay. The viewport here is at the *display* scale
         // (no DPR multiplier) because the layer is sized in CSS pixels —
@@ -270,8 +293,10 @@ function PdfPageCanvas({
     if (!editMode) return;
     if (edit?.deleted) return;
     const rect = overlayRef.current.getBoundingClientRect();
-    const relX = e.clientX - rect.left;
-    const relY = e.clientY - rect.top;
+    // The view is CSS-transformed (pan/zoom), so screen px ≠ layout px.
+    const f = overlayRef.current.offsetWidth / (rect.width || 1);
+    const relX = (e.clientX - rect.left) * f;
+    const relY = (e.clientY - rect.top) * f;
 
     if (tool === 'text') {
       // Place a new text box at the click. Width is a sensible default that
@@ -317,10 +342,11 @@ function PdfPageCanvas({
   const onOverlayMouseMove = (e) => {
     if (!drag) return;
     const rect = overlayRef.current.getBoundingClientRect();
+    const f = overlayRef.current.offsetWidth / (rect.width || 1);
     setDrag({
       ...drag,
-      curX: Math.max(0, Math.min(rect.width, e.clientX - rect.left)),
-      curY: Math.max(0, Math.min(rect.height, e.clientY - rect.top)),
+      curX: Math.max(0, Math.min(overlayRef.current.offsetWidth, (e.clientX - rect.left) * f)),
+      curY: Math.max(0, Math.min(overlayRef.current.offsetHeight, (e.clientY - rect.top) * f)),
     });
   };
 
@@ -382,13 +408,13 @@ function PdfPageCanvas({
         edit?.deleted && 'opacity-30',
       )}
     >
-      <canvas ref={canvasRef} className="block" />
+      <canvas ref={canvasRef} className="block h-full w-full" />
       {/* Selectable text overlay. Sits above the canvas (z-index from
           CSS) but BELOW the edit overlay below, so when the edit overlay
           is `pointer-events-none` (default / select tool), text-layer
           spans receive the pointer events and the user can drag-select. */}
       <div ref={textLayerRef} className="rustic-pdf-textlayer" aria-hidden="true" />
-      {!rendered && (
+      {!rendered && !canvasRef.current?.width && (
         <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
           <span>{pageNumber}</span>
         </div>
@@ -624,8 +650,15 @@ export default function PdfPreview({ tab }) {
   // but introduces a race with any in-flight overlays the user just authored.
   const [originalBytes, setOriginalBytes] = useState(null);
   const [error, setError] = useState(null);
-  const [scale, setScale] = useState(1);
+  // Resolution the pages are laid out and rendered at. Live zoom is a GPU
+  // transform on top (usePanZoom); when a gesture settles the pages are
+  // re-rendered at the new resolution and the transform is rebased.
+  const [renderScale, setRenderScale] = useState(1);
+  const renderScaleRef = useRef(1);
+  const pendingRebaseRef = useRef(1);
   const [currentPage, setCurrentPage] = useState(1);
+  const [textSelect, setTextSelect] = useState(false);
+  const [loadNote, setLoadNote] = useState(null);
 
   // Edit-mode state. `edits` is a per-page map keyed by 1-based page number.
   const [editMode, setEditMode] = useState(false);
@@ -636,12 +669,6 @@ export default function PdfPreview({ tab }) {
   const [highlightColor, setHighlightColor] = useState('#fff176');
   const [saving, setSaving] = useState(false);
 
-  // The "natural fit" scale that lets one page fit the container width.
-  // Recomputed on mount and on container resize. We treat this as the 100%
-  // baseline so PDF documents land in a sensible default zoom rather than a
-  // hard-coded 1.25x that often overflows the available width.
-  const fitScaleRef = useRef(1);
-  const surfaceRef = useRef(null);
   const lastReportedPageRef = useRef(1);
 
   const tabSetDirty = useEditor((s) => s.setDirty);
@@ -679,40 +706,78 @@ export default function PdfPreview({ tab }) {
     setPageBaseViewports([]);
     setOriginalBytes(null);
     setEdits({});
+    setLoadNote(null);
 
     try {
-      const [pdfjs, b64] = await Promise.all([
-        loadPdfJs(),
-        invoke('read_file_base64', { path: tab.path }),
-      ]);
+      const [pdfjs, total] = await Promise.all([loadPdfJs(), fileSize(tab.path, reloadVersion)]);
       if (signal.cancelled) return null;
-      const bytes = base64ToBytes(b64.data);
-      const task = pdfjs.getDocument({ data: bytes });
+      let task;
+      if (total <= SMALL_PDF_BYTES) {
+        const bytes = await fetchFileBytes(tab.path, { version: reloadVersion });
+        if (signal.cancelled) return null;
+        setOriginalBytes(bytes);
+        // pdf.js may transfer (detach) the buffer it's given; keep ours intact for save.
+        task = pdfjs.getDocument({ data: bytes.slice() });
+      } else {
+        // Big document: pdf.js asks for byte ranges as pages need them, so a
+        // multi-hundred-MB PDF opens without being read whole.
+        const initial = await fetchFileRange(tab.path, 0, Math.min(total, 1 << 20), { version: reloadVersion });
+        if (signal.cancelled) return null;
+        const transport = new pdfjs.PDFDataRangeTransport(total, initial);
+        transport.requestDataRange = (begin, end) => {
+          fetchFileRange(tab.path, begin, end, { version: reloadVersion })
+            .then((chunk) => transport.onDataRange(begin, chunk))
+            .catch((err) => setError(`Failed reading PDF: ${String(err?.message || err)}`));
+        };
+        task = pdfjs.getDocument({
+          range: transport,
+          rangeChunkSize: 1 << 20,
+          disableAutoFetch: true,
+          disableStream: true,
+        });
+      }
       const loaded = await task.promise;
       if (signal.cancelled) {
         try { loaded.destroy(); } catch {}
         return null;
       }
-      // Collect viewport-at-scale-1 for each page. PDF.js caches getPage
-      // internally so this is cheap; doing it now means every page row
-      // can size itself synchronously on first render.
-      const viewports = await Promise.all(
-        Array.from({ length: loaded.numPages }, async (_, i) => {
-          const p = await loaded.getPage(i + 1);
-          return p.getViewport({ scale: 1 });
-        }),
-      );
+      // Lay every page out at the first page's size immediately, then fill
+      // in the real sizes in the background — opening a 400+ page document
+      // must not wait on 400 getPage round trips.
+      const first = (await loaded.getPage(1)).getViewport({ scale: 1 });
       if (signal.cancelled) {
         try { loaded.destroy(); } catch {}
         return null;
       }
+      const viewports = Array.from({ length: loaded.numPages }, () => first);
       setDoc(loaded);
       setPdfjsMod(pdfjs);
       setPageBaseViewports(viewports);
-      setOriginalBytes(bytes);
+      (async () => {
+        const BATCH = 24;
+        for (let start = 2; start <= loaded.numPages; start += BATCH) {
+          const end = Math.min(loaded.numPages, start + BATCH - 1);
+          const batch = await Promise.all(
+            Array.from({ length: end - start + 1 }, (_, i) =>
+              loaded.getPage(start + i).then((p) => p.getViewport({ scale: 1 })),
+            ),
+          ).catch(() => null);
+          if (signal.cancelled || !batch) return;
+          let changed = false;
+          batch.forEach((v, i) => {
+            const idx = start - 1 + i;
+            if (v.width !== viewports[idx].width || v.height !== viewports[idx].height) changed = true;
+            viewports[idx] = v;
+          });
+          if (changed) setPageBaseViewports([...viewports]);
+        }
+      })();
+      if (total > SMALL_PDF_BYTES) {
+        setLoadNote(`${(total / 1048576).toFixed(0)} MB · streamed`);
+      }
       return loaded;
     } catch (e) {
-      if (!signal.cancelled) setError(String(e));
+      if (!signal.cancelled) setError(String(e?.message || e));
       return null;
     }
   }, [tab.path, reloadVersion]);
@@ -731,62 +796,68 @@ export default function PdfPreview({ tab }) {
     };
   }, [loadDoc]);
 
-  // Compute the fit-to-width baseline once the document and the surface
-  // ref are both available. Re-runs on ResizeObserver — if the user splits
-  // the editor pane the fit width must follow.
-  useLayoutEffect(() => {
-    if (pageBaseViewports.length === 0 || !surfaceRef.current) return;
-    const surface = surfaceRef.current;
-    const compute = () => {
-      const available = surface.clientWidth - 32; // 16px padding either side
-      const widest = Math.max(...pageBaseViewports.map((v) => v.width));
-      if (widest <= 0 || available <= 0) return;
-      const next = Math.max(0.25, Math.min(2, available / widest));
-      fitScaleRef.current = next;
-      setScale((prev) => (Math.abs(prev - next) < 0.01 ? prev : next));
-    };
-    compute();
-    const ro = new ResizeObserver(compute);
-    ro.observe(surface);
-    return () => ro.disconnect();
-    // We deliberately only run this on doc-load: subsequent zooms should be
-    // sticky to user input, not snap back to fit-to-width.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  // Page layout in render-scale-1 units. Gaps and padding scale with the
+  // pages, so the whole layout grows linearly with renderScale — that's what
+  // lets a re-render be absorbed by rebasing the transform with no jump.
+  const layout = useMemo(() => {
+    const PAD = 16;
+    const GAP = 12;
+    const offsets = [];
+    let y = PAD;
+    let maxW = 0;
+    for (const v of pageBaseViewports) {
+      offsets.push(y);
+      y += v.height + GAP;
+      maxW = Math.max(maxW, v.width);
+    }
+    return { PAD, GAP, offsets, width: maxW + PAD * 2, height: y - GAP + PAD };
   }, [pageBaseViewports]);
 
-  // Track which page the user is reading by sampling the scroll center.
-  // Cheap throttle via requestAnimationFrame so a fast scroll doesn't
-  // re-render every frame.
-  useEffect(() => {
-    const surface = surfaceRef.current;
-    if (!surface) return;
-    let raf = 0;
-    const onScroll = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        const center = surface.scrollTop + surface.clientHeight / 2;
-        const pages = surface.querySelectorAll('[data-pdf-page]');
-        for (const p of pages) {
-          const top = p.offsetTop;
-          const bottom = top + p.offsetHeight;
-          if (center >= top && center <= bottom) {
-            const n = Number(p.getAttribute('data-pdf-page'));
-            if (n && n !== lastReportedPageRef.current) {
-              lastReportedPageRef.current = n;
-              setCurrentPage(n);
-            }
-            return;
-          }
-        }
-      });
-    };
-    surface.addEventListener('scroll', onScroll, { passive: true });
-    return () => {
-      surface.removeEventListener('scroll', onScroll);
-      if (raf) cancelAnimationFrame(raf);
-    };
-  }, [pageBaseViewports.length]);
+  const updateCurrentPage = useCallback((view, r) => {
+    const vp = pzRef.current?.viewportRef.current;
+    if (!vp || layout.offsets.length === 0) return;
+    const centerY = (vp.clientHeight / 2 - view.y) / view.k / r;
+    let n = 1;
+    for (let i = 0; i < layout.offsets.length; i++) {
+      if (layout.offsets[i] <= centerY) n = i + 1;
+      else break;
+    }
+    if (n !== lastReportedPageRef.current) {
+      lastReportedPageRef.current = n;
+      setCurrentPage(n);
+    }
+  }, [layout]);
+
+  const pz = usePanZoom({
+    fit: 'width',
+    padding: 0,
+    minScale: 0.01,
+    maxScale: 200,
+    canPan: () => !textSelect && !(editMode && tool !== 'select'),
+    onSettle: (view) => {
+      const r = renderScaleRef.current;
+      updateCurrentPage(view, r);
+      // Re-render at the resolution actually on screen (clamped: tiny
+      // thumbnails and extreme zoom both fall back to CSS scaling).
+      const target = Math.min(8, Math.max(0.1, r * view.k));
+      if (Math.abs(target / r - 1) > 0.03) {
+        pendingRebaseRef.current = target / r;
+        renderScaleRef.current = target;
+        setRenderScale(target);
+      }
+    },
+  });
+  const pzRef = useRef(pz);
+  pzRef.current = pz;
+
+  useLayoutEffect(() => {
+    if (pendingRebaseRef.current !== 1) {
+      pz.rebase(pendingRebaseRef.current);
+      pendingRebaseRef.current = 1;
+    }
+    if (layout.offsets.length) pz.setContentSize(layout.width * renderScale, layout.height * renderScale);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [renderScale, layout]);
 
   // Cleanup the loaded doc on unmount or path swap.
   useEffect(() => {
@@ -798,13 +869,12 @@ export default function PdfPreview({ tab }) {
   }, [doc]);
 
   const jumpToPage = (n) => {
-    const surface = surfaceRef.current;
-    if (!surface) return;
-    const target = surface.querySelector(`[data-pdf-page="${n}"]`);
-    if (target) target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    const top = layout.offsets[n - 1];
+    if (top == null) return;
+    const v = pz.getView();
+    pz.setView({ y: -(top - layout.PAD / 2) * renderScale * v.k });
+    lastReportedPageRef.current = n;
   };
-
-  const fitWidth = () => setScale(fitScaleRef.current);
 
   // Update a single page's edits. The callback drops the entry entirely if it
   // ends up empty so `dirty` stays accurate without bookkeeping.
@@ -846,7 +916,7 @@ export default function PdfPreview({ tab }) {
   // top, write back via the existing write_file_base64 command, then reload
   // the pdf.js doc so the user sees their changes baked in.
   const onSave = useCallback(async () => {
-    if (saving || !originalBytes) return;
+    if (saving || !doc) return;
     if (!dirty) {
       toast.message('No changes to save');
       return;
@@ -854,7 +924,9 @@ export default function PdfPreview({ tab }) {
     setSaving(true);
     try {
       const { PDFDocument, StandardFonts, rgb, degrees } = await loadPdfLib();
-      const pdfDoc = await PDFDocument.load(originalBytes);
+      // Streamed (large) documents never held their bytes; read them now.
+      const source = originalBytes ?? (await fetchFileBytes(tab.path));
+      const pdfDoc = await PDFDocument.load(source);
       const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
       const pages = pdfDoc.getPages();
 
@@ -936,7 +1008,7 @@ export default function PdfPreview({ tab }) {
     } finally {
       setSaving(false);
     }
-  }, [dirty, edits, originalBytes, saving, tab.path, loadDoc]);
+  }, [dirty, doc, edits, originalBytes, saving, tab.path, loadDoc]);
 
   // Register Ctrl+S handler while we're the active editor.
   useEffect(() => {
@@ -973,7 +1045,7 @@ export default function PdfPreview({ tab }) {
             setCurrentPage(n);
             jumpToPage(n);
           }}
-          className="h-6 w-14 text-xs"
+          className="h-6 w-16 text-xs tabular-nums"
         />
         <span className="text-xs text-muted-foreground">
           / {pageBaseViewports.length}
@@ -1075,18 +1147,17 @@ export default function PdfPreview({ tab }) {
         )}
       </div>
       <div className="flex items-center gap-1">
-        <Button size="icon-xs" variant="ghost" onClick={() => setScale((s) => Math.max(0.1, s * 0.85))} aria-label="Zoom out">
-          <ZoomOut />
+        {loadNote && <span className="mr-1 text-[11px] text-muted-foreground">{loadNote}</span>}
+        <Button
+          size="icon-xs"
+          variant={textSelect ? 'default' : 'ghost'}
+          onClick={() => setTextSelect((v) => !v)}
+          title={textSelect ? 'Text selection on — drag selects text' : 'Select text (drag pans otherwise)'}
+          aria-label="Toggle text selection"
+        >
+          <TextCursor />
         </Button>
-        <span className="w-12 text-center text-xs text-muted-foreground">
-          {Math.round((scale / (fitScaleRef.current || 1)) * 100)}%
-        </span>
-        <Button size="icon-xs" variant="ghost" onClick={() => setScale((s) => Math.min(8, s * 1.15))} aria-label="Zoom in">
-          <ZoomIn />
-        </Button>
-        <Button size="icon-xs" variant="ghost" onClick={fitWidth} aria-label="Fit to width">
-          <Maximize2 />
-        </Button>
+        <PanZoomControls pz={pz} fitLabel="Fit width" />
       </div>
     </>
   );
@@ -1095,15 +1166,20 @@ export default function PdfPreview({ tab }) {
   const highlightDefaults = { color: highlightColor, opacity: 0.4 };
 
   return (
-    <PreviewSurface
+    <PanZoomSurface
+      pz={pz}
       toolbar={toolbar}
-      scale={scale}
-      onScaleChange={setScale}
-      minScale={0.1}
-      maxScale={8}
-      scrollRef={surfaceRef}
+      background="bg-muted/30"
+      contentClassName={textSelect ? 'select-text cursor-text' : ''}
     >
-      <div className="flex flex-col items-center gap-3 py-4">
+      <div
+        className="flex flex-col items-center"
+        style={{
+          width: layout.width * renderScale,
+          padding: layout.PAD * renderScale,
+          gap: layout.GAP * renderScale,
+        }}
+      >
         {pageBaseViewports.map((bv, idx) => {
           const pageNumber = idx + 1;
           return (
@@ -1112,7 +1188,7 @@ export default function PdfPreview({ tab }) {
               doc={doc}
               pdfjs={pdfjsMod}
               pageNumber={pageNumber}
-              scale={scale}
+              scale={renderScale}
               baseViewport={bv}
               edit={edits[pageNumber]}
               editMode={editMode}
@@ -1125,6 +1201,6 @@ export default function PdfPreview({ tab }) {
           );
         })}
       </div>
-    </PreviewSurface>
+    </PanZoomSurface>
   );
 }

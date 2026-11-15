@@ -57,12 +57,11 @@ export function ProviderErrorBanner() {
                 className="inline-flex items-center gap-1.5 rounded-md border border-danger/50 bg-danger/15 px-2.5 py-1 text-xs font-medium text-foreground hover:bg-danger/25 disabled:opacity-50"
               >
                 <Wrench className="size-3.5" />
-                {busy ? 'Repairing…' : 'Repair & continue'}
+                {busy ? 'Restarting…' : 'Restart from transcript'}
               </button>
               <span className="text-[11px] text-foreground/70">
-                {entry.autoExhausted
-                  ? 'Automatic attempts are used up — repair once more by hand, or edit and re-send.'
-                  : 'Converts the rejected content in history to text, then resumes.'}
+                Converts the whole chat into one plain-text message and continues as a fresh
+                conversation — nothing the provider rejected is replayed.
               </span>
             </div>
           </div>

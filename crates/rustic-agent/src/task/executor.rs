@@ -2766,6 +2766,7 @@ impl TaskExecutor {
                 })
                 .collect();
 
+            let mut orphan_server_note: Option<String> = None;
             if !unresolved_server_ids.is_empty() {
                 if matches!(response.stop_reason, StopReason::PauseTurn)
                     && pause_turn_resubmits < MAX_PAUSE_TURN_RESUBMITS
@@ -2796,14 +2797,13 @@ impl TaskExecutor {
                             ContentBlock::ToolUse { id, .. } if unresolved_server_ids.contains(id)
                         )
                     });
-                    // Leave a visible trace so the model knows the search never
-                    // ran rather than silently losing the call.
-                    last.content.push(ContentBlock::Text {
-                        text: format!(
-                            "[{} server-side tool call(s) (e.g. web_search) ended without a result — the provider dropped them. Retry the search if its result matters.]",
-                            unresolved_server_ids.len()
-                        ),
-                    });
+                    // The trace for the model rides on the NEXT user message: appending
+                    // text after the assistant's tool_use blocks rewrote a signed
+                    // assistant turn and Claude 5 rejected the request as prefill.
+                    orphan_server_note = Some(format!(
+                        "[{} server-side tool call(s) (e.g. web_search) ended without a result — the provider dropped them. Retry the search if its result matters.]",
+                        unresolved_server_ids.len()
+                    ));
                 }
                 persist_now(messages);
             }
@@ -2838,6 +2838,12 @@ impl TaskExecutor {
                     task_id
                 );
                 if active.is_empty() {
+                    // A message queued while this turn ran arrives now rather
+                    // than after the turn: append it and keep going.
+                    if context.agent_depth == 0 && inject_user_inbox(messages, task_id, event_tx) {
+                        persist_now(messages);
+                        continue;
+                    }
                     // /goal loop: while a goal is active the turn does not end
                     // here — re-arm with a continuation directive unless the
                     // evaluator has verified the claimed completion (in which
@@ -3387,10 +3393,16 @@ impl TaskExecutor {
             // results — skip the (empty) message entirely; the resume path
             // creates the tool_result message when the answer arrives.
             if !tool_results.is_empty() {
+                if let Some(note) = orphan_server_note.take() {
+                    tool_results.push(ContentBlock::Text { text: note });
+                }
                 messages.push(Message {
                     role: Role::User,
                     content: tool_results,
                 });
+                if context.agent_depth == 0 {
+                    inject_user_inbox(messages, task_id, event_tx);
+                }
                 // Persist again so tool outputs are durable before the next
                 // provider call begins. A crash mid-call now keeps everything
                 // up to and including the just-completed tool batch.
@@ -3904,6 +3916,30 @@ fn learn_unsupported_param(
 }
 
 /// On cancel mid-batch, appends a user message pairing every tool_use of the trailing assistant message with a result (`results` where available, an "[interrupted]" stub otherwise) so the persisted history never holds a dangling tool_use.
+/// Appends any mid-run user messages queued for `task_id` as one user turn and
+/// tells the host which queue ids were delivered. Returns true if anything was added.
+fn inject_user_inbox(
+    messages: &mut Vec<Message>,
+    task_id: &str,
+    event_tx: &tokio::sync::mpsc::Sender<TaskEvent>,
+) -> bool {
+    let queued = crate::task::user_inbox::drain(task_id);
+    if queued.is_empty() {
+        return false;
+    }
+    let ids: Vec<String> = queued.iter().map(|m| m.id.clone()).collect();
+    let Some(msg) = crate::task::user_inbox::to_message(&queued) else {
+        return false;
+    };
+    tracing::info!(task = %task_id, count = ids.len(), "[executor] injected mid-run user message(s)");
+    messages.push(msg);
+    let _ = event_tx.try_send(TaskEvent::UserMessagesInjected {
+        task_id: task_id.to_string(),
+        ids,
+    });
+    true
+}
+
 fn close_dangling_tool_uses(messages: &mut Vec<Message>, results: &[(String, ToolOutput)]) -> bool {
     let Some(last) = messages.last() else {
         return false;

@@ -106,9 +106,15 @@ const DocxPreview     = React.lazy(() => import('@/components/editor/previews/do
 const XlsxPreview     = React.lazy(() => import('@/components/editor/previews/xlsx-preview'));
 const NotebookPreview = React.lazy(() => import('@/components/editor/previews/notebook-preview'));
 const HexPreview      = React.lazy(() => import('@/components/editor/previews/hex-preview'));
+const DecodedImagePreview = React.lazy(() => import('@/components/editor/previews/decoded-image-preview'));
+const FontPreview     = React.lazy(() => import('@/components/editor/previews/font-preview'));
+const ArchivePreview  = React.lazy(() => import('@/components/editor/previews/archive-preview'));
+const SqlitePreview   = React.lazy(() => import('@/components/editor/previews/sqlite-preview'));
+const PptxPreview     = React.lazy(() => import('@/components/editor/previews/pptx-preview'));
+const ModelPreview    = React.lazy(() => import('@/components/editor/previews/model-preview'));
 const DiffView        = React.lazy(() => import('@/components/scm/diff-view'));
 
-/** Edit ⇄ Preview toggle, shown top-right for markdown/svg/html tabs. */
+/** Edit ⇄ Preview toggle for markdown/svg/html tabs, shown in the breadcrumb bar beside Reveal. */
 function ViewModeToggle({ tab, groupId }) {
   const setTabViewMode = useEditor((s) => s.setTabViewMode);
   const isPreview = (tab.viewMode ?? 'edit') === 'preview';
@@ -116,7 +122,7 @@ function ViewModeToggle({ tab, groupId }) {
   return (
     <button
       onClick={() => setTabViewMode(tab.id, groupId, next)}
-      className="absolute right-3 top-2 z-20 flex items-center gap-1 rounded border border-border/60 bg-background/80 px-2 py-1 text-xs text-muted-foreground backdrop-blur-sm hover:text-foreground"
+      className="flex h-6 items-center gap-1 rounded px-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
       title={isPreview ? 'Edit source' : 'Open preview'}
       aria-label={isPreview ? 'Edit source' : 'Open preview'}
     >
@@ -204,6 +210,12 @@ function ActiveView({ tab }) {
     case 'xlsx':     return <XlsxPreview tab={tab} />;
     case 'notebook': return <NotebookPreview tab={tab} />;
     case 'hex':      return <HexPreview tab={tab} />;
+    case 'decoded-image': return <DecodedImagePreview tab={tab} />;
+    case 'font':     return <FontPreview tab={tab} />;
+    case 'archive':  return <ArchivePreview tab={tab} />;
+    case 'sqlite':   return <SqlitePreview tab={tab} />;
+    case 'pptx':     return <PptxPreview tab={tab} />;
+    case 'model3d':  return <ModelPreview tab={tab} />;
     case 'diff':     return <DiffView file={tab.diff} />;
     case 'unsupported': return <UnsupportedFileView tab={tab} />;
     default:         return <MonacoEditor tab={tab} />;
@@ -287,7 +299,14 @@ export default function EditorPane({ groupId }) {
     >
       <TabBar groupId={groupId} />
       {active?.path && active.kind !== 'diff' && active.kind !== 'terminal' && (
-        <Breadcrumb tab={active} />
+        <Breadcrumb
+          tab={active}
+          actions={
+            TOGGLEABLE_PREVIEW_KINDS.has(active.kind) ? (
+              <ViewModeToggle tab={active} groupId={groupId} />
+            ) : null
+          }
+        />
       )}
 
       <div className="relative flex-1 overflow-hidden">
@@ -311,9 +330,6 @@ export default function EditorPane({ groupId }) {
         {!isTerminalActive && (
           active ? (
             <div className="absolute inset-0">
-              {TOGGLEABLE_PREVIEW_KINDS.has(active.kind) && (
-                <ViewModeToggle tab={active} groupId={groupId} />
-              )}
               <Suspense fallback={<PaneFallback />}>
                 <ActiveView key={active.id} tab={active} />
               </Suspense>

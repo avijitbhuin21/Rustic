@@ -5,9 +5,8 @@ import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Button } from '@/components/ui/button';
-import { RefreshCw } from 'lucide-react';
+import { MousePointerClick, RefreshCw } from 'lucide-react';
 import { basename } from '@/state/editor';
-import { ToolbarToggleGap } from './preview-zoom';
 import {
   CanvasControls,
   DEVICE_PRESETS,
@@ -128,6 +127,8 @@ export default function HtmlPreview({ tab }) {
 
   const [activeIds, setActiveIds] = useState(['desktop']);
   const [customSize, setCustomSize] = useState({ width: 1280, height: 720 });
+  // Navigate (wheel zoom + drag pan everywhere) vs. interact with the page.
+  const [interactive, setInteractive] = useState(false);
 
   const frames = useMemo(() => {
     const list = DEVICE_PRESETS.filter((p) => activeIds.includes(p.id)).map((p) => ({ ...p }));
@@ -241,6 +242,19 @@ export default function HtmlPreview({ tab }) {
         >
           <RefreshCw />
         </Button>
+        <Button
+          size="xs"
+          variant={interactive ? 'default' : 'ghost'}
+          onClick={() => setInteractive((v) => !v)}
+          title={
+            interactive
+              ? 'Interacting with the page — click to go back to wheel-zoom / drag-pan'
+              : 'Interact with the page (click links, scroll inside it)'
+          }
+        >
+          <MousePointerClick />
+          <span className="ml-1">{interactive ? 'Interacting' : 'Interact'}</span>
+        </Button>
         <CanvasControls
           canvas={canvas}
           activeIds={activeIds}
@@ -252,7 +266,6 @@ export default function HtmlPreview({ tab }) {
           {basename(tab.path)}
         </span>
       </div>
-      <ToolbarToggleGap />
     </>
   );
 
@@ -263,6 +276,7 @@ export default function HtmlPreview({ tab }) {
       </div>
       <PreviewCanvas
         canvas={canvas}
+        interactive={interactive}
         renderFrame={(frame) => (
           <iframe
             ref={attachLinkHandler}

@@ -75,11 +75,193 @@ fn dimension_limit(error: &str) -> Option<u32> {
     Some(num.unwrap_or(crate::media_store::REQUEST_IMAGE_SIDE))
 }
 
+/// True for Claude's thinking-signature / prefix-binding rejections.
+fn is_thinking_signature_error(error: &str) -> bool {
+    let e = error.to_lowercase();
+    (e.contains("signature") && e.contains("thinking"))
+        || e.contains("bound to a different conversation")
+        || (e.contains("thinking") && e.contains("cannot be modified"))
+}
+
+/// Removes every thinking block from history; returns how many were removed.
+/// A message emptied this way keeps a short placeholder so it stays valid.
+fn strip_all_thinking(messages: &mut [Message]) -> usize {
+    let mut removed = 0;
+    for msg in messages.iter_mut() {
+        let before = msg.content.len();
+        msg.content.retain(|b| {
+            !matches!(
+                b,
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+            )
+        });
+        let n = before - msg.content.len();
+        removed += n;
+        if n > 0 && msg.content.is_empty() {
+            msg.content.push(ContentBlock::Text {
+                text: "[thinking omitted]".into(),
+            });
+        }
+    }
+    removed
+}
+
+/// Moves text blocks that trail an assistant's last tool_use into the next
+/// user message (Claude rejects that shape as prefill). Returns blocks moved.
+fn relocate_trailing_assistant_text(messages: &mut [Message]) -> usize {
+    let mut moved = 0;
+    for i in 0..messages.len() {
+        if !matches!(messages[i].role, crate::provider::Role::Assistant) {
+            continue;
+        }
+        let content = &messages[i].content;
+        let Some(last_tool) = content
+            .iter()
+            .rposition(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        else {
+            continue;
+        };
+        if last_tool + 1 == content.len()
+            || !content[last_tool + 1..]
+                .iter()
+                .all(|b| matches!(b, ContentBlock::Text { .. }))
+        {
+            continue;
+        }
+        let Some(next) = (i + 1..messages.len())
+            .find(|&j| matches!(messages[j].role, crate::provider::Role::User))
+        else {
+            continue;
+        };
+        let tail = messages[i].content.split_off(last_tool + 1);
+        moved += tail.len();
+        messages[next].content.extend(tail);
+    }
+    moved
+}
+
+/// Prefix of the flattened-restart message; starts with "[Context Condensed" so
+/// hosts treat it as a condense artifact (hidden in the transcript view).
+pub const RESTART_PREFIX: &str = "[Context Condensed — the conversation was restarted after a provider error. Below is a plain-text transcript of everything so far (thinking, tool-call structure and images removed). Continue the task from where it left off; do not redo finished work.]";
+
+const RESTART_TOOL_RESULT_CHARS: usize = 3_000;
+const RESTART_TRANSCRIPT_CHARS: usize = 400_000;
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}… [truncated]")
+}
+
+/// Renders `messages` as one plain-text transcript (no thinking, no tool
+/// blocks, no images) so a restarted request carries nothing a provider can
+/// reject on signature, pairing or media grounds.
+pub fn flatten_transcript(messages: &[Message]) -> String {
+    use crate::provider::Role;
+    let mut parts: Vec<String> = Vec::new();
+    for m in messages {
+        let who = match m.role {
+            Role::User => "USER",
+            Role::Assistant => "ASSISTANT",
+            Role::System => continue,
+        };
+        let mut lines: Vec<String> = Vec::new();
+        for b in &m.content {
+            match b {
+                ContentBlock::Text { text } => {
+                    if !text.trim().is_empty() {
+                        lines.push(text.clone());
+                    }
+                }
+                ContentBlock::ToolUse { name, input, .. } => {
+                    lines.push(format!("→ called {name} {}", clip(&input.to_string(), 600)));
+                }
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let tag = if *is_error {
+                        "tool error"
+                    } else {
+                        "tool result"
+                    };
+                    lines.push(format!(
+                        "← {tag}: {}",
+                        clip(content, RESTART_TOOL_RESULT_CHARS)
+                    ));
+                }
+                ContentBlock::Image { .. } => lines.push("[image]".into()),
+                ContentBlock::ModelSwitch { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. } => {}
+            }
+        }
+        if !lines.is_empty() {
+            parts.push(format!("### {who}\n{}", lines.join("\n")));
+        }
+    }
+    let mut transcript = parts.join("\n\n");
+    let total = transcript.chars().count();
+    if total > RESTART_TRANSCRIPT_CHARS {
+        // Keep the most recent part — it's what the model needs to continue.
+        let skip = total - RESTART_TRANSCRIPT_CHARS;
+        let tail: String = transcript.chars().skip(skip).collect();
+        transcript = format!("[… earlier transcript omitted …]\n{tail}");
+    }
+    transcript
+}
+
+/// Builds the restarted history: the original first message (if it is a user
+/// message) followed by a single user message holding the flattened rest.
+/// Returns (new_history, index_where_flattening_started).
+pub fn flatten_for_restart(messages: &[Message]) -> (Vec<Message>, usize) {
+    use crate::provider::Role;
+    let keep_head = matches!(messages.first().map(|m| &m.role), Some(Role::User))
+        && messages.len() > 1
+        && messages[0]
+            .content
+            .iter()
+            .all(|b| matches!(b, ContentBlock::Text { .. } | ContentBlock::Image { .. }));
+    let start = usize::from(keep_head);
+    let mut out: Vec<Message> = messages[..start].to_vec();
+    out.push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: format!(
+                "{RESTART_PREFIX}\n\n{}",
+                flatten_transcript(&messages[start..])
+            ),
+        }],
+    });
+    (out, start)
+}
+
 /// Repairs a task history that a provider deterministically rejects (4xx): stubs the
 /// offending block when the error names it, otherwise stubs all image blocks.
 /// Pixel-limit errors apply to every image in the request, so those downscale
 /// all images under the named limit instead (keeping them visible to the model).
 pub fn repair_history_for_provider_error(messages: &mut [Message], error: &str) -> RepairReport {
+    if is_thinking_signature_error(error) {
+        // Every thinking block after a rewritten prefix is stale, so stubbing
+        // the single named block just moves the 400 to the next one.
+        let removed = strip_all_thinking(messages);
+        if removed > 0 {
+            return RepairReport {
+                stubbed: removed,
+                targeted: false,
+            };
+        }
+    }
+    if error.to_lowercase().contains("prefill") {
+        let moved = relocate_trailing_assistant_text(messages);
+        if moved > 0 {
+            return RepairReport {
+                stubbed: moved,
+                targeted: false,
+            };
+        }
+    }
     if let Some(limit) = dimension_limit(error) {
         // A little under the stated limit so rounding never lands us on it.
         let cap = limit
@@ -349,6 +531,112 @@ mod tests {
                 targeted: false
             }
         );
+    }
+
+    #[test]
+    fn signature_binding_error_strips_every_thinking_block() {
+        let think = || ContentBlock::Thinking {
+            thinking: "t".into(),
+            signature: Some("sig".into()),
+            duration_secs: None,
+        };
+        let mut messages = vec![
+            msg(Role::User, vec![text("q")]),
+            msg(Role::Assistant, vec![think(), text("a")]),
+            msg(Role::User, vec![text("q2")]),
+            msg(Role::Assistant, vec![think()]),
+        ];
+        let err = "Claude API error 400: messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.";
+        let report = repair_history_for_provider_error(&mut messages, err);
+        assert_eq!(report.stubbed, 2);
+        assert!(messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .all(|b| !matches!(b, ContentBlock::Thinking { .. })));
+        assert!(
+            !messages[3].content.is_empty(),
+            "emptied message keeps a placeholder"
+        );
+    }
+
+    #[test]
+    fn prefill_error_moves_trailing_assistant_text_to_next_user() {
+        let mut messages = vec![
+            msg(Role::User, vec![text("q")]),
+            msg(
+                Role::Assistant,
+                vec![
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    },
+                    text("[1 server-side tool call(s) ended without a result]"),
+                ],
+            ),
+            msg(
+                Role::User,
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+            ),
+        ];
+        let err = "This model does not support assistant message prefill. The conversation must end with a user message.";
+        let report = repair_history_for_provider_error(&mut messages, err);
+        assert_eq!(report.stubbed, 1);
+        assert_eq!(messages[1].content.len(), 1);
+        assert!(matches!(messages[2].content[1], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn flatten_for_restart_keeps_head_and_strips_structure() {
+        let mut messages = vec![
+            msg(Role::User, vec![text("build the thing")]),
+            msg(
+                Role::Assistant,
+                vec![
+                    ContentBlock::Thinking {
+                        thinking: "secret".into(),
+                        signature: Some("sig".into()),
+                        duration_secs: None,
+                    },
+                    text("on it"),
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "a.rs"}),
+                        thought_signature: None,
+                    },
+                ],
+            ),
+        ];
+        messages.push(msg(
+            Role::User,
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "fn main() {}".into(),
+                    is_error: false,
+                },
+                img(),
+            ],
+        ));
+        let (out, start) = flatten_for_restart(&messages);
+        assert_eq!(start, 1);
+        assert_eq!(out.len(), 2);
+        let ContentBlock::Text { text: body } = &out[1].content[0] else {
+            panic!("flattened message must be text");
+        };
+        assert!(body.starts_with("[Context Condensed"));
+        assert!(body.contains("on it") && body.contains("→ called read_file"));
+        assert!(body.contains("fn main() {}") && body.contains("[image]"));
+        assert!(!body.contains("secret"));
+        assert!(crate::task::condense::is_condense_artifact_blocks(
+            &out[1].content
+        ));
     }
 
     #[test]

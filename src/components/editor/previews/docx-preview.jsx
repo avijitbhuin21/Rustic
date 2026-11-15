@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { fetchFileBytes } from '@/lib/file-bytes';
 import { useFileReloadVersion } from '@/lib/use-file-change';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -26,6 +27,137 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
+/**
+ * Wheel = zoom (around the cursor), drag on the background / middle-drag /
+ * Space+drag = pan, for the docx editor. Live zoom is a GPU transform on the
+ * page area; when the gesture settles we commit once through the editor's
+ * own setZoom (which re-lays the document out crisply) and re-anchor the
+ * scroll so the point under the cursor stays put. Dragging on text still
+ * selects it, so editing keeps working.
+ */
+function useDocxPanZoom(hostRef, editorRef, ready) {
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host || !ready) return undefined;
+    let scroll = null;
+    let gesture = null; // { factor, cx, cy, ox, oy }
+    let settle = 0;
+    let space = false;
+    let drag = null;
+    const content = () => scroll?.firstElementChild;
+
+    const commit = () => {
+      const g = gesture;
+      gesture = null;
+      const el = content();
+      if (!g || !el || !editorRef.current) return;
+      const z0 = editorRef.current.getZoom?.() ?? 1;
+      const z1 = Math.min(4, Math.max(0.25, z0 * g.factor));
+      const docX = (scroll.scrollLeft + g.cx) / z0;
+      const docY = (scroll.scrollTop + g.cy) / z0;
+      el.style.transform = '';
+      el.style.transformOrigin = '';
+      el.style.willChange = '';
+      editorRef.current.setZoom?.(z1);
+      // Two frames: let the editor re-render at the new zoom, then re-anchor.
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        scroll.scrollLeft = docX * z1 - g.cx;
+        scroll.scrollTop = docY * z1 - g.cy;
+      }));
+    };
+
+    const onWheel = (e) => {
+      if (!scroll || !scroll.contains(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        scroll.scrollLeft += e.shiftKey ? 0 : e.deltaX;
+        scroll.scrollTop += e.shiftKey ? e.deltaY : 0;
+        return;
+      }
+      const rect = scroll.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const el = content();
+      if (!el) return;
+      if (!gesture) {
+        gesture = {
+          factor: 1,
+          cx,
+          cy,
+          ox: scroll.scrollLeft + cx - el.offsetLeft,
+          oy: scroll.scrollTop + cy - el.offsetTop,
+        };
+        el.style.transformOrigin = `${gesture.ox}px ${gesture.oy}px`;
+        el.style.willChange = 'transform';
+      }
+      const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+      gesture.factor *= Math.exp(-dy * (e.ctrlKey ? 0.012 : 0.0022));
+      const z0 = editorRef.current?.getZoom?.() ?? 1;
+      gesture.factor = Math.min(4 / z0, Math.max(0.25 / z0, gesture.factor));
+      el.style.transform = `scale(${gesture.factor})`;
+      clearTimeout(settle);
+      settle = setTimeout(commit, 180);
+    };
+
+    // Anything in the scroll area that isn't the pages themselves is "desk".
+    const isBackground = (t) => !t.closest?.('.paged-editor__pages');
+    const onDown = (e) => {
+      if (!scroll || !scroll.contains(e.target)) return;
+      if (!(e.button === 1 || (e.button === 0 && (space || isBackground(e.target))))) return;
+      e.preventDefault();
+      drag = { x: e.clientX, y: e.clientY, l: scroll.scrollLeft, t: scroll.scrollTop, id: e.pointerId };
+      scroll.setPointerCapture?.(e.pointerId);
+      scroll.style.cursor = 'grabbing';
+    };
+    const onMove = (e) => {
+      if (!drag || drag.id !== e.pointerId) return;
+      scroll.scrollLeft = drag.l - (e.clientX - drag.x);
+      scroll.scrollTop = drag.t - (e.clientY - drag.y);
+    };
+    const onUp = (e) => {
+      if (!drag || drag.id !== e.pointerId) return;
+      drag = null;
+      scroll.style.cursor = '';
+    };
+    const onKey = (e) => {
+      if (e.code !== 'Space') return;
+      const typing = e.target?.isContentEditable || /INPUT|TEXTAREA/.test(e.target?.tagName || '');
+      if (typing) return;
+      space = e.type === 'keydown';
+    };
+
+    // The editor mounts its scroll container asynchronously.
+    const attach = () => {
+      scroll = host.querySelector('.docx-editor__scroll-container');
+      return !!scroll;
+    };
+    let mo = null;
+    if (!attach()) {
+      mo = new MutationObserver(() => { if (attach()) mo.disconnect(); });
+      mo.observe(host, { childList: true, subtree: true });
+    }
+    host.addEventListener('wheel', onWheel, { passive: false, capture: true });
+    host.addEventListener('pointerdown', onDown, true);
+    host.addEventListener('pointermove', onMove);
+    host.addEventListener('pointerup', onUp);
+    host.addEventListener('pointercancel', onUp);
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKey);
+    return () => {
+      mo?.disconnect();
+      clearTimeout(settle);
+      host.removeEventListener('wheel', onWheel, { capture: true });
+      host.removeEventListener('pointerdown', onDown, true);
+      host.removeEventListener('pointermove', onMove);
+      host.removeEventListener('pointerup', onUp);
+      host.removeEventListener('pointercancel', onUp);
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keyup', onKey);
+    };
+  }, [hostRef, editorRef, ready]);
+}
+
 export default function DocxPreview({ tab }) {
   // The DocxEditor itself is lazy-loaded. We keep a ref to it so we can
   // call `.save()` on Ctrl+S.
@@ -35,6 +167,7 @@ export default function DocxPreview({ tab }) {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const editorRef = useRef(null);
+  const hostRef = useRef(null);
   // Used to ignore the change event burst that fires during initial
   // document load — without this gate, opening a file would instantly
   // mark it dirty.
@@ -54,14 +187,13 @@ export default function DocxPreview({ tab }) {
       try {
         // Pull the editor + the file bytes in parallel; the editor
         // bundle is the slow part on first open.
-        const [editorMod, _css, res] = await Promise.all([
+        const [editorMod, _css, bytes] = await Promise.all([
           import('@eigenpal/docx-editor-react'),
           import('@eigenpal/docx-editor-react/styles.css'),
-          invoke('read_file_base64', { path: tab.path }),
+          fetchFileBytes(tab.path),
         ]);
         if (cancelled) return;
 
-        const bytes = base64ToBytes(res.data);
         // The editor's `documentBuffer` prop accepts ArrayBuffer; pass
         // the underlying buffer of the Uint8Array view so we don't
         // copy the bytes again.
@@ -154,6 +286,8 @@ export default function DocxPreview({ tab }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.path, dirty]);
 
+  useDocxPanZoom(hostRef, editorRef, !!EditorComponent && !!buffer);
+
   if (error) {
     return (
       <div className="flex h-full w-full items-center justify-center p-4 text-sm text-destructive">
@@ -174,7 +308,7 @@ export default function DocxPreview({ tab }) {
   }
 
   return (
-    <div className="rustic-docx-host flex h-full w-full flex-col">
+    <div ref={hostRef} className="rustic-docx-host flex h-full w-full flex-col">
       <EditorComponent
         ref={editorRef}
         documentBuffer={buffer}

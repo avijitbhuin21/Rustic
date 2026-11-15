@@ -291,6 +291,10 @@ pub struct AiConfig {
     /// "Auto-condense at" token cap applied to every chat. 0 = automatic.
     #[serde(default)]
     pub condense_threshold: u32,
+    /// Opt-out for the agent auto-filing Rustic bugs on the public tracker.
+    /// Negative so both old saved configs and `Default` keep reporting on.
+    #[serde(default)]
+    pub disable_auto_report_issues: bool,
 }
 
 impl AiConfig {
@@ -307,6 +311,7 @@ impl AiConfig {
             source_control: None,
             budget: crate::budget::BudgetSettings::default(),
             condense_threshold: 0,
+            disable_auto_report_issues: false,
         }
     }
 

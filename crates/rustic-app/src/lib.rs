@@ -11,6 +11,7 @@
 //! `ServerContext` (emits onto a WebSocket broadcast hub, paths from env,
 //! secrets from an encrypted file). Neither lives here — only the traits do.
 
+pub mod audio_stream;
 pub mod bootstrap;
 pub mod cloud_sync;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod notebook_kernel;
 pub mod path_scope;
 pub mod peer;
 pub mod preview_ops;
+pub mod rich_previews;
 pub mod search_ops;
 pub mod secrets;
 pub mod state;

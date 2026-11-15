@@ -992,6 +992,15 @@ pub async fn send_message(
         } else {
             system_prompt
         };
+        let system_prompt = if agent.ai_config.disable_auto_report_issues {
+            system_prompt
+        } else {
+            format!(
+                "{}{}",
+                system_prompt,
+                rustic_agent::issue_reporting_addendum()
+            )
+        };
 
         // Resolve thinking budget with this precedence:
         //   1. Frontend-provided value for this message (explicit user choice)
@@ -2086,6 +2095,12 @@ pub async fn send_message(
                         TaskEvent::SubagentThinkingDelta { task_id, agent_id, text } => {
                             let _ = app_events.emit("agent-subagent-thinking-delta", AgentSubagentThinkingDeltaEvent { task_id, agent_id, text });
                         }
+                        TaskEvent::UserMessagesInjected { task_id, ids } => {
+                            let _ = app_events.emit("agent-user-messages-injected", serde_json::json!({
+                                "task_id": task_id,
+                                "ids": ids,
+                            }));
+                        }
                         TaskEvent::ModelParamLearned { task_id, model, param, action, overrides } => {
                             if let Ok(mut agent) = learn_agent_arc.lock() {
                                 let caps = agent.ai_config.model_capabilities.entry(model.clone()).or_default();
@@ -2697,7 +2712,25 @@ pub fn repair_task_history(
     state: State<'_, AppState>,
     task_id: String,
     error: String,
+    flatten: Option<bool>,
 ) -> Result<RepairOutcome, String> {
+    if flatten.unwrap_or(false) {
+        let restarted = {
+            let db = state.db.lock_safe();
+            rustic_app::host_ops::agent_history::flatten_task_history(&db, &task_id)?
+        };
+        tracing::info!(target: "rustic::repair_task_history", task = %task_id, "history flattened for restart");
+        let mut agent = state.agent.lock_safe();
+        if let Some(task) = agent.tasks.get_mut(&task_id) {
+            task.messages = restarted;
+        }
+        return Ok(RepairOutcome {
+            stubbed: 1,
+            targeted: false,
+            summary: "Restarted the conversation from a plain-text transcript of the history."
+                .into(),
+        });
+    }
     let mut rows = {
         let db = state.db.lock_safe();
         db.get_messages_for_task(&task_id)
@@ -3479,6 +3512,15 @@ pub fn set_subagent_concurrency_cap(
 pub fn get_subagent_concurrency_cap(state: State<'_, AppState>) -> Result<Option<usize>, String> {
     let agent = state.agent.lock().map_err(|e| e.to_string())?;
     Ok(agent.ai_config.budget.max_concurrent_subagents)
+}
+
+/// Turn the agent's automatic Rustic bug reporting on or off.
+#[tauri::command]
+pub fn set_auto_report_issues(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+    agent.ai_config.disable_auto_report_issues = !enabled;
+    persist_ai_config(&agent.ai_config, &state)?;
+    Ok(())
 }
 
 /// Set the global "auto-condense at" token cap (0 = automatic).

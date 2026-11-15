@@ -249,6 +249,30 @@ async fn list_all_terminals(context: &ToolContext) -> Result<ToolOutput> {
     })
 }
 
+/// Agent terminals this process spawned with a POSIX shell (zsh/bash/sh…).
+/// Only those get the sentinel wrapper — PowerShell, fish and user-opened
+/// terminals keep the plain typed-command path.
+static POSIX_SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static SENTINEL_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// True when `shell` (a name or a path; `None` = the agent default) is a POSIX shell.
+fn is_posix_shell(shell: Option<&str>) -> bool {
+    let resolved = shell
+        .map(str::to_string)
+        .or_else(crate::agent_shell::agent_shell_path);
+    let Some(s) = resolved else {
+        return !cfg!(target_os = "windows");
+    };
+    let base = s
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&s)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    matches!(base.as_str(), "zsh" | "bash" | "sh" | "dash" | "ksh")
+}
+
 /// Resolve a raw pty buffer into the readable output of `cmd` alone: escape
 /// sequences and cursor noise removed, ConPTY's prompt repaints and the command
 /// echo cut, trailing prompt dropped.
@@ -394,7 +418,15 @@ async fn run_command(
                 &context.task_id,
                 shell.clone(),
             ) {
-                Ok(id) => id,
+                Ok(id) => {
+                    if is_posix_shell(shell.as_deref()) {
+                        POSIX_SESSIONS
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(id);
+                    }
+                    id
+                }
                 Err(e) => {
                     return Ok(ToolOutput {
                         content: format!("Failed to spawn terminal: {}", e),
@@ -409,7 +441,18 @@ async fn run_command(
     let short_cmd = truncate_utf8(cmd_str, 57);
     context.emit_progress(tool_use_id, &format!("$ [#{session_id}] {short_cmd}"));
 
-    if let Err(e) = broker.send_command(session_id, cmd_str, &context.task_id) {
+    let wrapped = POSIX_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&session_id);
+    let send_result = if wrapped {
+        let nonce = SENTINEL_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let line = crate::terminal_text::wrap_posix_command(cmd_str, nonce);
+        broker.send_command_line(session_id, cmd_str, &line, &context.task_id)
+    } else {
+        broker.send_command(session_id, cmd_str, &context.task_id)
+    };
+    if let Err(e) = send_result {
         return Ok(ToolOutput {
             content: format!("Failed to send command to terminal #{}: {}", session_id, e),
             is_error: true,
@@ -441,7 +484,7 @@ async fn run_command(
             // Prefer a fresh, larger read over the 4KB tail captured at
             // notice time; fall back to the notice tail if the session is
             // already gone.
-            let raw = broker
+            let mut raw = broker
                 .read_output(session_id, READ_OUTPUT_MAX)
                 .unwrap_or_else(|_| {
                     notices
@@ -449,16 +492,41 @@ async fn run_command(
                         .map(|n| n.output_tail.clone())
                         .unwrap_or_default()
                 });
+            // Completion is detected from the process tree, which can beat the
+            // last pty bytes into the buffer — the "(no output)" / truncated
+            // results. With a sentinel we know exactly when output is complete.
+            if wrapped && !shell_exited {
+                for _ in 0..20 {
+                    let done = crate::terminal_text::extract_sentinel_output(
+                        &crate::terminal_text::sanitize_terminal_output(&raw),
+                    )
+                    .is_some_and(|s| s.exit_code.is_some());
+                    if done {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if let Ok(fresh) = broker.read_output(session_id, READ_OUTPUT_MAX) {
+                        raw = fresh;
+                    }
+                }
+            }
             let sliced = slice_output_since_command(&raw, cmd_str);
+            let exit_note = crate::terminal_text::extract_sentinel_output(
+                &crate::terminal_text::sanitize_terminal_output(&raw),
+            )
+            .and_then(|s| s.exit_code)
+            .filter(|c| *c != 0)
+            .map(|c| format!("\n[exit code {c}]"))
+            .unwrap_or_default();
             let body = format_output_head_tail(&sliced, OUTPUT_MAX_BYTES);
             let footer = if shell_exited {
                 format!(
-                    "\n\n[terminal #{} exited — the shell is gone; the next run_command will spawn a fresh one]",
+                    "{exit_note}\n\n[terminal #{} exited — the shell is gone; the next run_command will spawn a fresh one]",
                     session_id
                 )
             } else {
                 format!(
-                    "\n\n[finished in terminal #{id}; the shell is still open — pass terminal_id={id} to run a follow-up in the same session]",
+                    "{exit_note}\n\n[finished in terminal #{id}; the shell is still open — pass terminal_id={id} to run a follow-up in the same session]",
                     id = session_id
                 )
             };
@@ -550,11 +618,15 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
     let rendered = params["rendered"].as_bool().unwrap_or(false);
 
     let result = if rendered {
-        broker.render_screen(id)
-    } else {
         broker
-            .read_output(id, max_bytes)
-            .map(|raw| crate::terminal_text::sanitize_terminal_output(&raw))
+            .render_screen(id)
+            .map(|s| crate::terminal_text::hide_sentinels(&s))
+    } else {
+        broker.read_output(id, max_bytes).map(|raw| {
+            crate::terminal_text::hide_sentinels(&crate::terminal_text::sanitize_terminal_output(
+                &raw,
+            ))
+        })
     };
 
     match result {

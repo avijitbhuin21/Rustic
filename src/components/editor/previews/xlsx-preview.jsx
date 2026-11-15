@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { fetchFileBytes } from '@/lib/file-bytes';
 import { useFileReloadVersion } from '@/lib/use-file-change';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -41,7 +42,7 @@ function extOf(path) {
 // CSV is special-cased because (a) it's plain text — no ExcelJS round-
 // trip needed — and (b) Univer wants a workbook snapshot. We synthesise
 // a single-sheet workbook in the Univer shape from the parsed rows.
-function csvTextToUniverSnapshot(text, sheetName = 'Sheet1') {
+function csvTextToUniverSnapshot(text, sheetName = 'Sheet1', delimiter = ',') {
   const rows = [];
   let row = [];
   let field = '';
@@ -55,7 +56,7 @@ function csvTextToUniverSnapshot(text, sheetName = 'Sheet1') {
       } else field += ch;
     } else {
       if (ch === '"') inQuotes = true;
-      else if (ch === ',') { row.push(field); field = ''; }
+      else if (ch === delimiter) { row.push(field); field = ''; }
       else if (ch === '\r') { /* skip */ }
       else if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
       else field += ch;
@@ -115,7 +116,7 @@ function csvTextToUniverSnapshot(text, sheetName = 'Sheet1') {
   };
 }
 
-function univerSnapshotToCsvText(snapshot) {
+function univerSnapshotToCsvText(snapshot, delimiter = ',') {
   const firstId = snapshot.sheetOrder?.[0];
   const sheet = firstId ? snapshot.sheets?.[firstId] : null;
   if (!sheet || !sheet.cellData) return '';
@@ -133,10 +134,10 @@ function univerSnapshotToCsvText(snapshot) {
       const cell = cols[c];
       if (!cell || cell.v == null) { line.push(''); continue; }
       const text = String(cell.v);
-      if (/[",\r\n]/.test(text)) line.push(`"${text.replace(/"/g, '""')}"`);
+      if (/["\r\n]/.test(text) || text.includes(delimiter)) line.push(`"${text.replace(/"/g, '""')}"`);
       else line.push(text);
     }
-    lines.push(line.join(','));
+    lines.push(line.join(delimiter));
   }
   return lines.join('\n');
 }
@@ -159,7 +160,8 @@ export default function XlsxPreview({ tab }) {
   const tabSetDirty = useEditor((s) => s.setDirty);
 
   const ext = extOf(tab.path);
-  const isCsv = ext === 'csv';
+  const isCsv = ext === 'csv' || ext === 'tsv';
+  const delimiter = ext === 'tsv' ? '\t' : ',';
 
   const reloadVersion = useFileReloadVersion(tab.path, { enabled: !dirty });
 
@@ -179,12 +181,12 @@ export default function XlsxPreview({ tab }) {
         // stack of unstyled labels and the canvas grid doesn't appear
         // (we hit this on first integration). The bundle ships its full
         // theme in a single 79 KB stylesheet via the preset entry.
-        const [{ createUniver }, { UniverSheetsCorePreset }, enUS, _css, res] = await Promise.all([
+        const [{ createUniver }, { UniverSheetsCorePreset }, enUS, _css, bytes] = await Promise.all([
           import('@univerjs/presets'),
           import('@univerjs/preset-sheets-core'),
           import('@univerjs/preset-sheets-core/locales/en-US'),
           import('@univerjs/preset-sheets-core/lib/index.css'),
-          invoke('read_file_base64', { path: tab.path }),
+          fetchFileBytes(tab.path),
         ]);
         if (cancelled) return;
 
@@ -192,10 +194,9 @@ export default function XlsxPreview({ tab }) {
         // through it for full style preservation.
         let snapshot;
         if (isCsv) {
-          const decoded = new TextDecoder('utf-8').decode(base64ToBytes(res.data));
-          snapshot = csvTextToUniverSnapshot(decoded, basename(tab.path));
+          const decoded = new TextDecoder('utf-8').decode(bytes);
+          snapshot = csvTextToUniverSnapshot(decoded, basename(tab.path), delimiter);
         } else {
-          const bytes = base64ToBytes(res.data);
           snapshot = await excelJsBufferToUniver(bytes.buffer, basename(tab.path));
         }
         if (cancelled) return;
@@ -308,7 +309,7 @@ export default function XlsxPreview({ tab }) {
       const snapshot = wb.save();
 
       if (isCsv) {
-        const csv = univerSnapshotToCsvText(snapshot);
+        const csv = univerSnapshotToCsvText(snapshot, delimiter);
         const b64 = bytesToBase64(new TextEncoder().encode(csv));
         await invoke('write_file_base64', { path: tab.path, data: b64 });
       } else {

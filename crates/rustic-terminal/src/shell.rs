@@ -187,7 +187,7 @@ impl TerminalManager {
             .emulator
             .lock()
             .map_err(|_| anyhow::anyhow!("emulator lock poisoned"))?;
-        Ok(emu.render_scrollback_ansi())
+        Ok(emu.render_rehydrate_ansi())
     }
 
     /// Record the most recent agent-issued command on a session (for UI display).

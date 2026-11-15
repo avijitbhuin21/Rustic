@@ -7,7 +7,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { useCodeCopyButtons } from '@/lib/code-copy';
-import { ZoomControls, ToolbarToggleGap, useCtrlWheelZoom } from './preview-zoom';
+import { ZoomControls, useCtrlWheelZoom } from './preview-zoom';
 
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 4;
@@ -99,7 +99,6 @@ export default function MarkdownPreview({ tab }) {
           onFit={() => setScale(1)}
           fitLabel="Reset zoom"
         />
-        <ToolbarToggleGap />
       </div>
       <div className="relative min-h-0 flex-1">
         <ScrollArea className="h-full w-full">

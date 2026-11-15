@@ -5,7 +5,6 @@ import { dirname, handleMarkdownLinkClick } from '@/lib/markdown-assets';
 import DOMPurify from 'dompurify';
 import { Skeleton } from '@/components/ui/skeleton';
 import { basename } from '@/state/editor';
-import { ToolbarToggleGap } from './preview-zoom';
 import { CanvasControls, PreviewCanvas, useCanvasView } from './preview-canvas';
 
 // The SVG spec's default intrinsic size, used when a document declares
@@ -128,7 +127,6 @@ export default function SvgPreview({ tab }) {
           {basename(tab.path)}
         </span>
       </div>
-      <ToolbarToggleGap />
     </>
   );
 

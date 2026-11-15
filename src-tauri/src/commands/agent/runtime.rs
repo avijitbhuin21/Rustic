@@ -259,6 +259,49 @@ pub(crate) fn decode_ask_user_images(
         .collect()
 }
 
+/// Queue a user message for a running task; the executor delivers it after the
+/// current tool call. Errors when the task isn't running so the UI can fall
+/// back to sending it normally.
+#[tauri::command]
+pub fn queue_mid_run_message(
+    state: State<'_, AppState>,
+    task_id: String,
+    id: String,
+    text: String,
+    images: Option<Vec<super::ImageAttachment>>,
+) -> Result<(), String> {
+    let running = state
+        .agent
+        .lock()
+        .map_err(|e| e.to_string())?
+        .cancellation_tokens
+        .contains_key(&task_id);
+    if !running {
+        return Err("Task is not running".into());
+    }
+    let images = decode_ask_user_images(images)
+        .into_iter()
+        .filter_map(|a| match a {
+            rustic_agent::tools::ToolAttachment::Image { media_type, data } => {
+                Some((media_type, data))
+            }
+            #[allow(unreachable_patterns)]
+            _ => None,
+        })
+        .collect();
+    rustic_agent::task::user_inbox::push(
+        &task_id,
+        rustic_agent::task::user_inbox::InboxMessage { id, text, images },
+    );
+    Ok(())
+}
+
+/// Withdraw a queued mid-run message. Returns true if it had not been delivered yet.
+#[tauri::command]
+pub fn cancel_mid_run_message(task_id: String, id: String) -> bool {
+    rustic_agent::task::user_inbox::remove(&task_id, &id)
+}
+
 /// Forward user answers to the parked `ask_user` tool. `cancelled` when user
 /// dismissed. `images` are any pictures the user attached to their answer.
 #[tauri::command]

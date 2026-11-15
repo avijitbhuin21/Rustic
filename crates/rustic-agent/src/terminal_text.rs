@@ -192,11 +192,95 @@ pub fn strip_trailing_prompt(text: &str) -> String {
 }
 
 /// Full cleanup pipeline for one command's output: sanitize, cut the echo, drop
-/// the trailing prompt.
+/// the trailing prompt. Sentinel-wrapped commands (see `wrap_posix_command`)
+/// are sliced exactly between their markers instead.
 pub fn clean_command_output(raw: &str, cmd: &str) -> String {
     let sanitized = sanitize_terminal_output(raw);
+    if let Some(body) = extract_sentinel_output(&sanitized) {
+        return body.output;
+    }
     let sliced = strip_command_echo(&sanitized, cmd);
     strip_trailing_prompt(&sliced)
+}
+
+const SENTINEL_BEGIN: &str = "__RSTC_B_";
+const SENTINEL_END: &str = "__RSTC_E_";
+
+/// Output of a sentinel-wrapped command, sliced between its markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentinelOutput {
+    pub output: String,
+    /// `None` while the command is still running (no end marker yet).
+    pub exit_code: Option<i32>,
+}
+
+/// Wraps `cmd` for a POSIX shell so it runs as ONE unit (multi-line scripts no
+/// longer hit `dquote>` continuation prompts) and its output is bracketed by
+/// markers. The markers are printed via octal escapes, so the echoed command
+/// line never contains the literal marker text and slicing is exact even when
+/// the echo wraps or is redrawn.
+pub fn wrap_posix_command(cmd: &str, nonce: u64) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(cmd.as_bytes());
+    format!(
+        " printf '\\137\\137RSTC_B_%s\\n' {nonce}; eval \"$(printf %s '{b64}' | base64 -d)\"; printf '\\n\\137\\137RSTC_E_%s_%d\\n' {nonce} \"$?\""
+    )
+}
+
+/// Finds the newest begin marker in sanitized output and returns what follows
+/// it, up to the matching end marker when present.
+pub fn extract_sentinel_output(sanitized: &str) -> Option<SentinelOutput> {
+    let begin_at = sanitized
+        .rmatch_indices(SENTINEL_BEGIN)
+        .find_map(|(i, _)| {
+            let line_start = i == 0 || sanitized[..i].ends_with('\n');
+            line_start.then_some(i)
+        })?;
+    let after_marker = &sanitized[begin_at + SENTINEL_BEGIN.len()..];
+    let nonce: String = after_marker
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if nonce.is_empty() {
+        return None;
+    }
+    let body_start = after_marker
+        .find('\n')
+        .map(|n| n + 1)
+        .unwrap_or(after_marker.len());
+    let body = &after_marker[body_start..];
+    let end_tag = format!("{SENTINEL_END}{nonce}_");
+    let (output, exit_code) = match body.find(&end_tag) {
+        Some(e) => {
+            let code: String = body[e + end_tag.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
+            (&body[..e], code.parse::<i32>().ok())
+        }
+        None => (body, None),
+    };
+    let mut out = output.trim_end_matches(['\n', ' ']).to_string();
+    if exit_code.is_none() {
+        out = strip_trailing_prompt(&out);
+    }
+    Some(SentinelOutput {
+        output: out,
+        exit_code,
+    })
+}
+
+/// Hides the sentinel wrapper's echo and marker lines from raw terminal text
+/// shown to the model by `read_terminal_output`.
+pub fn hide_sentinels(text: &str) -> String {
+    text.lines()
+        .filter(|l| {
+            !l.contains("\\137\\137RSTC_")
+                && !l.trim_start().starts_with(SENTINEL_BEGIN)
+                && !l.trim_start().starts_with(SENTINEL_END)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn trim_line(buf: &[char]) -> String {
@@ -383,6 +467,46 @@ mod tests {
                     ntext 0,8 | Select-Object -First 60; \"CARGO_DONE\"\n\
                     CARGO_DONE";
         assert_eq!(strip_command_echo(text, cmd), "CARGO_DONE");
+    }
+
+    #[test]
+    fn sentinel_slices_exact_output_despite_wrapped_echo() {
+        // Echo of the wrapper wraps and repaints (the tracker #3 garbling);
+        // the marker text only exists in real output, so slicing is exact.
+        let raw = "% \u{1b}[1m printf '\\137\\137RSTC_B_%s\\n' 7; eval \"$(printf %s 'Zm9y' | ba\rse64 -d)\"; printf '\\n\\137\\137RSTC_E_%s_%d\\n' 7 \"$?\"\n\
+                   __RSTC_B_7\n== a\nresult a\n== b\nresult b\n\n__RSTC_E_7_0\n% ";
+        let out = clean_command_output(raw, "for q in a b; do …; done");
+        assert_eq!(out, "== a\nresult a\n== b\nresult b");
+        let s = extract_sentinel_output(&sanitize_terminal_output(raw)).unwrap();
+        assert_eq!(s.exit_code, Some(0));
+    }
+
+    #[test]
+    fn sentinel_reports_nonzero_exit_and_running_state() {
+        let done = "__RSTC_B_3\nboom\n\n__RSTC_E_3_2\n$ ";
+        let s = extract_sentinel_output(done).unwrap();
+        assert_eq!((s.output.as_str(), s.exit_code), ("boom", Some(2)));
+        let running = "__RSTC_B_4\nstep 1\nstep 2";
+        let s = extract_sentinel_output(running).unwrap();
+        assert_eq!((s.output.as_str(), s.exit_code), ("step 1\nstep 2", None));
+    }
+
+    #[test]
+    fn sentinel_uses_newest_command_only() {
+        let raw = "__RSTC_B_1\nold\n\n__RSTC_E_1_0\n__RSTC_B_2\nnew\n\n__RSTC_E_2_0\n";
+        assert_eq!(extract_sentinel_output(raw).unwrap().output, "new");
+    }
+
+    #[test]
+    fn wrapper_is_single_line_and_round_trips_multiline_scripts() {
+        let cmd = "python3 - <<'EOF'\nprint(\"hi\")\nEOF";
+        let w = wrap_posix_command(cmd, 9);
+        assert!(!w.contains('\n'), "must be typed as one line");
+        assert!(
+            !w.contains(SENTINEL_BEGIN),
+            "echo must not contain the literal marker"
+        );
+        assert!(hide_sentinels(&format!("$ {w}\n__RSTC_B_9\nhi\n__RSTC_E_9_0")).trim() == "hi");
     }
 
     #[test]

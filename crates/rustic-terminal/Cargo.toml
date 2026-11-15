@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 serde = { workspace = true }
-portable-pty = "0.8"
+portable-pty = "0.9"
 anyhow = { workspace = true }
 # Headless terminal emulation — runs ALONGSIDE portable-pty (transport) and
 # xterm.js (the frontend renderer), never replacing either. Maintains an

@@ -300,8 +300,18 @@ export function modelSupportsAdaptiveThinking(modelId) {
     id.includes('opus-4-7') ||
     id.includes('opus-4-8') ||
     id.includes('opus-4-9') ||
-    id.includes('sonnet-4-6')
+    id.includes('sonnet-4-6') ||
+    claudeMajorVersion(id) >= 5
   );
+}
+
+/** Major version parsed from ids like `claude-haiku-5-5`; 0 when unknown. */
+function claudeMajorVersion(id) {
+  if (!id.startsWith('claude-')) return 0;
+  for (const seg of id.slice(7).split('-')) {
+    if (/^\d+$/.test(seg) && Number(seg) < 100) return Number(seg);
+  }
+  return 0;
 }
 
 // Best-effort human-readable name for a model id. Prefers the display name from
@@ -401,6 +411,49 @@ function isSyntheticInjection(text) {
     text.startsWith('SYSTEM: one or more background terminals') ||
     text.startsWith('<project_structure>')
   );
+}
+
+/** True for user-role entries with no real typed text (tool results, executor injections). */
+function isSyntheticUserMessage(m) {
+  const blocks = Array.isArray(m?.content) ? m.content : [];
+  const texts = blocks.filter((b) => b?.type === 'text' && typeof b.text === 'string');
+  if (texts.length === 0) return true;
+  return texts.every((b) => isSyntheticInjection(b.text));
+}
+
+/** The newest ask_user block in `messages` still waiting for an answer, or null. */
+export function findPendingAskUser(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const blocks = Array.isArray(list[i]?.content) ? list[i].content : [];
+    for (let j = blocks.length - 1; j >= 0; j--) {
+      const b = blocks[j];
+      if (b?.type !== 'ask_user') continue;
+      if (b.answered || b.cancelled || b.interrupted || !b.request_id) return null;
+      return b;
+    }
+  }
+  return null;
+}
+
+/** Text of the most recent real (non-injected) user message, clipped for a notification. */
+export function latestUserPrompt(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (m?.role !== 'user') continue;
+    const blocks = Array.isArray(m.content)
+      ? m.content
+      : [{ type: 'text', text: String(m.content ?? '') }];
+    const text = blocks
+      .filter((b) => b?.type === 'text' && !isSyntheticInjection(b.text))
+      .map((b) => b.text)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (text) return text.length > 140 ? `${text.slice(0, 139)}…` : text;
+  }
+  return undefined;
 }
 
 // SQLite stores `messages.created_at` as a UTC `YYYY-MM-DD HH:MM:SS` string.
@@ -1020,8 +1073,13 @@ export const useAgent = create((set, get) => ({
     for (const taskId of Object.keys(streamingByTask)) {
       if (streamingByTask[taskId]) preserveTaskIds.add(taskId);
     }
+    // Statuses arrive PascalCase from the backend ("Running"); a strict
+    // `=== 'running'` never matched, so a task paused mid-tool (stream idle,
+    // e.g. a long run_command) was evicted and only post-switch activity
+    // survived — the "history disappears during long tasks" bug.
+    const LIVE = new Set(['running', 'preparing', 'streaming', 'working', 'waiting', 'waitingonsubagents']);
     for (const taskId of Object.keys(statusByTask)) {
-      if (statusByTask[taskId] === 'running') preserveTaskIds.add(taskId);
+      if (LIVE.has(String(statusByTask[taskId] || '').toLowerCase())) preserveTaskIds.add(taskId);
     }
 
     const filterState = (stateMap) => {
@@ -1722,6 +1780,9 @@ export const useAgent = create((set, get) => ({
     const s = get();
     const task = [...(s.tasks || []), ...Object.values(s.tasksByProject).flat()].find((t) => t.id === taskId);
     if (!task) return;
+    if (!detail && (kind === 'completed' || kind === 'failed')) {
+      detail = latestUserPrompt(s.messagesByTask[taskId]);
+    }
     notifyTaskEvent({
       taskId,
       kind,
@@ -1835,26 +1896,67 @@ export const useAgent = create((set, get) => ({
     return item;
   },
 
+  /** Flags a queued item as held by the backend inbox (delivered mid-turn). */
+  _markQueuedInbox(taskId, id) {
+    set((s) => {
+      const list = s.queuedMessageByTask[taskId];
+      if (!list) return {};
+      return {
+        queuedMessageByTask: {
+          ...s.queuedMessageByTask,
+          [taskId]: list.map((q) => (q.id === id ? { ...q, inbox: true } : q)),
+        },
+      };
+    });
+  },
+
+  /** Turns inbox-delivered queue items into regular user messages in the transcript. */
+  _onUserMessagesInjected(taskId, ids) {
+    for (const id of ids || []) {
+      const q = get()._takeQueued(taskId, id);
+      if (q) get().appendUserMessage(taskId, q.text, q.attachments || []);
+    }
+  },
+
+  /**
+   * Pulls an inbox-held item back out of the backend before sending it some
+   * other way. Resolves false when the executor already delivered it.
+   */
+  async _withdrawFromInbox(taskId, item) {
+    if (!item?.inbox) return true;
+    try {
+      return !!(await safeInvoke('cancel_mid_run_message', { taskId, id: item.id }));
+    } catch {
+      return true;
+    }
+  },
+
   // Sends the oldest queued message, if any. Later items wait for the next
   // terminal status.
-  _flushQueuedMessage(taskId) {
+  async _flushQueuedMessage(taskId) {
     const queued = get()._takeQueued(taskId);
     if (!queued) return;
+    if (!(await get()._withdrawFromInbox(taskId, queued))) return;
     get()._sendMessageDirect(taskId, queued.text, queued.attachments, queued.thinkingBudget, queued.extras || {});
   },
 
   /** Sends a specific queued message immediately, interrupting the running turn. */
-  sendQueuedNow(taskId, id) {
+  async sendQueuedNow(taskId, id) {
     const q = get()._takeQueued(taskId, id);
     if (!q) return;
+    if (!(await get()._withdrawFromInbox(taskId, q))) return;
     get()._sendMessageDirect(taskId, q.text, q.attachments, q.thinkingBudget, q.extras || {});
   },
 
   /** Drops one queued message, or the whole queue when `id` is omitted. */
   discardQueued(taskId, id) {
     if (id) {
-      get()._takeQueued(taskId, id);
+      const q = get()._takeQueued(taskId, id);
+      get()._withdrawFromInbox(taskId, q);
       return;
+    }
+    for (const q of get().queuedMessageByTask[taskId] || []) {
+      get()._withdrawFromInbox(taskId, q);
     }
     set((s) => {
       const next = { ...s.queuedMessageByTask };
@@ -2239,6 +2341,21 @@ export const useAgent = create((set, get) => ({
       return;
     }
 
+    // A question is waiting on the user: the turn can't finish until it is
+    // answered, so a composer send (often with screenshots) IS the answer.
+    // Queuing it would strand the images until after the question resolved.
+    const pendingAsk = findPendingAskUser(get().messagesByTask[taskId]);
+    if (pendingAsk && get()._isTaskRunning(taskId)) {
+      const reply = (text || '').trim() || '(see attached images)';
+      const qs = Array.isArray(pendingAsk.questions) ? pendingAsk.questions : [];
+      const answers = qs.length === 1 && qs[0]?.id ? { [qs[0].id]: reply } : { reply };
+      await get().respondQuestion(pendingAsk.request_id, answers, {
+        cancelled: false,
+        images: attachments,
+      });
+      return;
+    }
+
     // A send while the task is mid-run used to cancel the running turn (the
     // backend's supersession path). Queue it instead and flush when the turn
     // reaches a terminal status; "Send now" keeps the old interrupt behaviour.
@@ -2249,7 +2366,22 @@ export const useAgent = create((set, get) => ({
         extras,
         thinkingBudget: thinkingTierToBudget(state.thinkingTier),
       });
-      toast.info('Message queued — will send when the current turn finishes', {
+      // Plain messages go to the backend inbox so the running turn picks
+      // them up right after its current tool call; goal/skill kickoffs keep
+      // the old send-after-turn path (they carry extras the inbox can't).
+      const plain = !extras || Object.keys(extras).length === 0;
+      if (plain) {
+        const images = (attachments || [])
+          .filter((a) => a && a.base64Data && a.mediaType)
+          .map((a) => ({ media_type: a.mediaType, data: a.base64Data }));
+        const nonImage = (attachments || []).some((a) => a && !(a.base64Data && a.mediaType));
+        if (!nonImage) {
+          safeInvoke('queue_mid_run_message', { taskId, id: queuedId, text: text || '', images })
+            .then(() => get()._markQueuedInbox(taskId, queuedId))
+            .catch(() => {});
+        }
+      }
+      toast.info('Message queued — the agent will see it after its current step', {
         id: `queued-${taskId}`,
         duration: 8000,
         action: {
@@ -2461,8 +2593,13 @@ export const useAgent = create((set, get) => ({
     });
   },
 
-  /** Repairs a history the provider permanently rejects (4xx), then resumes the task. */
-  async repairAndContinue(taskId, { auto = false } = {}) {
+  /**
+   * Repairs a history the provider permanently rejects (4xx), then resumes the task.
+   * `flatten` restarts the conversation from a plain-text transcript instead of
+   * patching blocks — the manual button always does this, and auto-repair falls
+   * back to it when targeted repair finds nothing to fix.
+   */
+  async repairAndContinue(taskId, { auto = false, flatten = !auto } = {}) {
     const entry = get().providerErrorByTask[taskId];
     if (!entry) return;
     const attemptNo = (entry.attempts || 0) + 1;
@@ -2471,12 +2608,16 @@ export const useAgent = create((set, get) => ({
       outcome = await safeInvoke('repair_task_history', {
         taskId,
         error: entry.error,
+        flatten,
       });
     } catch (e) {
       const msg = typeof e === 'string' ? e : e?.message || String(e);
       toast.error(`${auto ? 'Auto-repair' : 'Repair'} failed: ${msg}`);
       if (auto) get()._exhaustAutoRepair(taskId);
       return;
+    }
+    if ((!outcome || outcome.stubbed === 0) && !flatten) {
+      return get().repairAndContinue(taskId, { auto, flatten: true });
     }
     // Nothing was repairable — resuming would replay the exact same request
     // and hit the exact same 4xx. Don't burn a turn (and don't grow history
@@ -2488,6 +2629,15 @@ export const useAgent = create((set, get) => ({
           'No repairable content found in history — continuing would fail with the same error.',
       );
       return;
+    }
+    if (flatten && auto) {
+      // A flattened history that still fails can't be helped by more passes.
+      set((s) => ({
+        repairAttemptsByTask: {
+          ...s.repairAttemptsByTask,
+          [taskId]: { signature: providerErrorSignature(entry.error), count: MAX_AUTO_REPAIRS },
+        },
+      }));
     }
     toast.success(
       auto ? `Auto-repair ${attemptNo}/${MAX_AUTO_REPAIRS}: ${outcome.summary}` : outcome.summary,
@@ -2501,10 +2651,63 @@ export const useAgent = create((set, get) => ({
     await get().loadTaskHistory(taskId).catch(() => {});
     await get()._sendMessageDirect(
       taskId,
-      'The previous request failed with a provider error. The offending content in history has been converted to text notes. Continue from where you left off.',
+      flatten
+        ? 'The previous request failed with a provider error, so the conversation was restarted from the plain-text transcript above. Continue from where you left off.'
+        : 'The previous request failed with a provider error. The offending content in history has been converted to text notes. Continue from where you left off.',
       [],
       thinkingTierToBudget(get().thinkingTier),
     );
+  },
+
+  /**
+   * Deletes `userMsg` and everything after it from the task's history (UI,
+   * in-memory backend copy and DB) via `truncate_task_messages`.
+   */
+  async deleteFromMessage(taskId, userMsg) {
+    if (!taskId || !userMsg) return;
+    if (get()._isTaskRunning(taskId)) {
+      toast.error('Stop the agent before deleting messages.');
+      return;
+    }
+    const ok = await confirm({
+      title: 'Delete this message?',
+      description: 'This message and everything after it will be removed from the chat history. This cannot be undone.',
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!ok) return;
+    const userOrdinal = (list) =>
+      (list || []).filter((m) => m.role === 'user' && !isSyntheticUserMessage(m));
+    let sortOrder = userMsg.sortOrder;
+    if (typeof sortOrder !== 'number') {
+      // Live (not yet reloaded) messages carry no backend index: reload and
+      // find the same user message by its position among real user messages.
+      const ordinal = userOrdinal(get().messagesByTask[taskId]).indexOf(userMsg);
+      set((s) => {
+        const nextLoaded = { ...s.historyLoadedByTask };
+        delete nextLoaded[taskId];
+        return { historyLoadedByTask: nextLoaded };
+      });
+      await get().loadTaskHistory(taskId).catch(() => {});
+      sortOrder = userOrdinal(get().messagesByTask[taskId])[ordinal]?.sortOrder;
+    }
+    if (typeof sortOrder !== 'number') {
+      toast.error("This message can't be deleted (it was condensed out of the live history).");
+      return;
+    }
+    try {
+      await safeInvoke('truncate_task_messages', { taskId, keepCount: sortOrder });
+    } catch (e) {
+      toast.error(`Delete failed: ${typeof e === 'string' ? e : e?.message || e}`);
+      return;
+    }
+    set((s) => {
+      const nextLoaded = { ...s.historyLoadedByTask };
+      delete nextLoaded[taskId];
+      return { historyLoadedByTask: nextLoaded };
+    });
+    await get().loadTaskHistory(taskId).catch(() => {});
+    toast.success('Message and everything after it deleted.');
   },
 
   /**
@@ -2524,7 +2727,7 @@ export const useAgent = create((set, get) => ({
       providerErrorByTask: entry
         ? {
             ...s.providerErrorByTask,
-            [taskId]: { ...entry, autoExhausted: true },
+            [taskId]: { ...entry, attempts: (entry.attempts || 0) + 1, autoExhausted: true },
           }
         : s.providerErrorByTask,
     }));
@@ -3364,6 +3567,9 @@ export const useAgent = create((set, get) => ({
           status: 'failed',
           error: p.error || 'Sub-agent failed',
         });
+      },
+      'agent-user-messages-injected': (p) => {
+        if (p?.task_id) get()._onUserMessagesInjected(p.task_id, p.ids);
       },
       'agent-provider-error': (p) => {
         // A deterministic 4xx — retrying the same request can't fix it, but

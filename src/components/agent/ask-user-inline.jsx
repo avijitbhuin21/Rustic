@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { useAgent } from '@/state/agent';
 import { cn } from '@/lib/utils';
+import { MarkdownBlock } from './markdown-block';
 import {
   Check,
   CheckCircle2,
@@ -172,6 +173,18 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
         transition={{ duration: 0.2, ease: 'easeOut' }}
         className="overflow-hidden rounded-lg border border-border/70 bg-card shadow-sm"
         onPaste={onPaste}
+        onDragOver={(e) => {
+          if (Array.from(e.dataTransfer?.types || []).includes('Files')) e.preventDefault();
+        }}
+        onDrop={(e) => {
+          const files = Array.from(e.dataTransfer?.files || []).filter((f) =>
+            (f.type || '').startsWith('image/'),
+          );
+          if (files.length === 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+          addFiles(files);
+        }}
       >
         <div className="flex items-center justify-between gap-3 border-b border-border/60 px-3 py-2">
           <div className="text-xs font-medium">
@@ -508,7 +521,10 @@ function QuestionBody({ question, value, otherValue, onChange, onOtherChange, on
 
   return (
     <div className="space-y-2.5">
-      <div className="break-words text-sm font-medium leading-snug">{question.text}</div>
+      <MarkdownBlock
+        text={question.text}
+        className="break-words text-sm font-medium leading-snug [overflow-wrap:anywhere]"
+      />
 
       {kind === 'free_text' ? (
         <Textarea
@@ -649,9 +665,10 @@ function AnsweredView({ questions, answers }) {
             values.every((v) => v.length <= CHIP_ANSWER_MAX_CHARS && !v.includes('\n'));
           return (
             <div key={q.id ?? qi} className="min-w-0 space-y-1">
-              <div className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">
-                {q.text}
-              </div>
+              <MarkdownBlock
+                text={q.text}
+                className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]"
+              />
               {values.length === 0 ? (
                 <div className="text-xs italic text-muted-foreground">(no answer)</div>
               ) : allShort ? (

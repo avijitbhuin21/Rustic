@@ -30,6 +30,54 @@ import { IS_WEB } from '@/lib/platform';
 import { Section, isTauri } from './shared';
 import { RowGroup } from '../setting-row';
 
+// ─── Issue reporting ─────────────────────────────────────────────────────────
+
+/** Toggle for the agent auto-filing Rustic bugs it hits on the public tracker. */
+export function IssueReportingSection() {
+  const [enabled, setEnabled] = useState(true);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    invoke('get_ai_config')
+      .then((cfg) => setEnabled(!cfg?.disable_auto_report_issues))
+      .catch(() => {});
+  }, []);
+
+  const toggle = async (next) => {
+    setEnabled(next);
+    try {
+      await invoke('set_auto_report_issues', { enabled: next });
+    } catch (e) {
+      setEnabled(!next);
+      toastError(null, e);
+    }
+  };
+
+  return (
+    <Section
+      title="Issue reporting"
+      info="Lets the agent report bugs in Rustic itself to the public issue tracker."
+    >
+      <RowGroup inset>
+        <div className="flex items-start justify-between gap-3 px-3 py-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5 text-[13px] font-medium">
+              Auto-report Rustic bugs
+              <InfoTip>
+                When the agent hits a problem in Rustic itself (a tool misbehaving, a provider error,
+                a UI glitch) it files it on rustic.avijitbhuin.com/issues without asking — after
+                checking for duplicates and scrubbing secrets and private paths. At most 3 per task;
+                the links appear in its summary. Issues are public.
+              </InfoTip>
+            </div>
+          </div>
+          <Switch checked={enabled} onCheckedChange={toggle} />
+        </div>
+      </RowGroup>
+    </Section>
+  );
+}
+
 // ─── Budget ──────────────────────────────────────────────────────────────────
 
 export function BudgetSection() {

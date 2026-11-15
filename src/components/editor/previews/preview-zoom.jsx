@@ -74,11 +74,3 @@ export function useCtrlWheelZoom(ref, { scale, onScaleChange, minScale = 0.25, m
     return () => el.removeEventListener('wheel', onWheel);
   }, [ref, scale, onScaleChange, minScale, maxScale]);
 }
-
-/**
- * Spacer that keeps preview toolbars clear of the floating Edit ⇄ Preview
- * toggle that editor-pane.jsx overlays at the top-right of these panes.
- */
-export function ToolbarToggleGap() {
-  return <div className="w-24 shrink-0" aria-hidden />;
-}

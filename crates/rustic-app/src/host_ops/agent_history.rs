@@ -220,6 +220,81 @@ pub fn merge_archived_history(
     out
 }
 
+/// Archives a task's live history and replaces it with the flattened restart
+/// form (`rustic_agent::task::repair::flatten_for_restart`). The archived rows
+/// keep the full conversation visible in the transcript; the returned messages
+/// are what the host must install as the in-memory `task.messages`.
+pub fn flatten_task_history(
+    db: &rustic_db::Database,
+    task_id: &str,
+) -> Result<Vec<Message>, String> {
+    let rows = db
+        .get_messages_for_task(task_id)
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Err("No persisted messages found for this task".into());
+    }
+    let messages: Vec<Message> = rows
+        .iter()
+        .map(|row| {
+            let role = match row.role.as_str() {
+                "assistant" => Role::Assistant,
+                "system" => Role::System,
+                _ => Role::User,
+            };
+            let content: Vec<ContentBlock> = serde_json::from_str(&row.content_json)
+                .unwrap_or_else(|_| {
+                    vec![ContentBlock::Text {
+                        text: row.content_json.clone(),
+                    }]
+                });
+            Message { role, content }
+        })
+        .collect();
+    let (restarted, start) = rustic_agent::task::repair::flatten_for_restart(&messages);
+    let archived: Vec<(String, String)> = rows[start..]
+        .iter()
+        .filter(|r| !rustic_agent::is_condense_artifact_json(&r.content_json))
+        .map(|r| (r.role.clone(), r.content_json.clone()))
+        .collect();
+    db.append_archived_messages(task_id, &archived)
+        .map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut new_rows = Vec::with_capacity(restarted.len());
+    for (i, msg) in restarted.iter().enumerate() {
+        let template = &rows[i.min(rows.len() - 1)];
+        new_rows.push(rustic_db::models::MessageRow {
+            id: if i < start {
+                template.id.clone()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            },
+            task_id: task_id.to_string(),
+            role: if matches!(msg.role, Role::Assistant) {
+                "assistant".into()
+            } else {
+                "user".into()
+            },
+            content_json: rustic_agent::media_store::content_json(&msg.content)
+                .map_err(|e| e.to_string())?,
+            created_at: if i < start {
+                template.created_at.clone()
+            } else {
+                now.clone()
+            },
+            sort_order: i as i64,
+            turn_usage_json: if i < start {
+                template.turn_usage_json.clone()
+            } else {
+                None
+            },
+        });
+    }
+    db.replace_messages_for_task(task_id, &new_rows)
+        .map_err(|e| e.to_string())?;
+    Ok(restarted)
+}
+
 /// F-11 (Medium): max characters of an MCP tool description embedded in the
 /// system prompt. A hostile or compromised MCP server can otherwise inject
 /// arbitrarily long "ignore previous instructions" payloads.

@@ -50,6 +50,15 @@ fn supports_adaptive_thinking(model: &str) -> bool {
         || model.contains("opus-4-9")
         || model.contains("opus-4-6")
         || model.contains("sonnet-4-6")
+        || claude_major_version(model).is_some_and(|v| v >= 5)
+}
+
+/// Major version from ids like `claude-haiku-5-5` / `claude-opus-5-1-2026…`.
+/// Every Claude 5+ model is adaptive-only and rejects `temperature`.
+fn claude_major_version(model: &str) -> Option<u32> {
+    let rest = model.strip_prefix("claude-")?;
+    rest.split('-')
+        .find_map(|seg| seg.parse::<u32>().ok().filter(|n| *n < 100))
 }
 
 /// Map the user-facing `thinking_budget` token count onto an adaptive-mode
@@ -146,11 +155,21 @@ impl AiProvider for ClaudeProvider {
         // entirely regardless of model.
         let use_adaptive =
             config.supports_adaptive_thinking || supports_adaptive_thinking(&config.model);
+        let mut thinking_binding_beta = false;
+        let thinking_on =
+            config.thinking_budget > 0 && (use_adaptive || config.supports_reasoning_effort);
+        if !thinking_on {
+            // With thinking off the API has no use for replayed thinking, and a
+            // stale signed block can still fail the prefix check — omit them.
+            if let Some(msgs) = body["messages"].as_array_mut() {
+                strip_thinking_blocks(msgs);
+            }
+        }
         // Adaptive models drive thinking off the adaptive flag alone: their
         // `supports_reasoning_effort` capability is hidden (and stored false)
         // in the UI, so requiring it here would silently disable thinking.
         // Non-adaptive models still gate on the reasoning-effort capability.
-        if config.thinking_budget > 0 && (use_adaptive || config.supports_reasoning_effort) {
+        if thinking_on {
             tracing::info!(
                 "[claude] thinking mode for {}: {} (config flag={}, model-id match={})",
                 config.model,
@@ -163,13 +182,22 @@ impl AiProvider for ClaudeProvider {
                 supports_adaptive_thinking(&config.model),
             );
             if use_adaptive {
-                body["thinking"] = json!({
+                let mut thinking = json!({
                     "type": "adaptive",
                     // Opus 4.7 defaults `display` to "omitted" (thinking field
                     // empty, signature still present). Force summarized so the
                     // UI can render thinking blocks like on older models.
                     "display": "summarized",
                 });
+                if binds_thinking_to_prefix(config.base_url.as_deref()) {
+                    // Claude 5.x binds each thinking signature to the exact prefix
+                    // that produced it; condensation, tool-result clearing and
+                    // model/effort switches all rewrite that prefix. Let the API
+                    // drop stale blocks instead of 400ing the whole turn.
+                    thinking["block_binding"] = json!({ "prefix_mismatch_behavior": "drop_block" });
+                    thinking_binding_beta = true;
+                }
+                body["thinking"] = thinking;
                 body["output_config"] = json!({
                     "effort": budget_to_effort(config.thinking_budget),
                 });
@@ -259,6 +287,9 @@ impl AiProvider for ClaudeProvider {
         }
         if saw_web_fetch || config.web_fetch_enabled {
             betas.push("web-fetch-2025-09-10");
+        }
+        if thinking_binding_beta {
+            betas.push("thinking-binding-controls-2026-08-01");
         }
         if !betas.is_empty() {
             request = request.header("anthropic-beta", betas.join(","));
@@ -1168,9 +1199,60 @@ fn drop_orphan_server_tool_blocks(
     std::borrow::Cow::Owned(kept)
 }
 
+/// True when requests go to Anthropic's own endpoint, the only place the
+/// `thinking-binding-controls` beta is known to be accepted.
+fn binds_thinking_to_prefix(base_url: Option<&str>) -> bool {
+    base_url
+        .map(|u| u.contains("api.anthropic.com"))
+        .unwrap_or(true)
+}
+
+/// Removes thinking/redacted_thinking blocks from wire messages, dropping any
+/// message that ends up empty.
+fn strip_thinking_blocks(msgs: &mut Vec<serde_json::Value>) {
+    for m in msgs.iter_mut() {
+        if let Some(content) = m.get_mut("content").and_then(|c| c.as_array_mut()) {
+            content.retain(|b| {
+                !matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            });
+        }
+    }
+    msgs.retain(|m| {
+        m.get("content")
+            .and_then(|c| c.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(true)
+    });
+}
+
+/// Splits text blocks that trail an assistant's last tool_use off the message.
+/// Text after tool_use is not a valid assistant shape for Claude 5 (it was
+/// rejected as prefill); the returned blocks are carried into the next user turn.
+fn split_trailing_text_after_tool_use(
+    content: &mut Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let Some(last_tool) = content
+        .iter()
+        .rposition(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+    else {
+        return Vec::new();
+    };
+    let tail_is_text = content[last_tool + 1..]
+        .iter()
+        .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"));
+    if !tail_is_text || last_tool + 1 == content.len() {
+        return Vec::new();
+    }
+    content.split_off(last_tool + 1)
+}
+
 fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Value>) {
     let mut system = None;
     let mut api_msgs = Vec::new();
+    let mut carried_text: Vec<serde_json::Value> = Vec::new();
 
     for msg in messages {
         match msg.role {
@@ -1181,7 +1263,20 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Va
             }
             Role::User => {
                 let sanitized = drop_orphan_server_tool_blocks(&msg.content);
-                let content = tool_results_first(convert_content_blocks(&sanitized));
+                let mut content = tool_results_first(convert_content_blocks(&sanitized));
+                if !carried_text.is_empty() {
+                    if let Some(arr) = content.as_array_mut() {
+                        let at = arr
+                            .iter()
+                            .position(|b| {
+                                b.get("type").and_then(|t| t.as_str()) != Some("tool_result")
+                            })
+                            .unwrap_or(arr.len());
+                        for (i, b) in carried_text.drain(..).enumerate() {
+                            arr.insert(at + i, b);
+                        }
+                    }
+                }
                 // A message left empty after stripping orphans is invalid to
                 // send — skip it rather than 400 on "content cannot be empty".
                 if content.as_array().map(|a| a.is_empty()).unwrap_or(false) {
@@ -1191,13 +1286,20 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Va
             }
             Role::Assistant => {
                 let sanitized = drop_orphan_server_tool_blocks(&msg.content);
-                let content = convert_content_blocks(&sanitized);
+                let mut content = convert_content_blocks(&sanitized);
+                if let Some(arr) = content.as_array_mut() {
+                    carried_text.extend(split_trailing_text_after_tool_use(arr));
+                }
                 if content.as_array().map(|a| a.is_empty()).unwrap_or(false) {
                     continue;
                 }
                 api_msgs.push(json!({ "role": "assistant", "content": content }));
             }
         }
+    }
+
+    if !carried_text.is_empty() {
+        api_msgs.push(json!({ "role": "user", "content": carried_text }));
     }
 
     // Claude 4.6+ models reject assistant prefill ("conversation must end with
@@ -1616,6 +1718,58 @@ mod orphan_server_tool_tests {
         }];
         let (_sys, api) = convert_messages(&ends_user);
         assert_eq!(api.len(), 1, "a user-terminated history is left alone");
+    }
+
+    #[test]
+    fn claude_five_plus_is_adaptive_and_older_is_not() {
+        assert!(supports_adaptive_thinking("claude-haiku-5-5"));
+        assert!(supports_adaptive_thinking("claude-opus-5-1-20260922"));
+        assert!(!supports_adaptive_thinking("claude-haiku-4-5-20251001"));
+        assert!(!supports_adaptive_thinking("claude-3-5-sonnet-20241022"));
+        assert!(!supports_adaptive_thinking("claude-sonnet-4-5-20250929"));
+    }
+
+    #[test]
+    fn text_after_tool_use_moves_into_next_user_turn() {
+        let tool_use = ContentBlock::ToolUse {
+            id: "toolu_1".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![text("go")],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![text("reading"), tool_use, text("[server note]")],
+            },
+            Message {
+                role: Role::User,
+                content: vec![result("toolu_1", "ok")],
+            },
+        ];
+        let (_sys, api) = convert_messages(&messages);
+        assert_eq!(api.len(), 3);
+        let asst = api[1]["content"].as_array().unwrap();
+        assert_eq!(asst.last().unwrap()["type"], "tool_use");
+        let user = api[2]["content"].as_array().unwrap();
+        assert_eq!(user[0]["type"], "tool_result");
+        assert_eq!(user[1]["text"], "[server note]");
+    }
+
+    #[test]
+    fn strip_thinking_drops_emptied_messages() {
+        let mut msgs = vec![
+            json!({"role":"user","content":[{"type":"text","text":"q"}]}),
+            json!({"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":"s"}]}),
+            json!({"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":"s"},{"type":"text","text":"a"}]}),
+        ];
+        strip_thinking_blocks(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 1);
     }
 
     #[test]

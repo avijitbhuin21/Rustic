@@ -13,6 +13,7 @@ pub mod retry_now;
 pub mod subagent;
 pub mod terminal_broker;
 pub mod tool_search;
+pub mod user_inbox;
 
 use crate::provider::Message;
 use crate::task::cost::TaskCost;
@@ -157,6 +158,13 @@ pub enum TaskEvent {
     /// The provider rejected a request parameter with a deterministic 400 and
     /// the executor retried without it. Hosts persist `overrides` as the
     /// model's `request_params` so the next run never hits the error again.
+    /// Mid-run user messages (from `user_inbox`) were appended to history.
+    /// `ids` are the frontend queue ids so the UI can turn its queued chips
+    /// into real user messages.
+    UserMessagesInjected {
+        task_id: String,
+        ids: Vec<String>,
+    },
     ModelParamLearned {
         task_id: String,
         model: String,

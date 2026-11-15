@@ -73,8 +73,11 @@ function macLineEditSequence(e) {
 // as WOFF2 guarantees the same cell metrics + glyph coverage on every machine —
 // the previous stack relied on a system-installed Cascadia Mono and silently
 // fell back to Consolas (different metrics) when it was absent, which is what
-// made block/Unicode glyphs render misaligned. The tail is fallback-only.
-const TERMINAL_FONT_FAMILY = "'Victor Mono', 'Cascadia Mono', Consolas, monospace";
+// made block/Unicode glyphs render misaligned. The tail is fallback-only; the
+// symbol fonts cover TUI spinner/status glyphs (Claude Code's ✻ ✶ ⏺) that
+// Victor Mono lacks — without them macOS painted those cells as "???".
+const TERMINAL_FONT_FAMILY =
+  "'Victor Mono', 'Cascadia Mono', Menlo, Consolas, 'Apple Symbols', 'Segoe UI Symbol', 'Noto Sans Symbols 2', 'Apple Color Emoji', 'Segoe UI Emoji', monospace";
 
 // VS Code's terminal palette. Without these xterm.js falls back to its own
 // defaults, which are saturated near-pure ANSI colors (#ff0000 red, etc.).
@@ -262,6 +265,19 @@ function createTerminalInstance(sessionId) {
   let pasteListenerTarget = null;
   let lastCols = 0;
   let lastRows = 0;
+  // Size last sent to the PTY. Every SIGWINCH makes an inline TUI redraw (and
+  // can leave a duplicate frame), so never send the same size twice.
+  let ptyCols = 0;
+  let ptyRows = 0;
+  /** Sends the view's size to the PTY if it differs from the last one sent; true when sent. */
+  const sendPtySize = () => {
+    if (!term || !(term.cols > 0 && term.rows > 0)) return false;
+    if (term.cols === ptyCols && term.rows === ptyRows) return false;
+    ptyCols = term.cols;
+    ptyRows = term.rows;
+    useTerminal.getState().resizeTerminal(sessionId, term.cols, term.rows);
+    return true;
+  };
   // Escape hatch / A-B test: set localStorage 'rustic.terminal.renderer' to
   // 'dom' to disable the WebGL renderer. The DOM renderer has no glyph texture
   // atlas, so it can't garble scrollback — handy to confirm an atlas issue or as
@@ -520,7 +536,7 @@ function createTerminalInstance(sessionId) {
         firstRenderDisposable = null;
         try { fit?.fit(); } catch (_) {}
         if (term?.cols > 0 && term?.rows > 0) {
-          useTerminal.getState().resizeTerminal(sessionId, term.cols, term.rows);
+          sendPtySize();
         }
         loadWebgl();
       });
@@ -641,9 +657,28 @@ function createTerminalInstance(sessionId) {
       }
 
       if (term.cols > 0 && term.rows > 0) {
-        useTerminal.getState().resizeTerminal(sessionId, term.cols, term.rows);
+        lastCols = term.cols;
+        lastRows = term.rows;
+        sendPtySize();
       }
     });
+  };
+
+  // Drag-resizing fires dozens of size changes per second. Sending each to the
+  // pty made inline TUIs (Claude Code, Codex, Antigravity) redraw mid-drag, and
+  // every redraw of a frame taller than the screen leaves a copy in scrollback
+  // ("repeated output"). The view fits instantly; the pty gets ONE resize once
+  // the drag settles, and only if its size actually changed — measured on an
+  // Ink-style redraw: a two-step nudge left 3 copies, an exact resize 1.
+  let ptyResizeTimer = null;
+  const PTY_RESIZE_SETTLE_MS = 150;
+  const schedulePtyResize = () => {
+    if (ptyResizeTimer) clearTimeout(ptyResizeTimer);
+    ptyResizeTimer = setTimeout(() => {
+      ptyResizeTimer = null;
+      if (disposed || !term) return;
+      if (sendPtySize()) scheduleRepaint();
+    }, PTY_RESIZE_SETTLE_MS);
   };
 
   const refit = () => {
@@ -656,8 +691,7 @@ function createTerminalInstance(sessionId) {
           (term.cols !== lastCols || term.rows !== lastRows)) {
         lastCols = term.cols;
         lastRows = term.rows;
-        useTerminal.getState().resizeTerminal(sessionId, term.cols, term.rows);
-        scheduleRepaint();
+        schedulePtyResize();
       }
     } catch (_) {}
   };
@@ -675,6 +709,7 @@ function createTerminalInstance(sessionId) {
   let repaintTimer = null;
   const scheduleRepaint = () => {
     if (repaintTimer) clearTimeout(repaintTimer);
+    if (ptyResizeTimer) clearTimeout(ptyResizeTimer);
     repaintTimer = setTimeout(() => {
       repaintTimer = null;
       repaint();

@@ -49,6 +49,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Read-only access to the SQLite conversation stores the Antigravity CLI keeps
 # outside Rustic; `bundled` matches rustic-db so both link one libsqlite3.
 rusqlite = { version = "0.41", features = ["bundled"] }
+heifer = { version = "0.5", default-features = false }
+image = { workspace = true }
+symphonia = { version = "0.6", features = ["all"] }
 
 [lints]
 workspace = true

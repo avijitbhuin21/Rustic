@@ -95,6 +95,8 @@ pub async fn dispatch(
         "abort_task" => abort_task(ctx, args),
         "respond_to_permission" => respond_to_permission(ctx, args),
         "respond_to_ask_user" => respond_to_ask_user(ctx, args),
+        "queue_mid_run_message" => queue_mid_run_message(ctx, args),
+        "cancel_mid_run_message" => cancel_mid_run_message(args),
         "respond_to_ceiling_breach" => respond_to_ceiling_breach(ctx, args),
         "set_task_sensitive_access" => set_task_sensitive_access(ctx, args),
         "retry_stream_now" => retry_stream_now(args),
@@ -1330,6 +1332,12 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                         TaskEvent::SubagentThinkingDelta { task_id, agent_id, text } => {
                             ctx_events.emit("agent-subagent-thinking-delta", AgentSubagentThinkingDeltaEvent { task_id, agent_id, text });
                         }
+                        TaskEvent::UserMessagesInjected { task_id, ids } => {
+                            ctx_events.emit("agent-user-messages-injected", serde_json::json!({
+                                "task_id": task_id,
+                                "ids": ids,
+                            }));
+                        }
                         TaskEvent::ModelParamLearned { task_id, model, param, action, overrides } => {
                             {
                                 let mut agent = ctx_events.state().agent.lock_safe();
@@ -2177,6 +2185,15 @@ fn build_turn_prep(
     } else {
         system_prompt
     };
+    let system_prompt = if agent.ai_config.disable_auto_report_issues {
+        system_prompt
+    } else {
+        format!(
+            "{}{}",
+            system_prompt,
+            rustic_agent::issue_reporting_addendum()
+        )
+    };
 
     let thinking_budget_val = thinking_budget.unwrap_or_else(|| {
         let user_override = provider_entry.custom_thinking_budget;
@@ -2484,6 +2501,8 @@ fn truncate_task_messages(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
 struct RepairArg {
     task_id: String,
     error: String,
+    #[serde(default)]
+    flatten: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -2497,6 +2516,24 @@ struct RepairOutcome {
 fn repair_task_history(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: RepairArg = crate::api::parse(args)?;
     let state = ctx.state();
+
+    if a.flatten {
+        let restarted = {
+            let db = state.db.lock_safe();
+            rustic_app::host_ops::agent_history::flatten_task_history(&db, &a.task_id)?
+        };
+        tracing::info!(target: "rustic::repair_task_history", task = %a.task_id, "history flattened for restart");
+        let mut agent = state.agent.lock_safe();
+        if let Some(task) = agent.tasks.get_mut(&a.task_id) {
+            task.messages = restarted;
+        }
+        return ok(RepairOutcome {
+            stubbed: 1,
+            targeted: false,
+            summary: "Restarted the conversation from a plain-text transcript of the history."
+                .into(),
+        });
+    }
 
     let mut rows: Vec<MessageRow> = {
         let db = state.db.lock_safe();
@@ -3020,6 +3057,66 @@ struct RespondAskUserArg {
     // Pictures the user attached to their answer ({ media_type, data } base64).
     #[serde(default)]
     images: Option<Vec<ImageAttachment>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueMidRunArg {
+    task_id: String,
+    id: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    images: Option<Vec<ImageAttachment>>,
+}
+
+/// Queue a user message for a running task (delivered after the current tool call).
+fn queue_mid_run_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    let a: QueueMidRunArg = crate::api::parse(args)?;
+    let running = ctx
+        .state()
+        .agent
+        .lock_safe()
+        .cancellation_tokens
+        .contains_key(&a.task_id);
+    if !running {
+        return Err("Task is not running".into());
+    }
+    let images = {
+        use base64::Engine as _;
+        a.images
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|img| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(img.data.as_bytes())
+                    .ok()
+                    .map(|bytes| (img.media_type, bytes))
+            })
+            .collect()
+    };
+    rustic_agent::task::user_inbox::push(
+        &a.task_id,
+        rustic_agent::task::user_inbox::InboxMessage {
+            id: a.id,
+            text: a.text,
+            images,
+        },
+    );
+    ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelMidRunArg {
+    task_id: String,
+    id: String,
+}
+
+/// Withdraw a queued mid-run message; true when it had not been delivered yet.
+fn cancel_mid_run_message(args: &Value) -> Result<Value, ApiError> {
+    let a: CancelMidRunArg = crate::api::parse(args)?;
+    ok(rustic_agent::task::user_inbox::remove(&a.task_id, &a.id))
 }
 
 fn respond_to_ask_user(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {

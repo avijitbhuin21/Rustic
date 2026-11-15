@@ -64,6 +64,7 @@ pub async fn dispatch(
         "get_budget_settings" => get_budget_settings(ctx),
         "set_subagent_concurrency_cap" => set_subagent_concurrency_cap(ctx, args),
         "set_condense_threshold" => set_condense_threshold(ctx, args),
+        "set_auto_report_issues" => set_auto_report_issues(ctx, args),
         "get_subagent_concurrency_cap" => get_subagent_concurrency_cap(ctx),
 
         // ── models ─────────────────────────────────────────────────────
@@ -605,6 +606,20 @@ fn set_condense_threshold(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
     let a: CondenseThresholdArg = parse(args)?;
     let mut agent = ctx.state().agent.lock_safe();
     agent.ai_config.condense_threshold = a.tokens;
+    persist_ai_config(ctx, &agent.ai_config)?;
+    ok(())
+}
+
+#[derive(Deserialize)]
+struct AutoReportArg {
+    enabled: bool,
+}
+
+/// Turn the agent's automatic Rustic bug reporting on or off. Mirrors desktop.
+fn set_auto_report_issues(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    let a: AutoReportArg = parse(args)?;
+    let mut agent = ctx.state().agent.lock_safe();
+    agent.ai_config.disable_auto_report_issues = !a.enabled;
     persist_ai_config(ctx, &agent.ai_config)?;
     ok(())
 }

@@ -55,7 +55,8 @@ pub use skills::{
 };
 pub use system_prompt::{
     build_project_tree_block, build_subagent_prompt, build_system_prompt, is_project_tree_block,
-    models_from_providers, plan_mode_addendum, shell_env, PROJECT_TREE_CLOSE, PROJECT_TREE_OPEN,
+    issue_reporting_addendum, models_from_providers, plan_mode_addendum, shell_env,
+    PROJECT_TREE_CLOSE, PROJECT_TREE_OPEN,
 };
 pub use task::condense::{
     is_condense_artifact_blocks, is_condense_artifact_json, is_condense_artifact_values,

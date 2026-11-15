@@ -126,6 +126,21 @@ pub trait AgentTerminals: Send + Sync {
     /// command inside it).
     fn send_command(&self, session_id: u64, command: &str, task_id: &str) -> Result<(), String>;
 
+    /// Like `send_command`, but types `line` into the pty while recording
+    /// `display` as the command shown in the UI and in completion notices.
+    /// Used for sentinel-wrapped commands; brokers that don't override it
+    /// just type `line`.
+    fn send_command_line(
+        &self,
+        session_id: u64,
+        display: &str,
+        line: &str,
+        task_id: &str,
+    ) -> Result<(), String> {
+        let _ = display;
+        self.send_command(session_id, line, task_id)
+    }
+
     /// Read the tail of a terminal's buffered output as a UTF-8 string.
     fn read_output(&self, session_id: u64, max_bytes: usize) -> Result<String, String>;
 

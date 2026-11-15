@@ -156,60 +156,12 @@ impl TerminalEmulator {
     /// rows are preserved so spacing in the original output survives.
     pub fn render_scrollback_ansi(&self) -> String {
         let grid = self.term.grid();
-        let cols = grid.columns();
         let history = grid.history_size() as i32;
         let screen = grid.screen_lines() as i32;
 
         let mut rows: Vec<String> = Vec::with_capacity((history + screen) as usize);
         for line in (-history)..screen {
-            let row = &grid[Line(line)];
-
-            // Rightmost column worth emitting: a non-space glyph, or any cell
-            // carrying visible styling (inverse/underline/strikeout or a
-            // non-default background) that a bare trailing space would lose.
-            let mut last_col: i32 = -1;
-            for c in 0..cols {
-                let cell = &row[Column(c)];
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                let blank = cell.c == ' '
-                    && is_default_bg(&cell.bg)
-                    && !cell
-                        .flags
-                        .intersects(Flags::INVERSE | Flags::UNDERLINE | Flags::STRIKEOUT);
-                if !blank {
-                    last_col = c as i32;
-                }
-            }
-
-            if last_col < 0 {
-                rows.push(String::new());
-                continue;
-            }
-
-            let mut s = String::new();
-            let mut cur_sgr = String::new();
-            for c in 0..=(last_col as usize) {
-                let cell = &row[Column(c)];
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                let sgr = cell_sgr(cell.fg, cell.bg, cell.flags);
-                if sgr != cur_sgr {
-                    s.push_str(&sgr);
-                    cur_sgr = sgr;
-                }
-                s.push(if cell.c == '\0' { ' ' } else { cell.c });
-            }
-            s.push_str("\x1b[0m");
-            rows.push(s);
+            rows.push(self.render_row_ansi(line));
         }
 
         // Trim fully-blank leading and trailing rows (a tall screen over short
@@ -222,6 +174,117 @@ impl TerminalEmulator {
         }
 
         rows.join("\r\n")
+    }
+
+    /// State snapshot for (re)attaching an xterm view: screen contents PLUS the
+    /// terminal modes the running program set. Without the modes a TUI that
+    /// lives in the alternate screen (Claude Code, vim, htop) was replayed into
+    /// xterm's MAIN buffer; its next full redraws then pushed every old frame
+    /// into scrollback — the "repeated frames" bug, on every platform. Also
+    /// restores cursor position/visibility and input modes (app cursor keys,
+    /// bracketed paste, mouse reporting) so keys and clicks keep working.
+    pub fn render_rehydrate_ansi(&self) -> String {
+        use alacritty_terminal::term::TermMode;
+        let mode = *self.term.mode();
+        let grid = self.term.grid();
+        let mut out = String::new();
+        if mode.contains(TermMode::ALT_SCREEN) {
+            // Enter the alternate screen and paint each row at its absolute
+            // position — the program addresses rows by number, so no trimming.
+            out.push_str("\x1b[?1049h\x1b[H\x1b[2J");
+            for line in 0..grid.screen_lines() as i32 {
+                let row = self.render_row_ansi(line);
+                if !row.is_empty() {
+                    out.push_str(&format!("\x1b[{};1H{}", line + 1, row));
+                }
+            }
+        } else {
+            out.push_str(&self.render_scrollback_ansi());
+        }
+        let cursor = grid.cursor.point;
+        if mode.contains(TermMode::ALT_SCREEN) {
+            out.push_str(&format!(
+                "\x1b[{};{}H",
+                cursor.line.0 + 1,
+                cursor.column.0 + 1
+            ));
+        }
+        let flags: [(TermMode, &str); 10] = [
+            (TermMode::APP_CURSOR, "\x1b[?1h"),
+            (TermMode::APP_KEYPAD, "\x1b="),
+            (TermMode::BRACKETED_PASTE, "\x1b[?2004h"),
+            (TermMode::MOUSE_REPORT_CLICK, "\x1b[?1000h"),
+            (TermMode::MOUSE_DRAG, "\x1b[?1002h"),
+            (TermMode::MOUSE_MOTION, "\x1b[?1003h"),
+            (TermMode::UTF8_MOUSE, "\x1b[?1005h"),
+            (TermMode::SGR_MOUSE, "\x1b[?1006h"),
+            (TermMode::FOCUS_IN_OUT, "\x1b[?1004h"),
+            (TermMode::ALTERNATE_SCROLL, "\x1b[?1007h"),
+        ];
+        for (flag, seq) in flags {
+            if mode.contains(flag) {
+                out.push_str(seq);
+            }
+        }
+        if !mode.contains(TermMode::SHOW_CURSOR) {
+            out.push_str("\x1b[?25l");
+        }
+        if !mode.contains(TermMode::LINE_WRAP) {
+            out.push_str("\x1b[?7l");
+        }
+        out
+    }
+
+    /// One grid row as ANSI text (styles reset at the end); empty when blank.
+    fn render_row_ansi(&self, line: i32) -> String {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let row = &grid[Line(line)];
+
+        // Rightmost column worth emitting: a non-space glyph, or any cell
+        // carrying visible styling (inverse/underline/strikeout or a
+        // non-default background) that a bare trailing space would lose.
+        let mut last_col: i32 = -1;
+        for c in 0..cols {
+            let cell = &row[Column(c)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let blank = cell.c == ' '
+                && is_default_bg(&cell.bg)
+                && !cell
+                    .flags
+                    .intersects(Flags::INVERSE | Flags::UNDERLINE | Flags::STRIKEOUT);
+            if !blank {
+                last_col = c as i32;
+            }
+        }
+        if last_col < 0 {
+            return String::new();
+        }
+
+        let mut s = String::new();
+        let mut cur_sgr = String::new();
+        for c in 0..=(last_col as usize) {
+            let cell = &row[Column(c)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let sgr = cell_sgr(cell.fg, cell.bg, cell.flags);
+            if sgr != cur_sgr {
+                s.push_str(&sgr);
+                cur_sgr = sgr;
+            }
+            s.push(if cell.c == '\0' { ' ' } else { cell.c });
+        }
+        s.push_str("\x1b[0m");
+        s
     }
 }
 
@@ -391,6 +454,46 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn rehydrate_enters_alt_screen_and_keeps_rows_absolute() {
+        let mut emu = TerminalEmulator::new(40, 10);
+        emu.advance(b"$ claude\r\n");
+        // TUI enters the alt screen, enables app cursor keys + bracketed paste +
+        // SGR mouse, hides the cursor and paints row 4.
+        emu.advance(b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?25l\x1b[4;3HHELLO");
+        let snap = emu.render_rehydrate_ansi();
+        assert!(
+            snap.starts_with("\x1b[?1049h"),
+            "must enter the alt screen first: {snap:?}"
+        );
+        assert!(
+            snap.contains("\x1b[4;1H"),
+            "row must be painted at its absolute position"
+        );
+        for seq in [
+            "\x1b[?1h",
+            "\x1b[?2004h",
+            "\x1b[?1000h",
+            "\x1b[?1006h",
+            "\x1b[?25l",
+        ] {
+            assert!(snap.contains(seq), "missing mode {seq:?}");
+        }
+        assert!(
+            !strip_ansi(&snap).contains("$ claude"),
+            "main-screen text must not leak into the alt replay"
+        );
+    }
+
+    #[test]
+    fn rehydrate_main_buffer_matches_plain_scrollback() {
+        let mut emu = TerminalEmulator::new(40, 5);
+        emu.advance(b"hello\r\nworld");
+        let snap = emu.render_rehydrate_ansi();
+        assert!(!snap.contains("\x1b[?1049h"));
+        assert!(snap.starts_with(&emu.render_scrollback_ansi()));
     }
 
     #[test]

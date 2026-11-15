@@ -128,7 +128,7 @@ function FileSegment({ name, fullPath }) {
   );
 }
 
-export function Breadcrumb({ tab }) {
+export function Breadcrumb({ tab, actions = null }) {
   const projects = useExplorer((s) => s.projects);
 
   const segments = useMemo(() => {
@@ -172,8 +172,11 @@ export function Breadcrumb({ tab }) {
           </React.Fragment>
         );
       })}
-      {!IS_WEB && !tab.scratch && (
-        <RevealButton path={tab.path} showLabel className="ml-auto pl-2" />
+      {(actions || (!IS_WEB && !tab.scratch)) && (
+        <div className="ml-auto flex shrink-0 items-center gap-1 pl-2">
+          {actions}
+          {!IS_WEB && !tab.scratch && <RevealButton path={tab.path} showLabel />}
+        </div>
       )}
     </div>
   );

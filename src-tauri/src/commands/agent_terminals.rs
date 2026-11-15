@@ -232,6 +232,16 @@ impl AgentTerminals for TauriAgentTerminals {
     }
 
     fn send_command(&self, session_id: u64, command: &str, task_id: &str) -> Result<(), String> {
+        self.send_command_line(session_id, command, command, task_id)
+    }
+
+    fn send_command_line(
+        &self,
+        session_id: u64,
+        command: &str,
+        typed: &str,
+        task_id: &str,
+    ) -> Result<(), String> {
         let state = self.app.state::<AppState>();
         let manager = state
             .terminal_manager
@@ -262,7 +272,7 @@ impl AgentTerminals for TauriAgentTerminals {
             .terminal_manager
             .lock()
             .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
-        let mut line = command.to_string();
+        let mut line = typed.to_string();
         line.push('\r');
         let write_result = manager.write_session(session_id, line.as_bytes());
         drop(manager);
