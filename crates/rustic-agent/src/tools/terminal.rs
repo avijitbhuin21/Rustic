@@ -53,8 +53,10 @@ const READ_OUTPUT_MAX: usize = 32 * 1024;
 /// How long `run_command` waits inline for the command to finish before
 /// returning STILL_RUNNING and handing off to the wake-on-completion path.
 const RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
-/// Poll cadence for the inline completion wait.
-const RUN_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+/// Poll cadence for the inline completion wait. Sentinel-wrapped commands are
+/// detected from their end marker, so a short interval is what makes fast
+/// commands return about as fast as a human sees them finish.
+const RUN_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
     let (shell_param, shell_desc) = if available_shells.is_empty() {
@@ -445,8 +447,10 @@ async fn run_command(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains(&session_id);
+    let mut end_tag: Option<String> = None;
     let send_result = if wrapped {
         let nonce = SENTINEL_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        end_tag = Some(format!("__RSTC_E_{nonce}_"));
         let line = crate::terminal_text::wrap_posix_command(cmd_str, nonce);
         broker.send_command_line(session_id, cmd_str, &line, &context.task_id)
     } else {
@@ -459,6 +463,9 @@ async fn run_command(
             attachments: Vec::new(),
         });
     }
+    if let Some(tag) = end_tag.as_deref() {
+        broker.expect_end(session_id, tag);
+    }
 
     // Inline wait: poll the targeted notice queue up to RUN_GRACE. The session
     // monitor queues a CommandFinished (or Exited) notice when the shell drops
@@ -467,8 +474,23 @@ async fn run_command(
     let deadline = tokio::time::Instant::now() + RUN_GRACE;
     loop {
         tokio::time::sleep(RUN_POLL).await;
-        let notices = broker.take_command_finished(&context.task_id, session_id);
-        if !notices.is_empty() {
+        let mut notices = broker.take_command_finished(&context.task_id, session_id);
+        // The end marker is printed by the shell itself right after the
+        // command returns — a definitive signal, so don't wait for the
+        // monitor's process-tree poll + idle confirmation (3–23 s).
+        let mut sentinel_done = false;
+        if notices.is_empty() {
+            if let Some(tag) = end_tag.as_deref() {
+                if let Ok(tail) = broker.read_output(session_id, 8 * 1024) {
+                    if crate::terminal_text::sanitize_terminal_output(&tail).contains(tag) {
+                        broker.finish_command(session_id);
+                        notices = broker.take_command_finished(&context.task_id, session_id);
+                        sentinel_done = true;
+                    }
+                }
+            }
+        }
+        if sentinel_done || !notices.is_empty() {
             if let (Some(worker), Some(message_id)) = (
                 context.sweep_worker.as_ref(),
                 context.current_user_message_id.as_ref(),

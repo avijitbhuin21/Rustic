@@ -317,6 +317,23 @@ impl AgentTerminals for TauriAgentTerminals {
             .map_err(|e| e.to_string())
     }
 
+    fn expect_end(&self, session_id: u64, marker: &str) {
+        let state = self.app.state::<AppState>();
+        let guard = state.terminal_manager.lock();
+        if let Ok(manager) = guard {
+            manager.set_expected_end(session_id, marker);
+        }
+    }
+
+    fn finish_command(&self, session_id: u64) {
+        let state = self.app.state::<AppState>();
+        let guard = state.terminal_manager.lock();
+        if let Ok(manager) = guard {
+            manager.clear_command_in_flight(session_id);
+        }
+        emit_terminal_list_changed(&self.app);
+    }
+
     fn render_screen(&self, session_id: u64) -> Result<String, String> {
         let state = self.app.state::<AppState>();
         let manager = state

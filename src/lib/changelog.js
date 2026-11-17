@@ -2,6 +2,13 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.8.5',
+    date: 'November 2026',
+    entries: [
+      { tag: 'improved', text: 'Agent commands return as soon as they finish — a quick command like `echo ok && pwd` now comes back in well under a second instead of 5–20 seconds. Agents waiting on long commands are also woken the moment they finish.' },
+    ],
+  },
+  {
     version: '0.8.4',
     date: 'November 2026',
     entries: [

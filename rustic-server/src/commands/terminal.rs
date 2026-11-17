@@ -28,7 +28,7 @@ use crate::context::ServerContext;
 /// process for this long, the monitor reclaims it.
 const IDLE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the session-monitor thread polls (shell-exit + idle checks).
-const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the shell must sit at its prompt (no child process) before an
 /// in-flight agent command is declared finished. Absorbs the brief no-child
 /// gaps between the processes of a compound command (`a; b; c`).
@@ -335,6 +335,20 @@ pub(crate) fn spawn_session_monitor(
                     .and_then(|m| m.command_in_flight_since(session_id));
                 if marker != cmd_marker {
                     cmd_marker = marker;
+                    cmd_seen_running = false;
+                    cmd_idle_since = None;
+                }
+                let sentinel_done = cmd_marker.is_some()
+                    && ctx
+                        .state()
+                        .terminal_manager
+                        .lock()
+                        .map(|m| m.expected_end_seen(session_id))
+                        .unwrap_or(false);
+                if sentinel_done {
+                    on_agent_command_finished(&ctx, session_id);
+                    seen_running = true;
+                    cmd_marker = None;
                     cmd_seen_running = false;
                     cmd_idle_since = None;
                 }
@@ -915,6 +929,21 @@ impl AgentTerminals for ServerAgentTerminals {
         manager
             .read_output_tail(session_id, max_bytes)
             .map_err(|e| e.to_string())
+    }
+
+    fn expect_end(&self, session_id: u64, marker: &str) {
+        let state = self.ctx.state();
+        if let Ok(manager) = state.terminal_manager.lock() {
+            manager.set_expected_end(session_id, marker);
+        }
+    }
+
+    fn finish_command(&self, session_id: u64) {
+        let state = self.ctx.state();
+        if let Ok(manager) = state.terminal_manager.lock() {
+            manager.clear_command_in_flight(session_id);
+        }
+        emit_terminal_list_changed(&self.ctx);
     }
 
     fn render_screen(&self, session_id: u64) -> Result<String, String> {

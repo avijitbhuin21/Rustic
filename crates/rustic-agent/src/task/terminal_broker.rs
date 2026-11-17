@@ -180,6 +180,16 @@ pub trait AgentTerminals: Send + Sync {
         Vec::new()
     }
 
+    /// Tell the host which end marker the just-sent sentinel-wrapped command
+    /// prints, so its session monitor can wake the task the moment it appears
+    /// instead of waiting on process-tree polling. Default impl is a no-op.
+    fn expect_end(&self, _session_id: u64, _marker: &str) {}
+
+    /// `run_command` saw the command's end marker and already returned its
+    /// output: clear the in-flight marker so the session monitor does not
+    /// queue a second (duplicate) completion notice. Default impl is a no-op.
+    fn finish_command(&self, _session_id: u64) {}
+
     /// Drain the pending-exit queue for `task_id`. Called by the executor at
     /// the top of each loop iteration so background-terminal crashes become
     /// synthetic user messages the model sees on the next provider call.

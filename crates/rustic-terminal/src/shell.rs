@@ -221,7 +221,30 @@ impl TerminalManager {
             if let Ok(mut slot) = session.command_in_flight.lock() {
                 *slot = None;
             }
+            if let Ok(mut slot) = session.expected_end.lock() {
+                *slot = None;
+            }
         }
+    }
+
+    /// Record the end marker the next agent command will print on completion.
+    pub fn set_expected_end(&self, id: SessionId, marker: &str) {
+        if let Some(session) = self.sessions.get(&id) {
+            if let Ok(mut slot) = session.expected_end.lock() {
+                *slot = Some(marker.to_string());
+            }
+        }
+    }
+
+    /// True when the in-flight command's end marker has reached the output.
+    pub fn expected_end_seen(&self, id: SessionId) -> bool {
+        let Some(session) = self.sessions.get(&id) else {
+            return false;
+        };
+        let Some(marker) = session.expected_end.lock().ok().and_then(|g| g.clone()) else {
+            return false;
+        };
+        crate::pty::read_tail(&session.output_buffer, 16 * 1024).contains(&marker)
     }
 
     /// When an agent command is in flight on this session, returns the instant
@@ -372,4 +395,66 @@ fn session_info(s: &PtySession) -> SessionInfo {
 pub fn shell_has_background_job(pid: u32, foreground_pgid: Option<i32>) -> bool {
     crate::pty::shell_command_busy(pid, foreground_pgid) == Some(false)
         && crate::pty::process_has_children(pid) == Some(true)
+}
+
+#[cfg(test)]
+mod expected_end_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A sentinel end marker typed by a real shell is seen within ~1 s of
+    /// sending — the signal that makes agent commands finish as fast as a
+    /// human sees them.
+    #[test]
+    fn expected_end_is_seen_promptly_for_a_real_shell() {
+        let shell = if cfg!(windows) {
+            ["C:\\Program Files\\Git\\bin\\bash.exe"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).is_file())
+        } else {
+            ["/bin/zsh", "/bin/bash"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).is_file())
+        };
+        let Some(shell) = shell else { return };
+        let mut m = TerminalManager::new();
+        let (info, mut reader, buffer, _emu, _child) = m
+            .create_session(
+                std::env::temp_dir(),
+                "t".into(),
+                true,
+                Some(shell.into()),
+                None,
+                &[],
+            )
+            .expect("spawn");
+        std::thread::spawn(move || {
+            let mut b = [0u8; 4096];
+            while let Ok(n) = std::io::Read::read(&mut reader, &mut b) {
+                if n == 0 {
+                    break;
+                }
+                append_output(&buffer, &b[..n]);
+            }
+        });
+        let id = info.id;
+        m.mark_command_in_flight(id).expect("mark");
+        m.set_expected_end(id, "__RSTC_E_77_");
+        assert!(!m.expected_end_seen(id));
+        m.write_session(id, b" printf '\\137\\137RSTC_E_%s_%d\\n' 77 0\r")
+            .expect("write");
+        let start = Instant::now();
+        while !m.expected_end_seen(id) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(m.expected_end_seen(id), "end marker never seen");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        m.clear_command_in_flight(id);
+        assert!(!m.expected_end_seen(id));
+        m.destroy_session(id);
+    }
 }

@@ -69,6 +69,9 @@ pub struct PtySession {
     /// the agent broker's `send_command`, cleared by the session monitor when
     /// it detects the shell returned to its prompt.
     pub command_in_flight: Arc<Mutex<Option<Instant>>>,
+    /// End marker the in-flight sentinel-wrapped command prints when it
+    /// returns; lets the monitor detect completion without process polling.
+    pub expected_end: Arc<Mutex<Option<String>>>,
 }
 
 impl PtySession {
@@ -165,6 +168,13 @@ impl PtySession {
                 cpr_sent: Arc::clone(&cpr_sent),
                 tail: Vec::new(),
                 armed: true,
+                // Agent terminals have no xterm to answer at spawn time; every
+                // ms here delays the agent's first command.
+                grace: if is_agent {
+                    std::time::Duration::ZERO
+                } else {
+                    DSR_ANSWER_GRACE
+                },
             })
         } else {
             pair.master.try_clone_reader()?
@@ -192,6 +202,7 @@ impl PtySession {
             last_command: Arc::new(Mutex::new(None)),
             task_id: Arc::new(Mutex::new(None)),
             command_in_flight: Arc::new(Mutex::new(None)),
+            expected_end: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -262,6 +273,7 @@ struct ConptyDsrReader {
     cpr_sent: Arc<std::sync::atomic::AtomicBool>,
     tail: Vec<u8>,
     armed: bool,
+    grace: std::time::Duration,
 }
 
 const DSR_QUERY: &[u8] = b"\x1b[6n";
@@ -277,8 +289,9 @@ impl Read for ConptyDsrReader {
                 self.tail = Vec::new();
                 let writer = Arc::clone(&self.writer);
                 let cpr_sent = Arc::clone(&self.cpr_sent);
+                let grace = self.grace;
                 std::thread::spawn(move || {
-                    std::thread::sleep(DSR_ANSWER_GRACE);
+                    std::thread::sleep(grace);
                     if !cpr_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         if let Ok(mut w) = writer.lock() {
                             let _ = w.write_all(b"\x1b[1;1R");

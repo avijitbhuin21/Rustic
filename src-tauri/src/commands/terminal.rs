@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// process for this long, the monitor reclaims it.
 const IDLE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the session-monitor thread polls (shell-exit + idle checks).
-const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the shell must sit at its prompt (no child process) before an
 /// in-flight agent command is declared finished. Absorbs the brief no-child
 /// gaps between the processes of a compound command (`a; b; c`).
@@ -320,6 +320,20 @@ pub fn spawn_session_monitor(
                 };
                 if marker != cmd_marker {
                     cmd_marker = marker;
+                    cmd_seen_running = false;
+                    cmd_idle_since = None;
+                }
+                // Sentinel-wrapped commands print a definitive end marker —
+                // no process polling or idle confirmation needed.
+                let sentinel_done = cmd_marker.is_some() && {
+                    let state = app.state::<AppState>();
+                    let m = state.terminal_manager.lock();
+                    m.map(|m| m.expected_end_seen(session_id)).unwrap_or(false)
+                };
+                if sentinel_done {
+                    on_agent_command_finished(&app, session_id);
+                    seen_running = true;
+                    cmd_marker = None;
                     cmd_seen_running = false;
                     cmd_idle_since = None;
                 }
