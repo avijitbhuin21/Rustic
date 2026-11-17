@@ -44,7 +44,9 @@ pub struct PtySession {
     /// `@` mention picker so users can reference a specific terminal.
     pub pid: Option<u32>,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Set once a cursor-position report has reached the pty (see `ConptyDsrReader`).
+    cpr_sent: Arc<std::sync::atomic::AtomicBool>,
     // reader is taken out via take_reader() for the output streaming thread
     reader: Option<Box<dyn Read + Send>>,
     // child handle is taken out via take_child() for the monitor thread; held
@@ -154,8 +156,19 @@ impl PtySession {
         // Drop the slave side — we communicate through the master
         drop(pair.slave);
 
-        let writer = pair.master.take_writer()?;
-        let reader = pair.master.try_clone_reader()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let cpr_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader: Box<dyn Read + Send> = if cfg!(windows) {
+            Box::new(ConptyDsrReader {
+                inner: pair.master.try_clone_reader()?,
+                writer: Arc::clone(&writer),
+                cpr_sent: Arc::clone(&cpr_sent),
+                tail: Vec::new(),
+                armed: true,
+            })
+        } else {
+            pair.master.try_clone_reader()?
+        };
 
         let created_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -171,6 +184,7 @@ impl PtySession {
             pid,
             master: pair.master,
             writer,
+            cpr_sent,
             reader: Some(reader),
             child: Some(child),
             output_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(16 * 1024))),
@@ -207,8 +221,16 @@ impl PtySession {
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.writer.write_all(data)?;
-        self.writer.flush()?;
+        if is_cursor_position_report(data) {
+            self.cpr_sent
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut w = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pty writer lock poisoned"))?;
+        w.write_all(data)?;
+        w.flush()?;
         Ok(())
     }
 
@@ -226,6 +248,68 @@ impl PtySession {
         }
         Ok(())
     }
+}
+
+/// Windows ConPTY (portable-pty 0.9 sets `PSEUDOCONSOLE_INHERIT_CURSOR`) sends a
+/// `ESC[6n` cursor query at startup and blocks the console — no shell output,
+/// no typed input processed — until a cursor-position report comes back. A user
+/// terminal's xterm answers it, but agent terminals are often never attached to
+/// an xterm, so every agent command hung. This wrapper answers the first query
+/// itself when nobody else has within a short grace period.
+struct ConptyDsrReader {
+    inner: Box<dyn Read + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    cpr_sent: Arc<std::sync::atomic::AtomicBool>,
+    tail: Vec<u8>,
+    armed: bool,
+}
+
+const DSR_QUERY: &[u8] = b"\x1b[6n";
+const DSR_ANSWER_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+impl Read for ConptyDsrReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if self.armed && n > 0 {
+            self.tail.extend_from_slice(&buf[..n]);
+            if self.tail.windows(DSR_QUERY.len()).any(|w| w == DSR_QUERY) {
+                self.armed = false;
+                self.tail = Vec::new();
+                let writer = Arc::clone(&self.writer);
+                let cpr_sent = Arc::clone(&self.cpr_sent);
+                std::thread::spawn(move || {
+                    std::thread::sleep(DSR_ANSWER_GRACE);
+                    if !cpr_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        if let Ok(mut w) = writer.lock() {
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        }
+                    }
+                });
+            } else {
+                let keep = self.tail.len().saturating_sub(DSR_QUERY.len() - 1);
+                self.tail.drain(..keep);
+                if self.cpr_sent.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.armed = false;
+                }
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// True when `data` contains a cursor-position report (`ESC[<row>;<col>R`).
+fn is_cursor_position_report(data: &[u8]) -> bool {
+    data.windows(2).enumerate().any(|(i, w)| {
+        if w != b"\x1b[" {
+            return false;
+        }
+        let rest = &data[i + 2..];
+        let end = rest
+            .iter()
+            .position(|b| !(b.is_ascii_digit() || *b == b';'));
+        matches!(end, Some(e) if e > 0 && rest[e] == b'R' && rest[..e].contains(&b';'))
+    })
 }
 
 /// Append bytes to a shared output buffer, evicting from the front if the
@@ -485,6 +569,67 @@ fn windows_image_path(pid: u32) -> Option<String> {
             return None;
         }
         Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+#[cfg(test)]
+mod conpty_dsr_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_position_report_detection() {
+        assert!(is_cursor_position_report(b"\x1b[12;40R"));
+        assert!(is_cursor_position_report(b"ab\x1b[1;1Rcd"));
+        assert!(!is_cursor_position_report(b"\x1b[6n"));
+        assert!(!is_cursor_position_report(b"\x1b[2J"));
+        assert!(!is_cursor_position_report(b"echo hi\r"));
+    }
+
+    /// ConPTY blocks on its startup `ESC[6n` until answered; an agent terminal
+    /// with no xterm attached must still run typed commands.
+    #[cfg(windows)]
+    #[test]
+    fn conpty_runs_commands_without_an_attached_frontend() {
+        use std::time::{Duration, Instant};
+        let mut s = PtySession::new(
+            std::env::temp_dir(),
+            "t".into(),
+            true,
+            Some("cmd.exe".into()),
+            None,
+            &[],
+        )
+        .expect("spawn cmd");
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = out.clone();
+        let mut reader = s.take_reader().expect("reader");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        s.write(b"echo RSTC_%OS%_OK\r").expect("write");
+        let start = Instant::now();
+        let mut ran = false;
+        while start.elapsed() < Duration::from_secs(10) {
+            if String::from_utf8_lossy(&out.lock().unwrap()).contains("RSTC_Windows_NT_OK") {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Some(mut c) = s.take_child() {
+            let _ = c.kill();
+        }
+        assert!(
+            ran,
+            "command never ran: {:?}",
+            String::from_utf8_lossy(&out.lock().unwrap())
+        );
     }
 }
 

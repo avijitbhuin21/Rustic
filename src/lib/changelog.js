@@ -2,6 +2,13 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.8.4',
+    date: 'November 2026',
+    entries: [
+      { tag: 'fixed', text: 'Windows: agent commands no longer hang with no output. Agent terminals that were never opened in the panel used to wait forever for a console handshake, so nothing ran.' },
+    ],
+  },
+  {
     version: '0.8.3',
     date: 'November 2026',
     entries: [
