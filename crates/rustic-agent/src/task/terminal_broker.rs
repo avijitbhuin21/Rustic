@@ -49,6 +49,10 @@ pub struct AgentTerminalExit {
     /// Unix-ms timestamp when the event was observed.
     pub exited_at_ms: u64,
     pub kind: TerminalNoticeKind,
+    /// True when no command was in flight at event time, i.e. the last
+    /// command's output already reached the task (inline `run_command` result
+    /// or an earlier CommandFinished notice) and must not be replayed.
+    pub output_delivered: bool,
 }
 
 /// Render queued terminal notices as one synthetic SYSTEM user-message body.
@@ -62,6 +66,15 @@ pub fn format_terminal_notices(notices: &[AgentTerminalExit]) -> String {
          proceed.\n",
     );
     for n in notices {
+        if n.kind == TerminalNoticeKind::Exited && n.output_delivered {
+            body.push_str(&format!(
+                "\n— Terminal #{} ({}): the shell process exited — the terminal is no \
+                 longer running. Its last command had already finished and its output \
+                 was returned to you earlier, so it is not repeated here.\n",
+                n.session_id, n.label
+            ));
+            continue;
+        }
         match n.kind {
             TerminalNoticeKind::CommandFinished => {
                 body.push_str(&format!(
@@ -205,5 +218,49 @@ pub trait AgentTerminals: Send + Sync {
     /// entirely and falls back to the platform default.
     fn available_shells(&self) -> Vec<String> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notice(kind: TerminalNoticeKind, output_delivered: bool) -> AgentTerminalExit {
+        AgentTerminalExit {
+            session_id: 7,
+            label: "agent: git".into(),
+            last_command: Some("git status".into()),
+            output_tail: "$ git status\nnothing to commit\n".into(),
+            exited_at_ms: 0,
+            kind,
+            output_delivered,
+        }
+    }
+
+    #[test]
+    fn idle_shell_exit_does_not_replay_delivered_output() {
+        let body = format_terminal_notices(&[notice(TerminalNoticeKind::Exited, true)]);
+        assert!(
+            body.contains("Terminal #7 (agent: git): the shell process exited"),
+            "{body}"
+        );
+        assert!(!body.contains("nothing to commit"), "{body}");
+        assert!(!body.contains("Last command"), "{body}");
+        assert!(!body.contains("Output (tail)"), "{body}");
+    }
+
+    #[test]
+    fn exit_mid_command_and_command_finished_keep_their_output() {
+        for kind in [
+            TerminalNoticeKind::Exited,
+            TerminalNoticeKind::CommandFinished,
+        ] {
+            let body = format_terminal_notices(&[notice(kind, false)]);
+            assert!(body.contains("Last command: git status"), "{body}");
+            assert!(
+                body.contains("Output (tail):\n```\nnothing to commit\n```"),
+                "{body}"
+            );
+        }
     }
 }

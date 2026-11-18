@@ -1,22 +1,29 @@
 import { useEffect } from 'react';
 
 let mermaidPromise = null;
+let appliedTheme = null;
 
-/** Lazily loads and initializes the mermaid library once. */
+/**
+ * Lazily loads the mermaid library once and (re)initializes it whenever the
+ * app's light/dark mode differs from the one it was last configured for.
+ */
 function loadMermaid() {
   if (!mermaidPromise) {
-    mermaidPromise = import('mermaid').then((mod) => {
-      const mermaid = mod.default || mod;
+    mermaidPromise = import('mermaid').then((mod) => mod.default || mod);
+  }
+  return mermaidPromise.then((mermaid) => {
+    const theme = document.documentElement.classList.contains('dark') ? 'dark' : 'default';
+    if (theme !== appliedTheme) {
       mermaid.initialize({
         startOnLoad: false,
         securityLevel: 'strict',
-        theme: document.documentElement.classList.contains('dark') ? 'dark' : 'default',
+        theme,
         fontFamily: 'inherit',
       });
-      return mermaid;
-    });
-  }
-  return mermaidPromise;
+      appliedTheme = theme;
+    }
+    return mermaid;
+  });
 }
 
 /** Parses a CSS color (#rgb, #rrggbb, rgb()) into [r,g,b] or null. */
@@ -62,6 +69,34 @@ function fixLabelContrast(root) {
 }
 
 let renderSeq = 0;
+
+/** Renders mermaid `source` to SVG markup, rethrowing mermaid's parse error. */
+async function renderToSvg(mermaid, source) {
+  const id = `mermaid-chat-${++renderSeq}`;
+  try {
+    const { svg } = await mermaid.render(id, source);
+    return svg;
+  } catch (e) {
+    // mermaid.render leaves a stray error element behind on failure — remove
+    // it so it doesn't pile up at the document bottom.
+    document.getElementById(id)?.remove();
+    document.querySelector(`#d${id}`)?.remove();
+    throw e;
+  }
+}
+
+/**
+ * Renders a whole mermaid document (a `.mmd` file) to themed SVG markup plus
+ * its intrinsic viewBox size. Rejects with mermaid's parse error.
+ */
+export async function renderMermaidDiagram(source) {
+  const mermaid = await loadMermaid();
+  const host = document.createElement('div');
+  host.innerHTML = await renderToSvg(mermaid, source);
+  fixLabelContrast(host);
+  const vb = host.querySelector('svg')?.viewBox?.baseVal;
+  return { svg: host.innerHTML, width: vb?.width || 0, height: vb?.height || 0 };
+}
 
 const MAXIMIZE_ICON =
   '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>';
@@ -212,9 +247,8 @@ export function useMermaidBlocks(ref, deps) {
         if (!pre || pre.dataset.mermaidDone === '1') continue;
         const source = code.textContent || '';
         if (!source.trim()) continue;
-        const id = `mermaid-chat-${++renderSeq}`;
         try {
-          const { svg } = await mermaid.render(id, source);
+          const svg = await renderToSvg(mermaid, source);
           if (cancelled || !pre.isConnected) return;
           const wrap = document.createElement('div');
           wrap.className = 'mermaid-diagram relative my-2 flex justify-center overflow-x-auto rounded-md bg-muted/40 p-2';
@@ -236,12 +270,9 @@ export function useMermaidBlocks(ref, deps) {
           pre.replaceWith(wrap);
         } catch (e) {
           // Parse failure (often a partially-streamed block) — keep the code
-          // fence visible; mermaid.render leaves a stray error element behind,
-          // remove it so it doesn't pile up at the document bottom. Logged so
-          // a legitimately broken diagram is diagnosable from the console.
+          // fence visible. Logged so a legitimately broken diagram is
+          // diagnosable from the console.
           console.warn('[mermaid] render failed, leaving code fence as-is:', e?.message || e);
-          document.getElementById(id)?.remove();
-          document.querySelector(`#d${id}`)?.remove();
         }
       }
     })();

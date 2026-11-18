@@ -733,14 +733,6 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
         // Shared runtime (not per-turn): sub-agent tasks spawned during the
         // turn must survive the turn ending for the park/auto-resume flow.
         agent_rt.block_on(async {
-            ctx_thread.emit(
-                "agent-task-status",
-                AgentStatusEvent {
-                    task_id: task_id_clone.clone(),
-                    status: TaskStatus::Running,
-                },
-            );
-
             // Capture the file-history baseline in the BACKGROUND so the agent's
             // first response isn't blocked on shadow.track()'s full-worktree
             // hash. The executor gates the first file-mutating tool on
@@ -807,21 +799,34 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             // Tracking is active iff we have a handle and aren't in plan mode.
             let fh_handle_opt = if task_is_plan_mode { None } else { fh_handle_opt };
 
+            // This project's MCP tools, from the connect-time cache. Only
+            // servers that aren't connected yet are waited on; stale tool
+            // lists refresh in the background.
             let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
             let mcp_project_root = PathBuf::from(&project_root);
             let mcp_fut = tokio::task::spawn_blocking(move || {
-                let mut mcp = mcp_arc_connect.lock_safe();
-                mcp.connect_project(&mcp_project_root);
-                let tools = mcp.project_tools(&mcp_project_root);
-                let section = build_mcp_system_section(&tools);
-                (tools, section)
+                let turn =
+                    rustic_agent::McpManager::tools_for_turn(&mcp_arc_connect, &mcp_project_root);
+                let section = build_mcp_system_section(&turn.tools);
+                (turn.tools, section, turn.read_only)
             });
 
             // The baseline no longer blocks the turn; only MCP must be ready.
             let t_mcp = std::time::Instant::now();
             let mcp_result = mcp_fut.await;
             tracing::info!(target: "rustic::timing", task = %task_id_clone, elapsed_ms = t_mcp.elapsed().as_millis() as u64, "executor: MCP connect_all + tool list");
-            let (mcp_tool_defs, mcp_system_section) = mcp_result.unwrap_or_default();
+            let (mcp_tool_defs, mcp_system_section, mcp_read_only_tools) =
+                mcp_result.unwrap_or_default();
+            let mcp_read_only_tools = Arc::new(mcp_read_only_tools);
+
+            // Local setup is done; from here the wait is the model's.
+            ctx_thread.emit(
+                "agent-task-status",
+                AgentStatusEvent {
+                    task_id: task_id_clone.clone(),
+                    status: TaskStatus::Running,
+                },
+            );
 
             let mut provider_config = provider_config;
             if !mcp_system_section.is_empty() {
@@ -1048,6 +1053,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                 file_read_registry: Arc::new(rustic_agent::FileReadRegistry::new()),
                 mcp_manager: Some(Arc::clone(&mcp_manager_arc)),
                 mcp_tool_defs,
+                mcp_read_only_tools,
                 subagent_registry: Arc::clone(&subagent_registry),
                 agent_depth: 0,
                 ai_config: Arc::clone(&ai_config),

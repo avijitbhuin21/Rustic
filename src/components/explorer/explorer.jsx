@@ -9,6 +9,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { useExplorer, copyEntry, moveEntry, readClipboardFiles, writeClipboardFiles } from '@/state/explorer';
 import { usePanelSide } from '@/lib/panel-side';
 import { useContextProjectReveal } from '@/lib/context-projects';
+import { useActiveFilePath, isInside } from '@/lib/active-file';
 import { SIDEBAR_PANELS } from '@/state/layout';
 import { useClipboard } from '@/state/clipboard';
 import { pasteOsClipboardImageInto, uploadsAbsoluteDir } from '@/lib/clipboard-image';
@@ -44,6 +45,20 @@ export function Explorer({ onOpenFile }) {
   useContextProjectReveal(SIDEBAR_PANELS.EXPLORER, (ctx, panelSide) => {
     useExplorer.getState().revealProjects(panelSide, ctx.ids);
   });
+
+  // Switching editor tabs keeps the explorer following the file: make sure its
+  // project section is expanded (FileTree then opens the folders). Never
+  // collapses other projects.
+  const activeFile = useActiveFilePath();
+  useEffect(() => {
+    if (!activeFile) return;
+    const owner = projects
+      .filter((p) => p.root_path && isInside(p.root_path, activeFile))
+      .sort((a, b) => b.root_path.length - a.root_path.length)[0];
+    if (!owner) return;
+    const st = useExplorer.getState();
+    if (!st.expandedProjects[side]?.[owner.id]) st.setProjectExpanded(side, owner.id, true);
+  }, [activeFile, projects, side]);
 
   // Resolve where a paste should land. Selection wins (folder → into that
   // folder, file → its parent dir); otherwise drop into the active project's

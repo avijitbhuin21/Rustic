@@ -199,8 +199,44 @@ pub fn clean_command_output(raw: &str, cmd: &str) -> String {
     if let Some(body) = extract_sentinel_output(&sanitized) {
         return body.output;
     }
+    if let Some(body) = output_before_end_marker(&sanitized) {
+        return body;
+    }
     let sliced = strip_command_echo(&sanitized, cmd);
     strip_trailing_prompt(&sliced)
+}
+
+/// True for a line that is exactly a sentinel end marker (`__RSTC_E_<nonce>_<exit code>`).
+fn is_end_marker_line(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix(SENTINEL_END) else {
+        return false;
+    };
+    let Some((nonce, code)) = rest.split_once('_') else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    digits(nonce) && digits(code.strip_prefix('-').unwrap_or(code))
+}
+
+/// Output of a finished sentinel-wrapped command whose begin marker has scrolled
+/// out of the captured tail: everything before the closing end-marker line.
+fn output_before_end_marker(sanitized: &str) -> Option<String> {
+    let lines: Vec<&str> = sanitized.lines().collect();
+    let end_at = lines.iter().rposition(|l| is_end_marker_line(l))?;
+    // Only when the marker closes the buffer; anything after it but a prompt
+    // belongs to a later command.
+    if lines[end_at + 1..]
+        .iter()
+        .any(|l| !l.trim().is_empty() && !is_prompt_line(l))
+    {
+        return None;
+    }
+    Some(
+        lines[..end_at]
+            .join("\n")
+            .trim_end_matches(['\n', ' '])
+            .to_string(),
+    )
 }
 
 const SENTINEL_BEGIN: &str = "__RSTC_B_";
@@ -507,6 +543,29 @@ mod tests {
             "echo must not contain the literal marker"
         );
         assert!(hide_sentinels(&format!("$ {w}\n__RSTC_B_9\nhi\n__RSTC_E_9_0")).trim() == "hi");
+    }
+
+    #[test]
+    fn end_marker_stripped_when_begin_marker_scrolled_out_of_tail() {
+        // Tracker #10: a 4 KB tail of long output has no begin marker, so the
+        // end marker used to be handed to the model as the last output line.
+        let raw = "…middle of a long listing\nlast real line\n\n__RSTC_E_9_0\nuser@host Rustic % ";
+        assert_eq!(
+            clean_command_output(raw, "python3 report.py"),
+            "…middle of a long listing\nlast real line"
+        );
+        let failed = "partial\nboom\n\n__RSTC_E_12_-1\n";
+        assert_eq!(clean_command_output(failed, "false"), "partial\nboom");
+    }
+
+    #[test]
+    fn end_marker_fallback_ignores_lookalikes_and_older_commands() {
+        // Output that merely mentions the marker is kept as output.
+        let text = "see __RSTC_E_ in the docs\n__RSTC_E_x_0";
+        assert_eq!(clean_command_output(text, "cat notes"), text);
+        // A marker followed by a later command's output is not this command's end.
+        let later = "old tail\n__RSTC_E_3_0\n$ echo hi\nhi";
+        assert_eq!(clean_command_output(later, "echo hi"), "hi");
     }
 
     #[test]

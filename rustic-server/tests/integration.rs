@@ -163,6 +163,59 @@ fn unwired_command_returns_501() {
     });
 }
 
+#[test]
+fn prewarm_agent_project_warms_without_starting_unapproved_servers() {
+    run("pw", |app| async move {
+        let token = login_token(&app, "pw").await;
+        let call = |cmd: &'static str, body: serde_json::Value| {
+            let app = app.clone();
+            let token = token.clone();
+            async move {
+                app.oneshot(
+                    req("POST", &format!("/api/{cmd}"))
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("rustic-it-warm-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let marker = root.join("spawned");
+        let unapproved = serde_json::json!({ "mcpServers": { "evil": {
+            "command": "sh", "args": ["-c", format!("touch '{}'", marker.display())]
+        } } });
+        std::fs::write(root.join(".mcp.json"), unapproved.to_string()).unwrap();
+
+        let added = call("add_project", serde_json::json!({ "path": root })).await;
+        assert_eq!(added.status(), StatusCode::OK);
+        let project_id = body_json(added).await["id"].as_str().unwrap().to_string();
+
+        let warmed = call(
+            "prewarm_agent_project",
+            serde_json::json!({ "projectId": project_id }),
+        )
+        .await;
+        assert_eq!(warmed.status(), StatusCode::OK);
+        assert!(!marker.exists(), "unapproved project server was spawned");
+
+        let missing = call(
+            "prewarm_agent_project",
+            serde_json::json!({ "projectId": "no-such-project" }),
+        )
+        .await;
+        assert_ne!(missing.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&root);
+    });
+}
+
 async fn login_token(app: &axum::Router, pw: &str) -> String {
     let login = app
         .clone()
@@ -444,4 +497,131 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Stdio MCP server that holds its `initialize` reply until the gate file ($1) exists.
+#[cfg(unix)]
+const GATED_MCP_SERVER: &str = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      while [ ! -e "$1" ]; do sleep 0.02; done
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"capabilities":{}}}\n' "$id" ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"probe"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+#[cfg(unix)]
+#[test]
+fn mcp_list_returns_before_servers_connect_and_pushes_their_status() {
+    use std::time::{Duration, Instant};
+
+    let config = test_config("pw");
+    let data_dir = config.data_dir.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let shared = {
+        let _guard = rt.enter();
+        rustic_server::build_shared(config).unwrap()
+    };
+    let app = rustic_server::app::build_router(shared.clone());
+
+    rt.block_on(async {
+        let token = login_token(&app, "pw").await;
+        let call = |cmd: &'static str, body: serde_json::Value| {
+            let app = app.clone();
+            let token = token.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        req("POST", &format!("/api/{cmd}"))
+                            .header("content-type", "application/json")
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{cmd} failed");
+                body_json(resp).await
+            }
+        };
+
+        let script = data_dir.join("gated-mcp.sh");
+        std::fs::write(&script, GATED_MCP_SERVER).unwrap();
+        let gate = data_dir.join("gate");
+        let pool = serde_json::json!({ "mcpServers": {
+            "slow": { "command": "sh", "args": [script, gate] }
+        } });
+        let mut events = shared.ctx.hub.subscribe();
+
+        // Saving and listing both come back while the server is still held shut.
+        let started = Instant::now();
+        let saved = call(
+            "save_mcp_json",
+            serde_json::json!({ "scope": "user", "projectId": null, "content": pool.to_string() }),
+        )
+        .await;
+        let listed = call("list_mcp_servers", serde_json::json!({ "projectId": null })).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "save/list waited on the server handshake ({:?})",
+            started.elapsed()
+        );
+        for rows in [&saved, &listed] {
+            assert_eq!(rows.as_array().unwrap().len(), 1);
+            assert_eq!(rows[0]["name"], "slow");
+            assert_eq!(rows[0]["status"]["state"], "connecting");
+        }
+
+        // Once the server answers, its result is pushed as an event.
+        std::fs::write(&gate, "").unwrap();
+        let settled = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let text = match events.recv().await {
+                    Ok(text) => text,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("hub closed: {e}"),
+                };
+                let msg: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if msg["event"] == "mcp-server-status"
+                    && msg["payload"]["status"]["state"] != "connecting"
+                {
+                    return msg["payload"].clone();
+                }
+            }
+        })
+        .await
+        .expect("no mcp-server-status event after the server connected");
+        assert_eq!(settled["id"], "user-slow");
+        assert_eq!(settled["status"]["state"], "connected");
+        assert_eq!(settled["status"]["tool_count"], 1);
+        // The push outranks the earlier "connecting" snapshot, so a client
+        // receiving them out of order keeps the settled status.
+        assert!(settled["seq"].as_u64().unwrap() > listed[0]["status_seq"].as_u64().unwrap());
+
+        let listed = call("list_mcp_servers", serde_json::json!({ "projectId": null })).await;
+        assert_eq!(listed[0]["status"]["state"], "connected");
+
+        let tools = call(
+            "list_mcp_server_tools",
+            serde_json::json!({ "id": "user-slow" }),
+        )
+        .await;
+        assert_eq!(tools[0]["name"], "probe");
+        call(
+            "remove_mcp_server",
+            serde_json::json!({ "id": "user-slow" }),
+        )
+        .await;
+    });
+    drop(app);
+    drop(shared);
+    drop(rt);
+    let _ = std::fs::remove_dir_all(&data_dir);
 }

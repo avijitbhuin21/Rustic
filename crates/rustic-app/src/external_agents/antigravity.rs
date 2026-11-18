@@ -1,12 +1,16 @@
 //! Session capture for the Antigravity CLI (`agy`).
 //!
-//! Unlike Claude Code and Codex, `agy` has no hook system, so there is nothing
-//! to register and nothing that calls back. What it does have is a per
-//! conversation SQLite file under `~/.gemini/antigravity-cli/conversations/`,
-//! whose stem is the conversation id accepted by `agy --conversation <id>`.
+//! This is the fallback path. On `agy` versions with verified hook support, and
+//! in projects without a hooks file of their own, the conversation id arrives
+//! through `<project>/.agents/hooks.json` instead (see [`super::hooks`]) and
+//! nothing here runs.
 //!
-//! Capture therefore works by difference: snapshot the directory before
-//! spawning, then watch for the file that appears. Everything here is
+//! `agy` keeps a per conversation SQLite file under
+//! `~/.gemini/antigravity-cli/conversations/`, whose stem is the conversation id
+//! accepted by `agy --conversation <id>`. Capture works by difference: snapshot
+//! the directory before spawning, then watch for the file that appears. With two
+//! sessions open at once that guess can pick the other session's conversation,
+//! which is why hooks are preferred. Everything here is
 //! best-effort and read-only — Rustic never writes to Antigravity's store, and a
 //! failed read just leaves the session without a title.
 

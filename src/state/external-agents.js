@@ -7,6 +7,7 @@ import { useAgent } from '@/state/agent';
 import { useLayout } from '@/state/layout';
 
 const SESSIONS_CHANGED_EVENT = 'external-agent-sessions-changed';
+const ACTIVITY_EVENT = 'external-agent-activity';
 
 // A CLI agent session is a *chat*, not a terminal: the backend spawns its PTY,
 // but it is immediately hidden from the bottom terminal panel and the only
@@ -51,6 +52,22 @@ export const useExternalAgents = create((set, get) => ({
   // without a first turn — the same "no message, no chat" rule Rustic's own
   // chats follow.
   draftRowId: null,
+  // session row id -> activity rows (prompts, tool calls, approvals), oldest
+  // first, as reported by the CLI's hooks. Loaded when a session is viewed.
+  activityBySession: {},
+
+  /** Fetch a session's activity rows; a failed read leaves the list as it was. */
+  loadActivity: async (rowId) => {
+    if (!rowId) return;
+    try {
+      const rows = await invoke('list_external_agent_activity', { sessionRowId: rowId, limit: 300 });
+      set((s) => ({
+        activityBySession: { ...s.activityBySession, [rowId]: Array.isArray(rows) ? rows : [] },
+      }));
+    } catch {
+      /* older backend or unreadable log — the list just stays empty */
+    }
+  },
 
   detect: async ({ force = false } = {}) => {
     if (!force && get().detected) return get().installed;
@@ -180,7 +197,10 @@ export const useExternalAgents = create((set, get) => ({
     set((s) => {
       const ptyBySession = { ...s.ptyBySession };
       delete ptyBySession[row.id];
+      const activityBySession = { ...s.activityBySession };
+      delete activityBySession[row.id];
       return {
+        activityBySession,
         sessionsByProject: {
           ...s.sessionsByProject,
           [row.project_id]: (s.sessionsByProject[row.project_id] ?? []).filter(
@@ -330,6 +350,7 @@ export function selectActiveCliSession(s) {
 }
 
 let unlisten = null;
+let unlistenActivity = null;
 let unsubTask = null;
 let unsubSubmit = null;
 
@@ -338,6 +359,15 @@ export function initExternalAgents() {
   if (unlisten) return;
   unlisten = listen(SESSIONS_CHANGED_EVENT, () => {
     useExternalAgents.getState().refreshLoaded().catch(() => {});
+  }).catch(() => null);
+  // Only sessions already on screen (or viewed before) are re-read; the rest
+  // load their rows when they are opened.
+  unlistenActivity = listen(ACTIVITY_EVENT, (e) => {
+    const rowId = e?.payload?.sessionRowId;
+    const s = useExternalAgents.getState();
+    if (rowId && (rowId === s.activeSessionId || rowId in s.activityBySession)) {
+      s.loadActivity(rowId);
+    }
   }).catch(() => null);
   // Sending the first line is what turns a placeholder into a real chat, so it
   // has to show up in the list right then — waiting for the tool's hook would

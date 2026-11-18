@@ -1480,6 +1480,7 @@ async fn spawn_subagent_inner(
     let child_tool_config = Arc::clone(&context.tool_config);
     let child_mcp_manager = context.mcp_manager.clone();
     let child_mcp_tool_defs = context.mcp_tool_defs.clone();
+    let child_mcp_read_only_tools = Arc::clone(&context.mcp_read_only_tools);
     let child_subagent_registry = Arc::clone(&context.subagent_registry);
     let child_allowed_paths = context.allowed_paths.clone();
     let child_write_scope = writes.clone();
@@ -1653,6 +1654,7 @@ async fn spawn_subagent_inner(
             file_read_registry: std::sync::Arc::new(crate::tools::FileReadRegistry::new()),
             mcp_manager: child_mcp_manager,
             mcp_tool_defs: child_mcp_tool_defs,
+            mcp_read_only_tools: child_mcp_read_only_tools,
             subagent_registry: child_subagent_registry,
             agent_depth: 1,
             ai_config: child_ai_config,

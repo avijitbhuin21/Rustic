@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use rustic_db::{Database, ExternalAgentSessionRow};
 
+use super::activity::ActivityEvent;
 use super::antigravity;
 use super::hooks::HookPaths;
 use super::spool::drain_spool;
@@ -23,9 +24,13 @@ use crate::sync_ext::MutexExt;
 
 /// Event telling the frontend to re-read a project's external agent sessions.
 pub const SESSIONS_CHANGED_EVENT: &str = "external-agent-sessions-changed";
+/// Event telling the frontend one session's activity log grew. Payload:
+/// `{ "sessionRowId": "<row id>" }`.
+pub const ACTIVITY_EVENT: &str = "external-agent-activity";
 
-/// How often the spool is folded into the database.
-const DRAIN_INTERVAL: Duration = Duration::from_millis(1500);
+/// How often the spool is folded into the database. Short enough that a
+/// "waiting for approval" row shows up while the prompt is still on screen.
+const DRAIN_INTERVAL: Duration = Duration::from_millis(700);
 /// How long to keep watching for an `agy` conversation after spawning one.
 const AGY_CAPTURE_WINDOW: Duration = Duration::from_secs(600);
 const AGY_POLL_INTERVAL: Duration = Duration::from_millis(750);
@@ -134,20 +139,6 @@ pub fn prepare(
         }
     };
 
-    // Hook registration is per-agent: Claude takes a settings file, Codex needs
-    // a file inside the project, Antigravity supports neither and is captured by
-    // watching its conversation store instead.
-    let mut agy_before = None;
-    match agent {
-        AgentKind::Claude => super::hooks::write_claude_settings(&paths)?,
-        AgentKind::Codex => super::hooks::write_codex_hooks(&cwd, &paths)?,
-        AgentKind::Antigravity => {
-            agy_before = antigravity::conversations_dir().map(|d| antigravity::snapshot_ids(&d));
-        }
-    }
-
-    let claude_settings =
-        matches!(agent, AgentKind::Claude).then_some(paths.claude_settings.as_path());
     // Resolved per spawn, not cached across spawns: if the user updated the CLI
     // from inside a previous session, this is where the new copy gets picked up.
     let resolved = super::launcher::resolve(agent.program());
@@ -160,6 +151,50 @@ pub fn prepare(
             "resolved launcher"
         );
     }
+    let activity_hooks = super::hooks::supports_activity_hooks(
+        agent,
+        resolved.as_ref().and_then(|r| r.version.as_deref()),
+    );
+
+    // Hook registration is per-agent: Claude takes a settings file, Codex and
+    // Antigravity need a file inside the project.
+    let mut agy_before = None;
+    match agent {
+        AgentKind::Claude => super::hooks::write_claude_settings(&paths, activity_hooks)?,
+        AgentKind::Codex => super::hooks::write_codex_hooks(&cwd, &paths, activity_hooks)?,
+        AgentKind::Antigravity => {
+            let hooked = activity_hooks
+                && match super::hooks::write_antigravity_hooks(&cwd, &paths) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        tracing::debug!(
+                            target: "rustic::external_agents",
+                            "agy: project has its own .agents/hooks.json; activity hooks skipped"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "rustic::external_agents",
+                            "agy: writing .agents/hooks.json failed: {e}"
+                        );
+                        false
+                    }
+                };
+            // Every hook payload names its conversation, so with hooks the id
+            // arrives with the first turn. The store watch is only for when they
+            // can't be used: it guesses "the newest conversation since spawn",
+            // and with two sessions open it can hand one session's conversation
+            // to the other, leaving that session's hook events without a row.
+            if !hooked {
+                agy_before =
+                    antigravity::conversations_dir().map(|d| antigravity::snapshot_ids(&d));
+            }
+        }
+    }
+
+    let claude_settings =
+        matches!(agent, AgentKind::Claude).then_some(paths.claude_settings.as_path());
     let plan = build_launch_plan(
         agent,
         &mode,
@@ -169,6 +204,7 @@ pub fn prepare(
         &paths.spool,
         claude_settings,
         resolved.as_ref().map(|r| r.path.as_path()),
+        matches!(agent, AgentKind::Codex) && activity_hooks,
     );
 
     if existing.is_some() {
@@ -216,7 +252,12 @@ pub fn start_capture(
     let Ok(paths) = HookPaths::ensure(app_data_dir) else {
         return;
     };
-    ensure_drain_thread(db.clone(), emitter.clone(), paths.spool.clone());
+    ensure_drain_thread(
+        db.clone(),
+        emitter.clone(),
+        paths.spool.clone(),
+        paths.activity.clone(),
+    );
 
     if let (AgentKind::Antigravity, Some(before)) = (prep.agent, prep.agy_before.clone()) {
         let pty_key = prep.pty_key.clone();
@@ -299,7 +340,12 @@ fn watch_antigravity(
 /// One long-lived loop (rather than one per spawn) means a hook that fires long
 /// after its spawn — or while Rustic was restarting — is still folded in on the
 /// next pass.
-fn ensure_drain_thread(db: Arc<Mutex<Database>>, emitter: Arc<dyn EventEmitter>, spool: PathBuf) {
+fn ensure_drain_thread(
+    db: Arc<Mutex<Database>>,
+    emitter: Arc<dyn EventEmitter>,
+    spool: PathBuf,
+    activity_dir: PathBuf,
+) {
     if DRAIN_THREAD.set(()).is_err() {
         return;
     }
@@ -307,12 +353,31 @@ fn ensure_drain_thread(db: Arc<Mutex<Database>>, emitter: Arc<dyn EventEmitter>,
         std::thread::sleep(DRAIN_INTERVAL);
         let outcome = {
             let db = db.lock_safe();
-            drain_spool(&db, &spool)
+            drain_spool(&db, &spool, Some(&activity_dir))
         };
         if outcome.changed() {
             emitter.emit_json(SESSIONS_CHANGED_EVENT, serde_json::Value::Null);
         }
+        for row_id in &outcome.activity_sessions {
+            emitter.emit_json(
+                ACTIVITY_EVENT,
+                serde_json::json!({ "sessionRowId": row_id }),
+            );
+        }
     });
+}
+
+/// The newest activity rows of a session, oldest first.
+pub fn list_activity(
+    app_data_dir: &Path,
+    session_row_id: &str,
+    limit: usize,
+) -> Vec<ActivityEvent> {
+    super::activity::read(
+        &super::hooks::activity_dir(app_data_dir),
+        session_row_id,
+        limit,
+    )
 }
 
 /// Sessions for a project, newest first.
@@ -330,13 +395,19 @@ pub fn list_sessions(
 ///
 /// Purging is best effort: a transcript the CLI has already moved or rotated is
 /// not worth failing the delete over.
-pub fn delete_session(db: &Database, session_row_id: &str, purge_transcript: bool) -> Result<()> {
+pub fn delete_session(
+    db: &Database,
+    app_data_dir: &Path,
+    session_row_id: &str,
+    purge_transcript: bool,
+) -> Result<()> {
     if purge_transcript {
         if let Some(row) = db.get_external_agent_session(session_row_id)? {
             purge_transcript_files(&row);
         }
     }
     db.delete_external_agent_session(session_row_id)?;
+    super::activity::remove(&super::hooks::activity_dir(app_data_dir), session_row_id);
     Ok(())
 }
 
@@ -361,12 +432,12 @@ fn purge_transcript_files(row: &ExternalAgentSessionRow) {
 /// Files holding the CLI's own copy of a conversation.
 fn transcript_targets(row: &ExternalAgentSessionRow) -> Vec<PathBuf> {
     let mut targets: Vec<PathBuf> = Vec::new();
-    // Claude and Codex report their transcript path through the hooks.
+    // All three CLIs report their transcript path through the hooks.
     if let Some(path) = row.transcript_path.as_deref() {
         targets.push(PathBuf::from(path));
     }
-    // Antigravity has no hooks: its conversations are one SQLite file per id in
-    // the store we watch, so the path is derived rather than reported.
+    // Antigravity also keeps one SQLite file per conversation id in the store we
+    // watch; its path is derived rather than reported.
     if let (Some(AgentKind::Antigravity), Some(id)) = (
         AgentKind::from_str(&row.agent),
         row.external_session_id.as_deref(),

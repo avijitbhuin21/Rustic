@@ -37,8 +37,8 @@ pub use file_tree::{generate_file_tree, generate_file_tree_with_limits, tool_mut
 pub use index::{IndexStatus, SymbolEntry, SymbolIndex, SymbolKind};
 pub use mcp::{
     project_key as mcp_project_key, sha256_hex as mcp_sha256_hex, LoadProjectScopeResult,
-    McpConnectResult, McpConnectionStatus, McpManager, McpProjectSaveResult, McpProjectServerView,
-    McpScope, McpServerWithStatus, McpTransport, ServerConfig,
+    McpConnectionStatus, McpManager, McpProjectSaveResult, McpProjectServerView, McpScope,
+    McpServerWithStatus, McpStatusListener, McpTransport, McpTurnTools, ServerConfig,
 };
 pub use provider::{
     AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,

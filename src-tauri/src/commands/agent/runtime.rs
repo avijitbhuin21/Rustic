@@ -7,7 +7,51 @@ use crate::sync_ext::MutexExt;
 use rustic_agent::{ContentBlock, Message, NativePermissionDecision, Role, TaskCost, TaskStatus};
 use rustic_db::SubagentRecord;
 use std::sync::atomic::Ordering;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Warm a project's agent state when it becomes active — its file-history
+/// handle and MCP connections — so the first send doesn't pay for either.
+#[tauri::command]
+pub async fn prewarm_agent_project(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
+    let root = {
+        let workspace = state.workspace.lock_safe();
+        workspace
+            .list_projects()
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .ok_or_else(|| format!("Project not found: {}", project_id))?
+            .root_path
+            .clone()
+    };
+    let user_mcp_path = crate::app_paths::app_data_dir(&app)
+        .ok()
+        .map(|d| d.join("mcp.json"));
+    let mcp_arc = std::sync::Arc::clone(&state.agent.lock_safe().mcp_manager);
+    let mcp_root = root.clone();
+    let mcp = tokio::task::spawn_blocking(move || {
+        rustic_agent::McpManager::prewarm_project(&mcp_arc, user_mcp_path.as_deref(), &mcp_root);
+    });
+    let file_history = tokio::task::spawn_blocking(move || {
+        let Ok(canon_root) = root.canonicalize() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let state = app.state::<AppState>();
+        if let Err(e) =
+            crate::commands::file_history::get_or_create_handle(state.inner(), &app, &canon_root)
+        {
+            tracing::warn!(%e, "prewarm: file_history handle init failed");
+        }
+        tracing::info!(target: "rustic::timing", elapsed_ms = started.elapsed().as_millis() as u64, "prewarm: file-history handle init");
+    });
+    let _ = mcp.await;
+    let _ = file_history.await;
+    Ok(())
+}
 
 #[tauri::command(async)]
 pub fn get_task_cost(state: State<'_, AppState>, task_id: String) -> Result<TaskCost, String> {

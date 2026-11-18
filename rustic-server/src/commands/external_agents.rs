@@ -46,6 +46,7 @@ pub async fn dispatch(
         "resume_external_agent" => resume_external_agent(ctx, args).await,
         "list_external_agent_sessions" => list_external_agent_sessions(ctx, args),
         "delete_external_agent_session" => delete_external_agent_session(ctx, args),
+        "list_external_agent_activity" => list_external_agent_activity(ctx, args),
         _ => return None,
     })
 }
@@ -147,10 +148,32 @@ fn delete_external_agent_session(ctx: &ServerContext, args: &Value) -> Result<Va
         purge_transcript: Option<bool>,
     }
     let a: A = parse(args)?;
+    let data_dir = ctx.data_dir();
     let db = ctx.state().db.lock_safe();
-    service::delete_session(&db, &a.session_row_id, a.purge_transcript.unwrap_or(false))
-        .map_err(|e| e.to_string())?;
+    service::delete_session(
+        &db,
+        &data_dir,
+        &a.session_row_id,
+        a.purge_transcript.unwrap_or(false),
+    )
+    .map_err(|e| e.to_string())?;
     ok(serde_json::json!(null))
+}
+
+/// The newest activity rows (prompts, tool calls, approvals) of a CLI session.
+fn list_external_agent_activity(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        session_row_id: String,
+        limit: Option<usize>,
+    }
+    let a: A = parse(args)?;
+    ok(service::list_activity(
+        &ctx.data_dir(),
+        &a.session_row_id,
+        a.limit.unwrap_or(300),
+    ))
 }
 
 /// Shared body of spawn/resume: prepare, open a PTY, type the command in.

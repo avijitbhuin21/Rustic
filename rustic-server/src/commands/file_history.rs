@@ -233,17 +233,27 @@ pub(crate) fn get_or_create_handle(
     project_root: &Path,
 ) -> Result<FileHistoryHandle, String> {
     // Fast path: already in the registry.
-    {
+    let key = project_root.to_string_lossy().to_string();
+    let lookup = || -> Result<Option<FileHistoryHandle>, String> {
         let registry = state
             .file_history_registry
             .lock()
             .map_err(|e| format!("file_history_registry mutex poisoned: {e}"))?;
-        if let Some(handle) = registry.get(&project_root.to_string_lossy().to_string()) {
-            return Ok(handle.clone());
-        }
+        Ok(registry.get(&key).cloned())
+    };
+    if let Some(handle) = lookup()? {
+        return Ok(handle);
     }
 
-    // Slow path: construct outside the registry lock to keep contention low.
+    // Slow path: construct outside the registry lock to keep contention low,
+    // but one caller at a time — a send racing the project-open prewarm waits
+    // for that handle instead of building a second store + sweep worker.
+    static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _init = INIT.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(handle) = lookup()? {
+        return Ok(handle);
+    }
+
     // Spin up the FS-watcher accumulator before FileHistory so the targeted-
     // track path has it from the very first open_snapshot. Watcher failure is
     // non-fatal — FileHistory falls back to full walks with no accumulator.
@@ -317,7 +327,6 @@ pub(crate) fn get_or_create_handle(
         .file_history_registry
         .lock()
         .map_err(|e| format!("file_history_registry mutex poisoned: {e}"))?;
-    let key = project_root.to_string_lossy().to_string();
     let entry = registry.entry(key).or_insert(handle);
     Ok(entry.clone())
 }

@@ -83,6 +83,14 @@ function PlanContent({ todos }) {
           <span className="min-w-0 flex-1 whitespace-pre-wrap break-words leading-relaxed">
             {t.content}
           </span>
+          {t.group && (
+            <span
+              className="mt-0.5 shrink-0 rounded border border-border bg-muted px-1 text-[10px] leading-4 text-muted-foreground no-underline"
+              title="Independent of the other items in this group — can run together"
+            >
+              {t.group}
+            </span>
+          )}
         </li>
       ))}
     </ul>

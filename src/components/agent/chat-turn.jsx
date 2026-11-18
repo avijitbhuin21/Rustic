@@ -26,6 +26,7 @@ import { useRelativeTime } from '@/lib/relative-time';
 import { activeChatRoot } from '@/lib/file-links';
 import { MarkdownBlock } from './markdown-block';
 import { coalesceTextBlocks } from '@/lib/coalesce-text-blocks';
+import { ChatGalleryViewer } from './chat-image-gallery';
 
 
 const panelVariants = {
@@ -249,38 +250,51 @@ function collectChatImages(rows) {
   for (const row of rows || []) {
     const turn = row?.turn;
     if (!turn) continue;
-    for (const att of turn.user?.attachments || []) {
-      if (att && (att.url || att.src || att.deferred)) out.push({ ref: att, att, alt: att.name });
-    }
+    const userTs = turn.user?.timestamp || null;
+    const imgPaths = turn.user ? attachedImagePaths(turn.user) : [];
+    (turn.user?.attachments || []).forEach((att, i) => {
+      if (att && (att.url || att.src || att.deferred)) {
+        out.push({
+          ref: att,
+          att,
+          alt: att.name,
+          rowKey: row.key,
+          role: 'user',
+          timestamp: userTs,
+          path: att.path || att.relativePath || imgPaths[i] || null,
+        });
+      }
+    });
     for (const entry of turn.blocks || []) {
       const block = entry?.block;
       if (block?.type !== 'image') continue;
       const url = block.source?.url || block.url;
-      if (url) out.push({ ref: block, att: { url }, alt: undefined });
+      if (url) {
+        out.push({
+          ref: block,
+          att: { url },
+          alt: undefined,
+          rowKey: row.key,
+          role: 'assistant',
+          timestamp: entry?.timestamp || userTs,
+          path: block.path || null,
+        });
+      }
     }
   }
   return out;
 }
 
 /** Provide a shared, navigable image viewer for every image in the given transcript rows. */
-export function ChatImageGalleryProvider({ rows, children }) {
+export function ChatImageGalleryProvider({ rows, onGoToRow, children }) {
   const items = useMemo(() => collectChatImages(rows), [rows]);
   const [current, setCurrent] = useState(null);
   const [srcs, setSrcs] = useState(() => new Map());
-  const remember = (ref, url) => setSrcs((m) => (m.get(ref) === url ? m : new Map(m).set(ref, url)));
+  const remember = React.useCallback(
+    (ref, url) => setSrcs((m) => (m.get(ref) === url ? m : new Map(m).set(ref, url))),
+    [],
+  );
   const index = current ? items.findIndex((it) => it.ref === current) : -1;
-  const item = index >= 0 ? items[index] : null;
-  const src = item ? (item.att.url || item.att.src || srcs.get(item.ref) || null) : null;
-
-  useEffect(() => {
-    if (!item || src || !item.att.deferred) return undefined;
-    let cancelled = false;
-    const a = item.att;
-    fetchImageDataUrl(a.taskId, a.sortOrder, a.blockIndex, a.mediaType).then((url) => {
-      if (!cancelled && url) remember(item.ref, url);
-    });
-    return () => { cancelled = true; };
-  }, [item, src]);
 
   const ctx = useMemo(() => ({
     has: (ref) => items.some((it) => it.ref === ref),
@@ -288,22 +302,22 @@ export function ChatImageGalleryProvider({ rows, children }) {
       if (knownSrc) remember(ref, knownSrc);
       setCurrent(ref);
     },
-  }), [items]);
-
-  const onPrev = index > 0 ? () => setCurrent(items[index - 1].ref) : undefined;
-  const onNext = index >= 0 && index < items.length - 1 ? () => setCurrent(items[index + 1].ref) : undefined;
+  }), [items, remember]);
 
   return (
     <ChatImagesContext.Provider value={ctx}>
       {children}
-      <ImageLightbox
-        open={!!item}
-        onOpenChange={(v) => { if (!v) setCurrent(null); }}
-        src={src}
-        alt={item?.alt}
-        onPrev={onPrev}
-        onNext={onNext}
-        position={item ? { index, total: items.length } : null}
+      <ChatGalleryViewer
+        items={items}
+        index={index}
+        srcs={srcs}
+        onRemember={remember}
+        onSelect={(i) => setCurrent(items[i]?.ref ?? null)}
+        onClose={() => setCurrent(null)}
+        onGoToMessage={(it) => {
+          setCurrent(null);
+          if (it?.rowKey != null) onGoToRow?.(it.rowKey);
+        }}
       />
     </ChatImagesContext.Provider>
   );
@@ -503,7 +517,7 @@ function LooseFileRefs({ text, fileRefs, projectRoot }) {
   );
 }
 
-function CollapsibleUserText({ text, actions, fileRefs, projectRoot }) {
+function CollapsibleUserText({ text, actions, fileRefs, looseRefs, projectRoot }) {
   const [expanded, setExpanded] = useState(false);
   const innerRef = useRef(null);
   const [heights, setHeights] = useState(null);
@@ -557,7 +571,7 @@ function CollapsibleUserText({ text, actions, fileRefs, projectRoot }) {
           <MentionText text={text} fileRefs={fileRefs} projectRoot={projectRoot} />
         </div>
       </motion.div>
-      <LooseFileRefs text={text} fileRefs={fileRefs} projectRoot={projectRoot} />
+      <LooseFileRefs text={text} fileRefs={looseRefs ?? fileRefs} projectRoot={projectRoot} />
       {showActionRow && (
         <div className="mt-1 flex items-center justify-between gap-2">
           {canCollapse ? (
@@ -652,11 +666,25 @@ function CopyButton({ text }) {
 // That footer is purely for the model — the chat UI already renders the image
 // thumbnails above the bubble, so we strip it from the rendered text.
 const ATTACHED_IMAGES_FOOTER_RE =
-  /(?:\n\n)?\[Attached images\](?:\n[ \t]*-[^\n]*)+\s*$/;
+  /(?:\n\n)?\[Attached images\](?:\n[ \t]*-[^\n]*)+(?=\s*$|\n\n\[Referenced files)/;
 
 function stripAttachedImagesFooter(text) {
   if (!text) return text;
   return text.replace(ATTACHED_IMAGES_FOOTER_RE, '');
+}
+
+/** Returns the image paths listed in a message's `[Attached images]` footer. */
+function attachedImagePaths(message) {
+  const raw = (message?.content || [])
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text || '')
+    .join('\n');
+  const m = /\[Attached images\]((?:\n[ \t]*-[^\n]*)+)/.exec(raw);
+  if (!m) return [];
+  return m[1]
+    .split('\n')
+    .map((l) => l.replace(/^[ \t]*-[ \t]*/, '').trim())
+    .filter(Boolean);
 }
 
 // Pull a plain-text representation out of a user message's content blocks so
@@ -840,7 +868,16 @@ function InjectedPromptCapsule({ label, preview, text }) {
 function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
   const { user } = turn;
   const blocks = useMemo(() => coalesceTextBlocks(turn.blocks), [turn.blocks]);
-  const { text: strippedText, paths: fileRefs } = stripFileRefsFooter(userText(user));
+  const { text: strippedText, paths: fileRefs0 } = stripFileRefsFooter(userText(user));
+  const imageRefs = useMemo(() => {
+    const fromAtt = (user?.attachments || []).map((a) => a?.relativePath || a?.path).filter(Boolean);
+    return [...new Set([...attachedImagePaths(user), ...fromAtt])];
+  }, [user]);
+  const fileRefs = useMemo(
+    () => (imageRefs.length ? [...fileRefs0, ...imageRefs] : fileRefs0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [fileRefs0.join('\n'), imageRefs],
+  );
   const text = strippedText.trim();
   const escalation = parseEscalation(text);
   const peerMessage = parsePeerMessage(text);
@@ -926,6 +963,7 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                   text={text}
                   actions={userActions}
                   fileRefs={fileRefs}
+                  looseRefs={fileRefs0}
                   projectRoot={projectRoot}
                 />
               ) : null}

@@ -53,7 +53,16 @@ pub fn bootstrap(
     {
         let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
         let consent_path = data_dir.join("mcp_consent.json");
-        mcp_arc.lock_safe().set_consent_path(consent_path);
+        let mut mcp = mcp_arc.lock_safe();
+        mcp.set_consent_path(consent_path);
+        // Push each server's connect result to the MCP panels as it settles.
+        let status_emitter = emitter.clone();
+        mcp.set_status_listener(Arc::new(move |id, status, seq| {
+            status_emitter.emit_json(
+                "mcp-server-status",
+                serde_json::json!({ "id": id, "status": status, "seq": seq }),
+            );
+        }));
     }
 
     hydrate_config_and_secrets(&state, secrets);

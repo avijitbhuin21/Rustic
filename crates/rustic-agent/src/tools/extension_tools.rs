@@ -641,24 +641,36 @@ async fn add_mcp_server(params: Value, context: &ToolContext) -> Result<ToolOutp
     let name_for_block = name.clone();
     let add_result = tokio::task::spawn_blocking(
         move || -> anyhow::Result<(String, std::result::Result<Vec<crate::provider::ToolDef>, String>)> {
-            let mut m = mgr_clone.lock().unwrap_or_else(|p| p.into_inner());
             match scope {
                 McpScope::User => {
-                    m.add_pool_server(&name_for_block, &entry)?;
+                    mgr_clone
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .add_pool_server(&name_for_block, &entry)?;
                     let id = format!("user-{}", name_for_block);
-                    let connect = m.test_server(&id).map_err(|e| e.to_string());
+                    let connect = crate::mcp::McpManager::retest_server(&mgr_clone, &id)
+                        .map_err(|e| e.to_string());
                     Ok((id, connect))
                 }
                 McpScope::Project => {
-                    let res = m.save_project_server(&root, &name_for_block, Some(&entry), true, true)?;
-                    let id = m
+                    let res = crate::mcp::McpManager::save_project_server(
+                        &mgr_clone,
+                        &root,
+                        &name_for_block,
+                        Some(&entry),
+                        true,
+                    )?;
+                    let id = mgr_clone
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
                         .effective_config_for_project(&root, &name_for_block)
                         .map(|c| c.id)
                         .unwrap_or_else(|| name_for_block.clone());
                     let connect = if res.consent_required {
                         Err("the project's .mcp.json has changes not yet approved in Rustic; ask the user to approve it in Settings → MCP".to_string())
                     } else if res.connected {
-                        m.server_tools(&id).map_err(|e| e.to_string())
+                        crate::mcp::McpManager::list_server_tools(&mgr_clone, &id)
+                            .map_err(|e| e.to_string())
                     } else {
                         Err(res.error.unwrap_or_else(|| "connection failed".to_string()))
                     };
@@ -935,10 +947,9 @@ async fn uninstall_extension(params: Value, context: &ToolContext) -> Result<Too
             if scope_c.as_deref() == Some("project") {
                 let root = context.project_root.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    mgr_clone
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .save_project_server(&root, &name_c, None, false, false)
+                    crate::mcp::McpManager::save_project_server(
+                        &mgr_clone, &root, &name_c, None, false,
+                    )
                 })
                 .await;
                 return Ok(match res {

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { ArrowLeft, Loader2, Play, Square, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
@@ -10,11 +10,31 @@ import { TerminalPane } from '@/components/terminal/lazy-terminal-pane';
 import { useExternalAgents } from '@/state/external-agents';
 import { agentLabel } from './external-agent-launchers';
 import { useCliBusy } from './cli-activity';
+import { CliActivityList } from './cli-activity-list';
+import { CliInsertPicker } from './cli-insert-picker';
+
+const RUSTIC_FILE_MIME = 'application/x-rustic-file';
+
+/** The persistent terminal instance for a PTY (its module is a lazy chunk). */
+async function terminalInstance(ptySessionId) {
+  const mod = await import('@/components/terminal/terminal-instance');
+  return mod.acquireTerminalInstance(ptySessionId);
+}
+
+/** `path` relative to `root` with forward slashes when it sits inside it; otherwise unchanged. */
+function relativeTo(root, path) {
+  const norm = (p) => String(p).replace(/\\/g, '/').replace(/\/+$/, '');
+  const base = root ? norm(root) : '';
+  const full = norm(path);
+  return base && full.startsWith(`${base}/`) ? full.slice(base.length + 1) : full;
+}
 
 /**
  * A CLI agent conversation (Claude Code / Codex / agy) rendered as a chat inside
  * the agent panel. The body is the agent's own PTY — the user types straight
  * into the tool, and stopping it is that tool's own Ctrl+C or the stop button.
+ * Around it: an activity list fed by the CLI's hooks, and an insert picker /
+ * file drop that paste text at the CLI's cursor but never submit it.
  *
  * The terminal instance is owned by terminal-instance.js, so switching to a
  * Rustic chat and back keeps the whole session on screen.
@@ -24,6 +44,59 @@ export function CliChatView({ row, onBack }) {
   const busy = useCliBusy(ptySessionId);
   const live = ptySessionId != null;
   const resumable = !!row.external_session_id;
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [dropping, setDropping] = useState(false);
+
+  // Paste text at the CLI's cursor. Never submits (see insertText).
+  const insert = useCallback(
+    async (text) => {
+      if (ptySessionId == null) return;
+      try {
+        (await terminalInstance(ptySessionId)).insertText(text);
+      } catch (err) {
+        toast.error(String(err));
+      }
+    },
+    [ptySessionId],
+  );
+
+  // The CLI terminal sits on the chat surface, and its shortcut opens the picker.
+  useEffect(() => {
+    if (ptySessionId == null) return undefined;
+    let inst = null;
+    let gone = false;
+    terminalInstance(ptySessionId)
+      .then((i) => {
+        if (gone) return;
+        inst = i;
+        inst.setSurface('--background');
+        inst.setOnOpenPicker(() => setPickerOpen(true));
+      })
+      .catch(() => {});
+    return () => {
+      gone = true;
+      inst?.setOnOpenPicker(null);
+      inst?.setSurface(null);
+    };
+  }, [ptySessionId]);
+
+  const draggedPath = (e) =>
+    e.dataTransfer.types.includes(RUSTIC_FILE_MIME) ? e.dataTransfer.getData(RUSTIC_FILE_MIME) : '';
+
+  const onDragOver = (e) => {
+    if (!live || !e.dataTransfer.types.includes(RUSTIC_FILE_MIME)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    setDropping(true);
+  };
+
+  const onDrop = (e) => {
+    setDropping(false);
+    const path = draggedPath(e);
+    if (!live || !path) return;
+    e.preventDefault();
+    insert(`@${relativeTo(row.cwd, path)} `);
+  };
 
   const resume = async () => {
     try {
@@ -84,6 +157,14 @@ export function CliChatView({ row, onBack }) {
           {row.title || `${agentLabel(row.agent)} session`}
         </span>
         <div className="ml-auto flex items-center gap-1">
+          {live && (
+            <CliInsertPicker
+              projectRoot={row.cwd}
+              open={pickerOpen}
+              onOpenChange={setPickerOpen}
+              onInsert={insert}
+            />
+          )}
           {live ? (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -126,7 +207,13 @@ export function CliChatView({ row, onBack }) {
           </Tooltip>
         </div>
       </div>
-      <div className="min-h-0 flex-1 bg-background p-1">
+      <CliActivityList row={row} live={live} />
+      <div
+        className={`relative min-h-0 flex-1 bg-background px-3 pb-2 pt-2 ${dropping ? 'ring-1 ring-inset ring-info' : ''}`}
+        onDragOverCapture={onDragOver}
+        onDragLeave={() => setDropping(false)}
+        onDropCapture={onDrop}
+      >
         {live ? (
           <TerminalPane sessionId={ptySessionId} active />
         ) : (

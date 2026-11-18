@@ -527,7 +527,8 @@ fn format_todo_block(todos: &[TodoItem]) -> Option<String> {
          ## Active todo list (preserved verbatim — not summarized)\n\n",
     );
     for (i, t) in todos.iter().enumerate() {
-        out.push_str(&format!("{}. [{}] {}\n", i + 1, t.status, t.content));
+        out.push_str(&t.line(i));
+        out.push('\n');
     }
     out.push_str("\nContinue working from this list; keep it current with todo_write.\n");
     Some(out)

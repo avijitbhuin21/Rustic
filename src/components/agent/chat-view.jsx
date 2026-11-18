@@ -207,8 +207,21 @@ function VirtualTurnList({ rows, toolResults, taskId, projectRoot, scrollRef, st
     if (el) el.scrollTop = el.scrollHeight;
   }, [totalSize, rows.length, scrollRef, stickRef]);
 
+  const [flashKey, setFlashKey] = React.useState(null);
+  const goToRow = React.useCallback((rowKey) => {
+    const idx = rows.findIndex((r) => r.key === rowKey);
+    if (idx < 0) return;
+    if (stickRef) stickRef.current = false;
+    virtualizer.scrollToIndex(idx, { align: 'start' });
+    // A second pass after measurement settles — estimated sizes above the
+    // target shift its real offset once those rows mount.
+    setTimeout(() => virtualizer.scrollToIndex(idx, { align: 'start' }), 120);
+    setFlashKey(rowKey);
+    setTimeout(() => setFlashKey((k) => (k === rowKey ? null : k)), 1600);
+  }, [rows, virtualizer, stickRef]);
+
   return (
-    <ChatImageGalleryProvider rows={rows}>
+    <ChatImageGalleryProvider rows={rows} onGoToRow={goToRow}>
     <motion.div
       initial={{ opacity: 0 }}
       animate={{ opacity: 1, transition: { duration: 0.2, delay: 0.05 } }}
@@ -222,7 +235,10 @@ function VirtualTurnList({ rows, toolResults, taskId, projectRoot, scrollRef, st
             key={vi.key}
             data-index={vi.index}
             ref={virtualizer.measureElement}
-            className="absolute left-0 w-full"
+            className={cn(
+              'absolute left-0 w-full transition-colors duration-700',
+              flashKey === row.key && 'bg-primary/10',
+            )}
             style={{ top: vi.start }}
           >
             {row.type === 'divider' ? (
@@ -634,14 +650,17 @@ export function ChatView() {
   }, [turns, markersByTurnIndex]);
 
   // True while the user has sent a message but the backend hasn't streamed
-  // any assistant content yet — the cold-start setup window on the first
-  // send. Shows a small "Preparing…" pill below the last turn so the chat
-  // doesn't look frozen for the few seconds before the first delta lands.
+  // any assistant content yet. Shows a small pill below the last turn so the
+  // chat doesn't look frozen: "Preparing…" during local setup, "Thinking…"
+  // once the backend reports Running and the wait is the model's.
   const isPreparing =
     isStreaming &&
     turns.length > 0 &&
     turns[turns.length - 1].user &&
     turns[turns.length - 1].blocks.length === 0;
+  const setupDone = useAgent(
+    (s) => String(s.statusByTask[s.activeTaskId] || '').toLowerCase() === 'running'
+  );
 
   const openTools = (tab) => {
     setToolsTab(tab);
@@ -965,7 +984,7 @@ export function ChatView() {
                         className="mx-auto flex w-full max-w-3xl items-center gap-2 px-6 pb-2 pt-1 text-xs text-muted-foreground"
                       >
                         <Loader2 className="size-3.5 animate-spin text-info" />
-                        <span>Preparing…</span>
+                        <span>{setupDone ? 'Thinking…' : 'Preparing…'}</span>
                       </motion.div>
                     )}
                   </AnimatePresence>

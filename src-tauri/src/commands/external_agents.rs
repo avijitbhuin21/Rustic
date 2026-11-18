@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustic_app::external_agents::activity::ActivityEvent;
 use rustic_app::external_agents::service::{self, SpawnTarget};
 use rustic_app::external_agents::{
     annotate_updates, detect_agents, missing_agents, AgentKind, AgentPermissionMode, DetectedAgent,
@@ -120,13 +121,35 @@ pub async fn list_external_agent_sessions(
 /// tool's native resume picker.
 #[tauri::command]
 pub async fn delete_external_agent_session(
+    app: AppHandle,
     state: State<'_, AppState>,
     session_row_id: String,
     purge_transcript: Option<bool>,
 ) -> Result<(), String> {
+    let data_dir = app_data_dir(&app).map_err(|e| e.to_string())?;
     let db = state.db.lock_safe();
-    service::delete_session(&db, &session_row_id, purge_transcript.unwrap_or(false))
-        .map_err(|e| e.to_string())
+    service::delete_session(
+        &db,
+        &data_dir,
+        &session_row_id,
+        purge_transcript.unwrap_or(false),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// The newest activity rows (prompts, tool calls, approvals) of a CLI session.
+#[tauri::command]
+pub async fn list_external_agent_activity(
+    app: AppHandle,
+    session_row_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<ActivityEvent>, String> {
+    let data_dir = app_data_dir(&app).map_err(|e| e.to_string())?;
+    Ok(service::list_activity(
+        &data_dir,
+        &session_row_id,
+        limit.unwrap_or(300),
+    ))
 }
 
 /// Shared body of spawn/resume: prepare, open a PTY, type the command in.

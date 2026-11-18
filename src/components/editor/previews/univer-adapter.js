@@ -17,6 +17,51 @@
 //   BooleanNumber:   0=false, 1=true
 
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
+
+const SHEET_RELS = /^xl\/worksheets\/_rels\/[^/]+\.rels$/;
+const COMMENT_REL = /\/relationships\/(comments|vmlDrawing)["']/;
+const EXCELJS_COMMENT_TARGET =
+  /\bTarget\s*=\s*["']\.\.\/(comments\d+\.xml|drawings\/vmlDrawing\d+\.vml)["']/;
+
+/**
+ * Make worksheet relationships loadable by ExcelJS, which throws on two things
+ * valid OOXML allows (and openpyxl writes):
+ *  - absolute targets (`/xl/tables/table1.xml`) — rewritten to the
+ *    sheet-relative form (`../tables/table1.xml`) ExcelJS looks parts up by;
+ *  - comment parts not named the way Excel names them — those relationships
+ *    are dropped, since ExcelJS never reads such parts and the viewer shows
+ *    no comments.
+ * Returns the original buffer when nothing needs rewriting.
+ *
+ * @param {ArrayBuffer} buffer
+ * @returns {Promise<ArrayBuffer>}
+ */
+export async function normalizeSheetRelTargets(buffer) {
+  let zip;
+  try {
+    zip = await JSZip.loadAsync(buffer);
+  } catch {
+    return buffer;
+  }
+  let changed = false;
+  for (const name of Object.keys(zip.files)) {
+    if (!SHEET_RELS.test(name)) continue;
+    const xml = await zip.file(name).async('string');
+    const fixed = xml.replace(/<Relationship\b[^>]*?(?:\/>|>\s*<\/Relationship>)/g, (tag) => {
+      if (/TargetMode\s*=\s*["']External["']/.test(tag)) return tag;
+      const relative = tag.replace(/(\bTarget\s*=\s*["'])\/xl\//, '$1../');
+      return COMMENT_REL.test(relative) && !EXCELJS_COMMENT_TARGET.test(relative) ? '' : relative;
+    });
+    if (fixed !== xml) {
+      zip.file(name, fixed);
+      changed = true;
+    }
+  }
+  if (!changed) return buffer;
+  // DEFLATE lets JSZip reuse the untouched entries' compressed bytes.
+  return zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' });
+}
 
 // Numeric mirrors of the Univer enums so we don't have to import the
 // enum objects from @univerjs/core at this layer (keeps the adapter
@@ -146,7 +191,7 @@ function applyStyleToExcelCell(style, target) {
  */
 export async function excelJsBufferToUniver(buffer, workbookName = 'Workbook') {
   const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(buffer);
+  await wb.xlsx.load(await normalizeSheetRelTargets(buffer));
 
   // Hoist every unique style into the workbook-level `styles` map and
   // reference them from cells by id. This is how Univer recommends

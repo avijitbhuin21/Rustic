@@ -7,14 +7,15 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Save, RefreshCw, Check, X, Play, Trash2 } from 'lucide-react';
+import { Save, RefreshCw, Check, X, Play, Trash2, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { toastError } from '@/lib/toast-error';
 import { useAgent } from '@/state/agent';
 import { cn } from '@/lib/utils';
+import { applyMcpStatus, mcpStatusReady, reconcileMcpList, useMcpServerStatus } from '@/lib/mcp-status';
 
 // Last-loaded panel data per project, so reopening the panel renders instantly
-// while a background refresh runs (list_mcp_servers connects servers and is slow).
+// while a background refresh runs.
 const panelCache = new Map();
 
 /** Merge fresh panel data into the per-project cache. */
@@ -60,9 +61,11 @@ export function McpPanel() {
       .catch(() => {
         if (current()) setJson((j) => j ?? '{\n  "mcpServers": {}\n}');
       });
-    const listTask = invoke('list_mcp_servers', { projectId: pid })
+    // Listen before listing, so a server that settles instantly isn't missed.
+    const listTask = mcpStatusReady()
+      .then(() => invoke('list_mcp_servers', { projectId: pid }))
       .then((list) => {
-        const next = Array.isArray(list) ? list : [];
+        const next = reconcileMcpList(Array.isArray(list) ? list : []);
         cachePatch(pid, { servers: next });
         if (current()) setServers(next);
       })
@@ -84,6 +87,14 @@ export function McpPanel() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Servers connect in the background; each one's result lands on its own row.
+  useMcpServerStatus((evt) => {
+    for (const [pid, entry] of panelCache) {
+      if (entry.servers) cachePatch(pid, { servers: applyMcpStatus(entry.servers, evt) });
+    }
+    setServers((list) => applyMcpStatus(list, evt));
+  });
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -210,7 +221,8 @@ export function McpPanel() {
                 >
                   <span className="font-mono">{s.name || s.id}</span>
                   {s.status && (
-                    <Badge variant="outline" className="h-4 text-[10px]">
+                    <Badge variant="outline" className="h-4 gap-1 text-[10px]">
+                      {s.status.state === 'connecting' && <Loader2 className="size-2.5 animate-spin" />}
                       {(typeof s.status === 'string' ? s.status : s.status.state) ?? 'unknown'}
                       {typeof s.status === 'object' && s.status.tool_count != null
                         ? ` · ${s.status.tool_count}`

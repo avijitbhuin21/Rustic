@@ -19,9 +19,11 @@ import {
   Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup, SelectLabel,
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Skeleton } from '@/components/ui/skeleton';
 import { toast } from 'sonner';
 import { toastError } from '@/lib/toast-error';
 import { cn } from '@/lib/utils';
+import { applyMcpStatus, mcpStatusReady, reconcileMcpList, useMcpServerStatus } from '@/lib/mcp-status';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
@@ -53,10 +55,8 @@ export function McpJsonDialog({ open, onClose }) {
     catch { toast.error('Invalid JSON'); return; }
     setSaving(true);
     try {
-      const results = await invoke('save_mcp_json', { scope: 'user', projectId: null, content: json });
-      const failed = (results || []).filter((r) => !r.connected);
-      if (failed.length === 0) toast.success('MCP saved');
-      else toast.error(`Saved, but ${failed.length} server(s) failed to connect`);
+      await invoke('save_mcp_json', { scope: 'user', projectId: null, content: json });
+      toast.success('MCP saved');
       onClose();
     } catch (e) { toastError(null, e); }
     finally { setSaving(false); }
@@ -94,7 +94,7 @@ export function McpServerRow({ server, onRemove, onConfigure }) {
   const id = server.id || server.name;
   const st = server.status || { state: 'unknown' };
   const connected = st.state === 'connected';
-  const { label, tone } = statusBadge(st);
+  const { label, tone, busy } = statusBadge(st);
 
   const toggle = async () => {
     const next = !open;
@@ -126,7 +126,10 @@ export function McpServerRow({ server, onRemove, onConfigure }) {
           <span className="w-3.5 shrink-0" />
         )}
         <span className="text-[12px] font-mono flex-1 truncate">{server.name || id}</span>
-        <Badge variant="outline" className={cn('h-5 text-[10px]', tone)}>{label}</Badge>
+        <Badge variant="outline" className={cn('h-5 gap-1 text-[10px]', tone)}>
+          {busy && <Loader2 className="size-2.5 animate-spin" />}
+          {label}
+        </Badge>
         <Button
           size="sm" variant="ghost" className="h-7 gap-1 px-2 text-[11px] text-muted-foreground hover:text-foreground"
           title="Configure per project"
@@ -173,22 +176,28 @@ export function McpServerRow({ server, onRemove, onConfigure }) {
 }
 
 export function McpSection() {
-  const [servers, setServers] = useState([]);
+  // `null` = not loaded yet (renders a skeleton, not the empty state).
+  const [servers, setServers] = useState(null);
   const [jsonOpen, setJsonOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [configuring, setConfiguring] = useState(null);
 
   // The Settings list shows the global pool (projectId: null → pool only).
   // Per-project overrides are edited through each row's Configure dialog.
+  // The call returns at once; servers still coming up arrive as `connecting`
+  // and each row is filled in by its status event.
   const refresh = async () => {
-    if (!isTauri()) return;
+    if (!isTauri()) { setServers([]); return; }
     try {
+      // Listen before listing, so a server that settles instantly isn't missed.
+      await mcpStatusReady();
       const list = await invoke('list_mcp_servers', { projectId: null });
-      setServers(Array.isArray(list) ? list : []);
-    } catch { setServers([]); }
+      setServers(reconcileMcpList(Array.isArray(list) ? list : []));
+    } catch { setServers((s) => s ?? []); }
   };
   useEffect(() => { refresh(); }, []);
   useExtensionsChanged(refresh);
+  useMcpServerStatus((evt) => setServers((list) => applyMcpStatus(list, evt)));
 
   const remove = async (id) => {
     try { await invoke('remove_mcp_server', { id }); refresh(); }
@@ -218,7 +227,17 @@ export function McpSection() {
         </>
       }
     >
-      {servers.length === 0 ? (
+      {servers === null ? (
+        <div className="space-y-2" aria-busy="true" aria-label="Loading MCP servers">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="flex items-center gap-2 px-3 py-2">
+              <Skeleton className="h-3.5 w-36" />
+              <span className="flex-1" />
+              <Skeleton className="h-5 w-24" />
+            </div>
+          ))}
+        </div>
+      ) : servers.length === 0 ? (
         <div className="text-[12px] text-muted-foreground">
           No MCP servers configured.<br />
           Click + to add one, or "Edit JSON" to paste a standard <code className="text-[11px]">.mcp.json</code>.

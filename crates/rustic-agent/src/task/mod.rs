@@ -441,6 +441,34 @@ pub enum FileTrackedKind {
 pub struct TodoItem {
     pub content: String,
     pub status: String, // "pending", "in_progress", "completed"
+    /// Items sharing a label are independent of each other and may be worked on together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl TodoItem {
+    /// Render this item as one numbered checklist line (`index` is 0-based).
+    pub fn line(&self, index: usize) -> String {
+        match &self.group {
+            Some(g) => format!(
+                "{}. [{}] {} (group: {})",
+                index + 1,
+                self.status,
+                self.content,
+                g
+            ),
+            None => format!("{}. [{}] {}", index + 1, self.status, self.content),
+        }
+    }
+
+    /// Normalise a model-supplied group label: trimmed, `None` when blank.
+    pub fn parse_group(value: Option<&serde_json::Value>) -> Option<String> {
+        value
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .map(str::to_string)
+    }
 }
 
 /// Bounded sender for TaskEvent. Used to be `UnboundedSender`, but that let

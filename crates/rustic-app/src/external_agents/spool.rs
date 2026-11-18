@@ -11,6 +11,7 @@ use std::path::Path;
 
 use rustic_db::Database;
 
+use super::activity;
 use super::hooks::{pty_key_from_spool_name, title_from_prompt, HookPayload};
 
 /// Outcome of one drain pass.
@@ -23,6 +24,8 @@ pub struct DrainOutcome {
     pub deferred: usize,
     /// Row ids whose session id or title changed, so the host can tell the UI.
     pub touched_sessions: Vec<String>,
+    /// Row ids that gained activity rows in this pass.
+    pub activity_sessions: Vec<String>,
 }
 
 impl DrainOutcome {
@@ -36,7 +39,10 @@ impl DrainOutcome {
 /// A payload whose `pty_key` has no matching row is *deferred*, not discarded:
 /// a hook can fire before the host has finished inserting the session row, and
 /// dropping it would lose the only disclosure of that conversation's id.
-pub fn drain_spool(db: &Database, spool: &Path) -> DrainOutcome {
+///
+/// With `activity_dir`, events the activity list shows are also appended to the
+/// session's log there.
+pub fn drain_spool(db: &Database, spool: &Path, activity_dir: Option<&Path>) -> DrainOutcome {
     let mut outcome = DrainOutcome::default();
     let Ok(entries) = std::fs::read_dir(spool) else {
         return outcome;
@@ -63,16 +69,36 @@ pub fn drain_spool(db: &Database, spool: &Path) -> DrainOutcome {
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(payload) = serde_json::from_str::<HookPayload>(&body) else {
+        let parsed = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|raw| {
+                let payload = serde_json::from_value::<HookPayload>(raw.clone()).ok()?;
+                Some((raw, payload))
+            });
+        let Some((raw, payload)) = parsed else {
             tracing::debug!(target: "rustic::external_agents", file = %name, "spool: unparseable payload discarded");
             let _ = std::fs::remove_file(&path);
             continue;
         };
 
         match apply_payload(db, &pty_key, &payload) {
-            Ok(Some(session_id)) => {
+            Ok(Some((session_id, row_changed))) => {
                 outcome.applied += 1;
-                if !outcome.touched_sessions.contains(&session_id) {
+                if let (Some(dir), Some(event)) =
+                    (activity_dir, activity::normalize(&raw, activity::now_ms()))
+                {
+                    match activity::append(dir, &session_id, &event) {
+                        Ok(()) => {
+                            if !outcome.activity_sessions.contains(&session_id) {
+                                outcome.activity_sessions.push(session_id.clone());
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "rustic::external_agents", "activity: append failed: {e}")
+                        }
+                    }
+                }
+                if row_changed && !outcome.touched_sessions.contains(&session_id) {
                     outcome.touched_sessions.push(session_id);
                 }
                 let _ = std::fs::remove_file(&path);
@@ -91,13 +117,17 @@ pub fn drain_spool(db: &Database, spool: &Path) -> DrainOutcome {
     outcome
 }
 
-/// Apply one payload. Returns the affected row id, or `None` when no row is
-/// registered for this `pty_key` yet.
+/// Apply one payload. Returns the affected row id and whether the session list
+/// needs refreshing, or `None` when no row is registered for this `pty_key` yet.
+///
+/// Tool and approval events arrive many times a turn and change nothing the
+/// session list shows, so they must not trigger a list refresh each time.
 fn apply_payload(
     db: &Database,
     pty_key: &str,
     payload: &HookPayload,
-) -> rustic_db::Result<Option<String>> {
+) -> rustic_db::Result<Option<(String, bool)>> {
+    let before = db.get_external_agent_session_by_pty_key(pty_key)?;
     let row_id = match payload.session_id.as_deref() {
         Some(external_id) if !external_id.is_empty() => db.attach_external_agent_session_id(
             pty_key,
@@ -119,7 +149,23 @@ fn apply_payload(
         db.set_external_agent_session_title(pty_key, &title)?;
     }
     db.touch_external_agent_session(pty_key)?;
-    Ok(Some(row_id))
+
+    let session_event = matches!(
+        payload.hook_event_name.as_deref(),
+        None | Some("SessionStart" | "UserPromptSubmit")
+    );
+    let after = db.get_external_agent_session(&row_id)?;
+    let row_changed = session_event
+        || match (&before, &after) {
+            (Some(b), Some(a)) => {
+                b.id != a.id
+                    || b.external_session_id != a.external_session_id
+                    || b.title != a.title
+                    || b.transcript_path != a.transcript_path
+            }
+            _ => true,
+        };
+    Ok(Some((row_id, row_changed)))
 }
 
 #[cfg(test)]
@@ -195,7 +241,7 @@ mod tests {
             }),
         );
 
-        let outcome = drain_spool(&db, &spool.dir);
+        let outcome = drain_spool(&db, &spool.dir, None);
         assert_eq!(outcome.applied, 2);
         assert_eq!(outcome.deferred, 0);
         assert_eq!(outcome.touched_sessions, vec!["s1".to_string()]);
@@ -216,7 +262,7 @@ mod tests {
             serde_json::json!({ "hook_event_name": "SessionStart", "session_id": "ext-9" }),
         );
 
-        let outcome = drain_spool(&db, &spool.dir);
+        let outcome = drain_spool(&db, &spool.dir, None);
         assert_eq!(outcome.applied, 0);
         assert_eq!(outcome.deferred, 1);
         assert!(!outcome.changed());
@@ -231,9 +277,83 @@ mod tests {
         let k = key();
         std::fs::write(spool.dir.join(format!("{k}-x.json")), "{ broken").unwrap();
 
-        let outcome = drain_spool(&db, &spool.dir);
+        let outcome = drain_spool(&db, &spool.dir, None);
         assert_eq!(outcome.applied, 0);
         assert_eq!(spool.count(), 0);
+    }
+
+    #[test]
+    fn tool_events_land_in_the_activity_log_without_refreshing_the_list() {
+        let k = key();
+        let db = db_with_session(&k);
+        let spool = Spool::new();
+        let activity_dir = spool.dir.join("activity");
+        spool.write(
+            &k,
+            serde_json::json!({ "hook_event_name": "UserPromptSubmit", "session_id": "e", "prompt": "list files" }),
+        );
+        let first = drain_spool(&db, &spool.dir, Some(&activity_dir));
+        assert_eq!(first.touched_sessions, vec!["s1".to_string()]);
+        assert_eq!(first.activity_sessions, vec!["s1".to_string()]);
+
+        spool.write(
+            &k,
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "e",
+                "tool_name": "Bash",
+                "tool_use_id": "t1",
+                "tool_input": { "command": "ls" }
+            }),
+        );
+        // Antigravity's dialect carries no session id at all.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        spool.write(
+            &k,
+            serde_json::json!({
+                "hookEventName": "PostToolUse",
+                "toolCall": { "id": "c1", "name": "read_file", "args": { "Path": "/tmp/p1/a.txt" } }
+            }),
+        );
+        let second = drain_spool(&db, &spool.dir, Some(&activity_dir));
+        assert_eq!(second.applied, 2);
+        assert!(
+            !second.changed(),
+            "tool events must not refresh the session list"
+        );
+        assert_eq!(second.activity_sessions, vec!["s1".to_string()]);
+
+        let rows = activity::read(&activity_dir, "s1", 50);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].kind, activity::ActivityKind::Prompt);
+        assert_eq!(rows[1].text.as_deref(), Some("ls"));
+        assert_eq!(rows[2].paths, vec!["/tmp/p1/a.txt".to_string()]);
+    }
+
+    #[test]
+    fn antigravity_payloads_supply_the_conversation_id_title_and_transcript() {
+        let k = key();
+        let db = db_with_session(&k);
+        let spool = Spool::new();
+        spool.write(
+            &k,
+            serde_json::json!({
+                "hookEventName": "PreInvocation",
+                "invocationNum": 0,
+                "conversationId": "conv-1",
+                "transcriptPath": "/brain/conv-1/transcript_full.jsonl",
+                "lastUserInput": "read the notes"
+            }),
+        );
+        let outcome = drain_spool(&db, &spool.dir, None);
+        assert_eq!(outcome.touched_sessions, vec!["s1".to_string()]);
+        let row = db.get_external_agent_session("s1").unwrap().unwrap();
+        assert_eq!(row.external_session_id.as_deref(), Some("conv-1"));
+        assert_eq!(row.title.as_deref(), Some("read the notes"));
+        assert_eq!(
+            row.transcript_path.as_deref(),
+            Some("/brain/conv-1/transcript_full.jsonl")
+        );
     }
 
     #[test]
@@ -245,12 +365,12 @@ mod tests {
             &k,
             serde_json::json!({ "hook_event_name": "UserPromptSubmit", "session_id": "e", "prompt": "first" }),
         );
-        drain_spool(&db, &spool.dir);
+        drain_spool(&db, &spool.dir, None);
         spool.write(
             &k,
             serde_json::json!({ "hook_event_name": "UserPromptSubmit", "session_id": "e", "prompt": "second" }),
         );
-        drain_spool(&db, &spool.dir);
+        drain_spool(&db, &spool.dir, None);
 
         let row = db.get_external_agent_session("s1").unwrap().unwrap();
         assert_eq!(row.title.as_deref(), Some("first"));

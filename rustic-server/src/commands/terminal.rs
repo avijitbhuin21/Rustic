@@ -157,6 +157,7 @@ fn finalize_session_exit(ctx: &ServerContext, session_id: u64) {
             output_tail: tail,
             exited_at_ms,
             kind: TerminalNoticeKind::Exited,
+            output_delivered: !cmd_was_in_flight,
         };
         if let Ok(mut q) = state.agent_terminal_exits.lock() {
             q.entry(task_id.clone()).or_default().push(entry);
@@ -212,6 +213,7 @@ fn on_agent_command_finished(ctx: &ServerContext, session_id: u64) {
         output_tail: tail,
         exited_at_ms,
         kind: TerminalNoticeKind::CommandFinished,
+        output_delivered: false,
     };
     if let Ok(mut q) = state.agent_terminal_exits.lock() {
         q.entry(task_id.clone()).or_default().push(entry);

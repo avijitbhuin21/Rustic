@@ -154,6 +154,14 @@ pub fn run() {
                 let consent_path = app_data_dir.join("mcp_consent.json");
                 let mut mcp = mcp_arc.lock_safe();
                 mcp.set_consent_path(consent_path);
+                // Push each server's connect result to the MCP panels as it settles.
+                let status_app = app.handle().clone();
+                mcp.set_status_listener(Arc::new(move |id, status, seq| {
+                    let _ = status_app.emit(
+                        "mcp-server-status",
+                        serde_json::json!({ "id": id, "status": status, "seq": seq }),
+                    );
+                }));
             }
 
             // Restore AI config and hydrate API keys from the OS keychain.
@@ -363,6 +371,7 @@ pub fn run() {
             commands::external_agents::resume_external_agent,
             commands::external_agents::list_external_agent_sessions,
             commands::external_agents::delete_external_agent_session,
+            commands::external_agents::list_external_agent_activity,
             commands::search::start_search,
             commands::search::cancel_search,
             commands::search::replace_in_file,
@@ -550,6 +559,7 @@ pub fn run() {
             commands::agent::clear_memory,
             commands::agent::switch_model,
         commands::agent::set_task_thinking_tier,
+            commands::agent::prewarm_agent_project,
             commands::agent::get_project_defaults,
             commands::agent::save_project_defaults,
             commands::skills::list_skills,

@@ -174,6 +174,93 @@ fn short_kind(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// JSON types a property schema accepts, read from `type` and from `anyOf` / `oneOf` variants.
+fn schema_types(schema: &serde_json::Value) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    match schema.get("type") {
+        Some(serde_json::Value::String(s)) => out.push(s.as_str()),
+        Some(serde_json::Value::Array(a)) => out.extend(a.iter().filter_map(|v| v.as_str())),
+        _ => {}
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(variants) = schema.get(key).and_then(|v| v.as_array()) {
+            for variant in variants {
+                out.extend(schema_types(variant));
+            }
+        }
+    }
+    out
+}
+
+/// Parse a string argument as the first of `types` it is a valid value of.
+fn parse_string_as(text: &str, types: &[&str]) -> Option<serde_json::Value> {
+    let t = text.trim();
+    for ty in types {
+        let parsed = match *ty {
+            "integer" => t.parse::<i64>().ok().map(serde_json::Value::from),
+            "number" => t
+                .parse::<i64>()
+                .ok()
+                .map(serde_json::Value::from)
+                .or_else(|| {
+                    t.parse::<f64>()
+                        .ok()
+                        .and_then(serde_json::Number::from_f64)
+                        .map(serde_json::Value::Number)
+                }),
+            "boolean" => match t {
+                "true" => Some(serde_json::Value::Bool(true)),
+                "false" => Some(serde_json::Value::Bool(false)),
+                _ => None,
+            },
+            "null" => (t == "null").then_some(serde_json::Value::Null),
+            "array" => serde_json::from_str::<serde_json::Value>(t)
+                .ok()
+                .filter(|v| v.is_array()),
+            "object" => serde_json::from_str::<serde_json::Value>(t)
+                .ok()
+                .filter(|v| v.is_object()),
+            _ => None,
+        };
+        if parsed.is_some() {
+            return parsed;
+        }
+    }
+    None
+}
+
+/// Convert string-valued top-level arguments to the JSON type the tool's
+/// schema declares. Models regularly send `"4"` or `"[\"a\"]"` for integer and
+/// array parameters, and strict MCP servers reject those outright.
+pub(crate) fn coerce_mcp_arguments(
+    tool_name: &str,
+    mut arguments: serde_json::Value,
+    tool_defs: &[ToolDef],
+) -> serde_json::Value {
+    let props = tool_defs
+        .iter()
+        .find(|d| d.name == tool_name)
+        .and_then(|d| d.parameters.get("properties"))
+        .and_then(|v| v.as_object());
+    let (Some(props), Some(args)) = (props, arguments.as_object_mut()) else {
+        return arguments;
+    };
+    for (key, value) in args.iter_mut() {
+        let (Some(text), Some(schema)) = (value.as_str(), props.get(key)) else {
+            continue;
+        };
+        let types = schema_types(schema);
+        // No declared type, or strings are acceptable: the value is fine as sent.
+        if types.is_empty() || types.contains(&"string") {
+            continue;
+        }
+        if let Some(typed) = parse_string_as(text, &types) {
+            *value = typed;
+        }
+    }
+    arguments
+}
+
 /// Dispatch one MCP tool call. Single implementation shared by the parallel
 /// read-only phase and the sequential write phase (6.9 — previously
 /// copy-pasted at both sites).
@@ -198,6 +285,7 @@ async fn call_mcp_tool(
     mcp_tool_defs: &[ToolDef],
     project_root: &std::path::Path,
 ) -> ToolOutput {
+    let tool_input = coerce_mcp_arguments(tool_name, tool_input, mcp_tool_defs);
     if let Err(e) = validate_mcp_arguments(tool_name, &tool_input, mcp_tool_defs) {
         return ToolOutput {
             content: format!("MCP tool error: argument validation failed: {}", e),
@@ -601,6 +689,21 @@ impl TaskExecutor {
             return Ok(self.freebuff_web_search(&input).await);
         }
         self.tools.execute(name, tool_id, input, context).await
+    }
+
+    /// Run a group of `parallel: true` `run_command` calls concurrently, returning outputs in call order.
+    async fn execute_parallel_commands(
+        &self,
+        calls: &[(&str, &serde_json::Value)],
+        context: &ToolContext,
+    ) -> Vec<ToolOutput> {
+        if crate::file_tree::tool_mutates_file_tree("run_command") {
+            match self.tree_cache.lock() {
+                Ok(mut c) => c.dirty = true,
+                Err(e) => e.into_inner().dirty = true,
+            }
+        }
+        self.tools.run_commands_parallel(calls, context).await
     }
 
     /// Run `web_search` via codebuff's built-in web access: a one-shot, tool-less
@@ -3035,9 +3138,16 @@ impl TaskExecutor {
 
             // Smart concurrency: read-only tools run in parallel, write tools run sequentially after.
             // This prevents race conditions on writes while maximizing throughput for reads.
-            let (read_only_tools, mut write_tools): (Vec<_>, Vec<_>) = tool_uses
-                .iter()
-                .partition(|(_, name, _)| BuiltinTools::is_read_only(name));
+            // MCP tools their server annotates `readOnlyHint` join the parallel batch.
+            // The hint only affects scheduling: in plan mode every MCP tool stays in
+            // the write set, so the plan-mode gate below still rejects it.
+            let (read_only_tools, mut write_tools): (Vec<_>, Vec<_>) =
+                tool_uses.iter().partition(|(_, name, _)| {
+                    BuiltinTools::is_read_only(name)
+                        || (!context.is_plan_mode
+                            && !BuiltinTools::is_builtin(name)
+                            && context.mcp_read_only_tools.contains_key(name.as_str()))
+                });
 
             let mut results: Vec<(String, ToolOutput)> = Vec::new();
             // Include any parse-error results from the filter step above
@@ -3088,12 +3198,26 @@ impl TaskExecutor {
 
             // Phase 1: Execute all read-only tools in parallel
             if !read_only_tools.is_empty() {
+                // Calls to one MCP server share a single connection. Queue them
+                // behind a per-server gate so each call's timeout starts only
+                // once it owns the pipe; different servers still run in parallel.
+                let mcp_gates: std::collections::HashMap<&str, tokio::sync::Mutex<()>> =
+                    read_only_tools
+                        .iter()
+                        .filter_map(|(_, name, _)| context.mcp_read_only_tools.get(name.as_str()))
+                        .map(|server| (server.as_str(), tokio::sync::Mutex::new(())))
+                        .collect();
+                let mcp_gates = &mcp_gates;
                 let read_futures: Vec<_> = read_only_tools
                     .iter()
                     .map(|(tool_id, tool_name, tool_input)| {
                         let tool_id = tool_id.clone();
                         let tool_name = tool_name.clone();
                         let tool_input = tool_input.clone();
+                        let gate = context
+                            .mcp_read_only_tools
+                            .get(tool_name.as_str())
+                            .and_then(|server| mcp_gates.get(server.as_str()));
                         async move {
                             let result = if BuiltinTools::is_builtin(&tool_name) {
                                 self.execute_builtin(&tool_name, &tool_id, tool_input, context)
@@ -3104,6 +3228,10 @@ impl TaskExecutor {
                                         attachments: Vec::new(),
                                     })
                             } else if let Some(mcp) = &context.mcp_manager {
+                                let _serial = match gate {
+                                    Some(g) => Some(g.lock().await),
+                                    None => None,
+                                };
                                 call_mcp_tool(
                                     mcp,
                                     &tool_name,
@@ -3141,8 +3269,16 @@ impl TaskExecutor {
                 }
             }
 
-            // Phase 2: Execute write/execute tools sequentially
-            for (tool_id, tool_name, tool_input) in &write_tools {
+            // Phase 2: Execute write/execute tools sequentially. The one exception is a
+            // run of adjacent `run_command` calls that each opted in with
+            // `parallel: true` — those launch together.
+            let mut write_idx = 0usize;
+            while write_idx < write_tools.len() {
+                let (tool_id, tool_name, tool_input) = write_tools[write_idx];
+                let parallel_len =
+                    BuiltinTools::parallel_command_run_len(&write_tools[write_idx..]);
+                let parallel_group = &write_tools[write_idx..write_idx + parallel_len];
+                write_idx += parallel_len.max(1);
                 // Bail before starting another write tool if the user hit Stop.
                 if let Some(token) = &context.cancel_token {
                     if token.load(Ordering::SeqCst) {
@@ -3171,6 +3307,29 @@ impl TaskExecutor {
                     if waited_ms > 100 {
                         tracing::info!(target: "rustic::timing", task = %context.task_id, tool = %tool_name, waited_ms, "executor: write tool blocked on baseline gate");
                     }
+                }
+                if !parallel_group.is_empty() {
+                    let calls: Vec<(&str, &serde_json::Value)> = parallel_group
+                        .iter()
+                        .map(|(id, _, input)| (id.as_str(), input))
+                        .collect();
+                    let group_fut = self.execute_parallel_commands(&calls, context);
+                    match await_or_cancel(context.cancel_token.as_ref(), group_fut).await {
+                        Some(outputs) => results.extend(
+                            parallel_group
+                                .iter()
+                                .map(|(id, _, _)| id.clone())
+                                .zip(outputs),
+                        ),
+                        None => {
+                            let _ = event_tx.try_send(TaskEvent::StatusChange {
+                                task_id: task_id.clone(),
+                                status: TaskStatus::Cancelled,
+                            });
+                            return Ok(task_cost);
+                        }
+                    }
+                    continue;
                 }
                 let is_builtin_check = BuiltinTools::is_builtin(tool_name);
                 tracing::debug!(
@@ -4256,7 +4415,13 @@ fn format_todo_anchor(todos: &[crate::task::TodoItem]) -> String {
         "[Todo checklist reminder — injected automatically]\nYour current todo list:\n",
     );
     for (i, t) in todos.iter().enumerate() {
-        out.push_str(&format!("{}. [{}] {}\n", i + 1, t.status, t.content));
+        out.push_str(&t.line(i));
+        out.push('\n');
+    }
+    if todos.iter().any(|t| t.group.is_some()) {
+        out.push_str(
+            "\nItems sharing a group label do not depend on each other — send their tool calls together in one response.\n",
+        );
     }
     out.push_str(
         "\nThis list is your authoritative plan. Continue with the next incomplete item. \
@@ -4294,7 +4459,12 @@ fn rehydrate_todos_from_history(messages: &[Message]) -> Option<Vec<crate::task:
                         .and_then(|v| v.as_str())
                         .unwrap_or("pending")
                         .to_string();
-                    Some(crate::task::TodoItem { content, status })
+                    let group = crate::task::TodoItem::parse_group(item.get("group"));
+                    Some(crate::task::TodoItem {
+                        content,
+                        status,
+                        group,
+                    })
                 })
                 .collect();
             if !todos.is_empty() {
@@ -4664,6 +4834,102 @@ mod context_opt_tests {
         assert_eq!(
             message_anchor_sig(&mk("full body")),
             message_anchor_sig(&mk("[stub]"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod mcp_coerce_tests {
+    use super::{coerce_mcp_arguments, validate_mcp_arguments, ToolDef};
+    use serde_json::json;
+
+    fn defs() -> Vec<ToolDef> {
+        vec![ToolDef {
+            name: "list-deployments".into(),
+            description: String::new(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "projectId": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "ratio": { "type": "number" },
+                    "staged": { "type": "boolean" },
+                    "types": { "type": "array", "items": { "type": "string" } },
+                    "limits": { "type": "object" },
+                    "timeout": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
+                    "status": { "enum": ["SUCCESS", "FAILED"] },
+                    "label": { "type": ["string", "null"] }
+                },
+                "required": ["projectId"]
+            }),
+        }]
+    }
+
+    #[test]
+    fn stringified_arguments_take_their_declared_type() {
+        // Tracker #11: `limit: "4"` and `types: "[...]"` were rejected by the server.
+        let out = coerce_mcp_arguments(
+            "list-deployments",
+            json!({
+                "projectId": "129",
+                "limit": "4",
+                "ratio": "0.5",
+                "staged": "true",
+                "types": "[\"deploy\", \"build\"]",
+                "limits": "{\"vCPUs\": 2}",
+                "timeout": "null"
+            }),
+            &defs(),
+        );
+        assert_eq!(
+            out,
+            json!({
+                "projectId": "129",
+                "limit": 4,
+                "ratio": 0.5,
+                "staged": true,
+                "types": ["deploy", "build"],
+                "limits": { "vCPUs": 2 },
+                "timeout": null
+            })
+        );
+        assert!(validate_mcp_arguments("list-deployments", &out, &defs()).is_ok());
+    }
+
+    #[test]
+    fn values_that_are_already_right_or_unparseable_are_left_alone() {
+        let input = json!({
+            "projectId": "42",
+            "limit": 4,
+            "types": ["deploy"],
+            "staged": "yes",
+            "ratio": "fast",
+            "status": "SUCCESS",
+            "label": "7",
+            "timeout": "30"
+        });
+        let out = coerce_mcp_arguments("list-deployments", input, &defs());
+        assert_eq!(
+            out["projectId"],
+            json!("42"),
+            "string params keep digit strings"
+        );
+        assert_eq!(out["limit"], json!(4));
+        assert_eq!(out["types"], json!(["deploy"]));
+        assert_eq!(out["staged"], json!("yes"));
+        assert_eq!(out["ratio"], json!("fast"));
+        assert_eq!(out["status"], json!("SUCCESS"));
+        assert_eq!(out["label"], json!("7"), "string is an accepted type");
+        assert_eq!(out["timeout"], json!(30));
+    }
+
+    #[test]
+    fn unknown_tools_and_non_object_arguments_pass_through() {
+        let args = json!({ "limit": "4" });
+        assert_eq!(coerce_mcp_arguments("other", args.clone(), &defs()), args);
+        assert_eq!(
+            coerce_mcp_arguments("list-deployments", json!(null), &defs()),
+            json!(null)
         );
     }
 }

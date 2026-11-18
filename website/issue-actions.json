@@ -1,4 +1,15 @@
 {
   "_help": "Moderation for the public issue tracker, applied on every deploy. Each action runs once (tracked by its unique id; never reuse one). op: close | reopen | delete. Example: { \"id\": \"2026-11-05-close-12\", \"op\": \"close\", \"issue\": 12, \"resolution\": \"Fixed in v0.7.9\" }",
-  "actions": []
+  "actions": [
+    { "id": "2026-11-18-close-3", "op": "close", "issue": 3, "resolution": "Fixed in v0.8.3: agent commands on macOS/Linux now run as one unit between output markers, so output is no longer dropped, garbled or mixed with shell prompts." },
+    { "id": "2026-11-18-close-4", "op": "close", "issue": 4, "resolution": "Fixed in v0.8.3: a task paused on a long-running tool is no longer evicted from the chat view, so its history stays visible." },
+    { "id": "2026-11-18-close-5", "op": "close", "issue": 5, "resolution": "Fixed in v0.8.3: ask_user questions render markdown, and replies split into several text blocks keep their formatting." },
+    { "id": "2026-11-18-close-6", "op": "close", "issue": 6, "resolution": "Fixed in v0.8.3: stale thinking blocks are dropped by the API after a model or effort switch instead of failing the request." },
+    { "id": "2026-11-18-close-7", "op": "close", "issue": 7, "resolution": "Fixed in source, ships in the next release: {a,b} alternatives now work in grep_search include/exclude and in glob patterns, and an invalid pattern returns an error instead of matching nothing." },
+    { "id": "2026-11-18-close-8", "op": "close", "issue": 8, "resolution": "Duplicate of #9. Inline strings were not the cause; the workbook's table relationship was." },
+    { "id": "2026-11-18-close-9", "op": "close", "issue": 9, "resolution": "Fixed in source, ships in the next release: absolute worksheet relationship targets (as openpyxl writes them) are rewritten to the relative form before the workbook is parsed." },
+    { "id": "2026-11-18-close-10", "op": "close", "issue": 10, "resolution": "Fixed in source, ships in the next release: the end marker is stripped even when long output pushed the begin marker out of the captured tail, and a shell-exit notice no longer repeats output that was already returned." },
+    { "id": "2026-11-18-close-11", "op": "close", "issue": 11, "resolution": "Fixed in source, ships in the next release: string arguments are converted to the number, boolean, array or object type the tool's schema declares before the MCP call." },
+    { "id": "2026-11-18-close-12", "op": "close", "issue": 12, "resolution": "Fixed in source, ships in the next release: workbooks with openpyxl-style comment parts now open. The comments themselves are not displayed." }
+  ]
 }

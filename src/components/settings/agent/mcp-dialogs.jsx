@@ -1,8 +1,9 @@
 // MCP dialogs: add one server to the global pool, and configure a pool
 // server per project (entry JSON, enable/disable, connection test).
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Loader2, ShieldAlert } from 'lucide-react';
+import { useMcpServerStatus } from '@/lib/mcp-status';
 import { Button } from '@/components/ui/button';
 import { InfoTip } from '@/components/ui/info-tip';
 import { Input } from '@/components/ui/input';
@@ -107,10 +108,13 @@ function PaneSwitch({ value, onChange, options }) {
   );
 }
 
-/** Short label + tone for a connection status object from the backend. */
+/** Short label + tone for a connection status object from the backend; `busy` = show a spinner. */
 export function statusBadge(status, enabled = true) {
   if (!enabled) return { label: 'Disabled', tone: 'border-border/60 text-muted-foreground' };
   const st = status || { state: 'unknown' };
+  if (st.state === 'connecting') {
+    return { label: 'Connecting', tone: 'border-border/60 text-muted-foreground', busy: true };
+  }
   if (st.state === 'connected') {
     const n = st.tool_count ?? 0;
     return { label: `Connected · ${n} tool${n === 1 ? '' : 's'}`, tone: 'border-success/40 text-success' };
@@ -174,11 +178,7 @@ export function McpAddServerDialog({ open, onClose }) {
       for (const [serverName, entry] of pairs) {
         const res = await invoke('add_mcp_pool_server', { name: serverName, entry, projectIds });
         const failedProjects = (res?.projects || []).filter((p) => p.error);
-        if (res?.pool?.connected) {
-          toast.success(`Added ${serverName} · ${res.pool.toolCount} tool${res.pool.toolCount === 1 ? '' : 's'}`);
-        } else {
-          toast.error(`Added ${serverName}, but it failed to connect: ${res?.pool?.error || 'unknown error'}`);
-        }
+        toast.success(`Added ${serverName} — connecting…`);
         if (failedProjects.length) {
           toast.error(`Couldn't write ${serverName} to ${failedProjects.map((p) => p.projectName).join(', ')}: ${failedProjects[0].error}`);
         }
@@ -373,6 +373,20 @@ export function McpConfigureDialog({ server, open, onClose }) {
     loadTools();
   }, [open, load, loadTools]);
 
+  // Per-project statuses resolve server-side (pool entry vs project override),
+  // so a status push re-reads the rows instead of patching them. Coalesced:
+  // several servers settling together cost one refetch.
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
+  const statusTimer = useRef(null);
+  useEffect(() => () => clearTimeout(statusTimer.current), []);
+  useMcpServerStatus(({ id, status }) => {
+    if (!open) return;
+    clearTimeout(statusTimer.current);
+    statusTimer.current = setTimeout(() => load(selectedIdRef.current), 150);
+    if (id === server?.id && status?.state === 'connected') loadTools();
+  });
+
   useEffect(() => {
     if (!selected) return;
     setJson(pretty(selected.view?.entry ?? {}));
@@ -555,7 +569,10 @@ export function McpConfigureDialog({ server, open, onClose }) {
                       >
                         <div className="truncate text-[12px]">{r.projectName}</div>
                         <div className="mt-0.5 flex items-center gap-1">
-                          <Badge variant="outline" className={cn('h-4 text-[9.5px]', b.tone)}>{b.label}</Badge>
+                          <Badge variant="outline" className={cn('h-4 gap-1 text-[9.5px]', b.tone)}>
+                            {b.busy && <Loader2 className="size-2.5 animate-spin" />}
+                            {b.label}
+                          </Badge>
                           {r.view?.overridden && (
                             <Badge variant="outline" className="h-4 text-[9.5px] text-muted-foreground">custom</Badge>
                           )}

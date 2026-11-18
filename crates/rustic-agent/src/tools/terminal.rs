@@ -84,6 +84,10 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
         "terminal_id": {
             "type": "integer",
             "description": "OMIT THIS for a normal command — a fresh terminal is spawned automatically. Only pass it to reuse a specific existing session whose id you got from a previous run_command result or list_all_terminals (e.g. a shell with an activated venv), or to type into a USER-opened terminal (always requires explicit user approval). Never guess or default this value."
+        },
+        "parallel": {
+            "type": "boolean",
+            "description": "Set true on EACH of several run_command calls emitted in the same response to run them at the same time instead of one after another (e.g. typecheck + lint + tests). Each gets its own fresh terminal. Only for commands that are independent of each other: leave it off when they share a lock, a port or the git index, or when order matters. Ignored on a lone call, when terminal_id is set, or when another kind of tool call sits between them."
         }
     });
     if let (Some(schema), Some(props)) = (shell_param, run_command_props.as_object_mut()) {
@@ -91,7 +95,7 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
     }
 
     let run_command_desc = format!(
-        "Run a shell command. Every command runs in a pty-backed background terminal; the tool waits up to ~{}s for it to finish. If the command finishes in time, its output is returned directly. If it is still running after the wait (dev servers, watchers, long builds/installs, test suites), you get back a `terminal_id` and the command keeps running without blocking the chat — use `read_terminal_output` to check progress, `kill_terminal` to stop it, or, if you have nothing to do until it finishes, simply end your turn: you are woken automatically with the output once the command completes. Never-ending processes (dev servers, watchers) do not complete — check them with `read_terminal_output` instead of waiting.\n\nFor a normal command, pass only `command` and leave `terminal_id` unset. Pass `terminal_id` ONLY to run a follow-up in the same shell session (e.g. after activating a virtualenv), using an id you got from a previous run_command result or `list_all_terminals`. You may also pass the id of a USER-opened terminal — that always asks the user for approval first.{}",
+        "Run a shell command. Every command runs in a pty-backed background terminal; the tool waits up to ~{}s for it to finish. If the command finishes in time, its output is returned directly. If it is still running after the wait (dev servers, watchers, long builds/installs, test suites), you get back a `terminal_id` and the command keeps running without blocking the chat — use `read_terminal_output` to check progress, `kill_terminal` to stop it, or, if you have nothing to do until it finishes, simply end your turn: you are woken automatically with the output once the command completes. Never-ending processes (dev servers, watchers) do not complete — check them with `read_terminal_output` instead of waiting.\n\nFor a normal command, pass only `command` and leave `terminal_id` unset. Pass `terminal_id` ONLY to run a follow-up in the same shell session (e.g. after activating a virtualenv), using an id you got from a previous run_command result or `list_all_terminals`. You may also pass the id of a USER-opened terminal — that always asks the user for approval first.\n\nTo run independent commands at the same time (e.g. typecheck + lint + tests), emit them as separate run_command calls in ONE response, each with `parallel: true`. Leave it off for commands that share a lock, a port or the git index, or that must run in order.{}",
         RUN_GRACE.as_secs(),
         shell_desc,
     );
@@ -282,14 +286,89 @@ fn slice_output_since_command(raw: &str, cmd: &str) -> String {
     crate::terminal_text::clean_command_output(raw, cmd)
 }
 
+/// A validated, user-approved command ready to be typed into a terminal.
+struct PreparedCommand {
+    command: String,
+    shell: Option<String>,
+    cwd: std::path::PathBuf,
+    terminal_id: Option<u64>,
+    stale_id_note: String,
+}
+
 async fn run_command(
     tool_use_id: &str,
     params: Value,
     context: &ToolContext,
 ) -> Result<ToolOutput> {
+    match prepare_command(&params, context).await {
+        Ok(prepared) => launch_command(tool_use_id, prepared, context, true).await,
+        Err(out) => Ok(out),
+    }
+}
+
+/// True when a `run_command` call opted into concurrent execution and targets a fresh terminal.
+pub(crate) fn wants_parallel(params: &Value) -> bool {
+    let flagged = match &params["parallel"] {
+        Value::Bool(b) => *b,
+        Value::String(s) => s.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    };
+    flagged && params.get("terminal_id").is_none_or(Value::is_null)
+}
+
+/// Run several `parallel: true` commands at once, returning outputs in call order.
+///
+/// Approvals are requested one at a time and a single file-history checkpoint
+/// is taken before anything launches: a per-command checkpoint taken while a
+/// sibling is already running would fold that sibling's writes into the
+/// baseline and drop them from the task's change set.
+pub(crate) async fn run_commands_parallel(
+    calls: &[(&str, &Value)],
+    context: &ToolContext,
+) -> Vec<ToolOutput> {
+    let mut prepared = Vec::with_capacity(calls.len());
+    for (_, params) in calls {
+        prepared.push(prepare_command(params, context).await);
+    }
+    if prepared.iter().any(|p| p.is_ok()) {
+        checkpoint_before_command(context);
+    }
+    let launches = calls
+        .iter()
+        .zip(prepared)
+        .map(|((tool_use_id, _), prep)| async move {
+            match prep {
+                Ok(p) => launch_command(tool_use_id, p, context, false)
+                    .await
+                    .unwrap_or_else(|e| ToolOutput {
+                        content: format!("Tool error: {}", e),
+                        is_error: true,
+                        attachments: Vec::new(),
+                    }),
+                Err(out) => out,
+            }
+        });
+    futures::future::join_all(launches).await
+}
+
+/// Fold pending watcher events into the pre-command file-history checkpoint.
+fn checkpoint_before_command(context: &ToolContext) {
+    if let (Some(history), Some(message_id)) = (
+        context.file_history.as_ref(),
+        context.current_user_message_id.as_ref(),
+    ) {
+        let _ = history.checkpoint_pre_bash(message_id);
+    }
+}
+
+/// Validate a `run_command` call and obtain the user's approval where the mode requires it.
+async fn prepare_command(
+    params: &Value,
+    context: &ToolContext,
+) -> std::result::Result<PreparedCommand, ToolOutput> {
     let cmd_str = params["command"].as_str().unwrap_or("");
     if cmd_str.is_empty() {
-        return Ok(ToolOutput {
+        return Err(ToolOutput {
             content: "No command provided".into(),
             is_error: true,
             attachments: Vec::new(),
@@ -297,7 +376,7 @@ async fn run_command(
     }
 
     if context.permissions() == PermissionLevel::Chat {
-        return Ok(ToolOutput {
+        return Err(ToolOutput {
             content: "PERMISSION_DENIED: Command execution is not allowed in Chat mode.".into(),
             is_error: true,
             attachments: Vec::new(),
@@ -307,7 +386,7 @@ async fn run_command(
     let broker = match context.agent_terminals.as_ref() {
         Some(b) => b,
         None => {
-            return Ok(ToolOutput {
+            return Err(ToolOutput {
                 content: "Command execution is not available in this environment.".into(),
                 is_error: true,
                 attachments: Vec::new(),
@@ -315,7 +394,7 @@ async fn run_command(
         }
     };
 
-    let terminal_id = parse_terminal_id(&params);
+    let terminal_id = parse_terminal_id(params);
     let shell = params["shell"]
         .as_str()
         .map(str::trim)
@@ -333,7 +412,7 @@ async fn run_command(
     {
         Some(c) => match super::file_ops::resolve_with_scope(context, c) {
             Ok(p) => p,
-            Err(out) => return Ok(out),
+            Err(out) => return Err(out),
         },
         None => context.project_root.clone(),
     };
@@ -393,7 +472,7 @@ async fn run_command(
             )
             .await;
         if !approved {
-            return Ok(ToolOutput {
+            return Err(ToolOutput {
                 content: "PERMISSION_DENIED: User denied command execution.".into(),
                 is_error: true,
                 attachments: Vec::new(),
@@ -401,14 +480,43 @@ async fn run_command(
         }
     }
 
+    Ok(PreparedCommand {
+        command: cmd_str.to_string(),
+        shell,
+        cwd,
+        terminal_id,
+        stale_id_note,
+    })
+}
+
+/// Type a prepared command into its terminal and wait inline for it to finish.
+async fn launch_command(
+    tool_use_id: &str,
+    prepared: PreparedCommand,
+    context: &ToolContext,
+    checkpoint: bool,
+) -> Result<ToolOutput> {
+    let PreparedCommand {
+        command,
+        shell,
+        cwd,
+        terminal_id,
+        stale_id_note,
+    } = prepared;
+    let cmd_str = command.as_str();
+    let Some(broker) = context.agent_terminals.as_ref() else {
+        return Ok(ToolOutput {
+            content: "Command execution is not available in this environment.".into(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    };
+
     // Capture before send: any file the command writes will have mtime >= this
     // instant, so the sweep enqueued on completion picks the changes up.
     let bash_start_for_sweep = std::time::SystemTime::now();
-    if let (Some(history), Some(message_id)) = (
-        context.file_history.as_ref(),
-        context.current_user_message_id.as_ref(),
-    ) {
-        let _ = history.checkpoint_pre_bash(message_id);
+    if checkpoint {
+        checkpoint_before_command(context);
     }
 
     let session_id = match terminal_id {
@@ -866,5 +974,188 @@ mod tests {
         let s = "abcde";
         assert_eq!(truncate_utf8(s, 5), "abcde");
         assert_eq!(truncate_utf8(s, 4), "abcd");
+    }
+
+    // ── parallel run_command ─────────────────────────────────────────────────
+
+    use crate::task::terminal_broker::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Broker whose commands only "finish" once `release_at` commands are in flight.
+    struct FakeTerminals {
+        next_id: AtomicU64,
+        sent: Mutex<Vec<u64>>,
+        release_at: usize,
+    }
+
+    impl FakeTerminals {
+        fn new(release_at: usize) -> Arc<Self> {
+            Arc::new(Self {
+                next_id: AtomicU64::new(1),
+                sent: Mutex::new(Vec::new()),
+                release_at,
+            })
+        }
+    }
+
+    impl AgentTerminals for FakeTerminals {
+        fn spawn(
+            &self,
+            _cwd: std::path::PathBuf,
+            _label: String,
+            _task_id: &str,
+            _shell: Option<String>,
+        ) -> std::result::Result<u64, String> {
+            Ok(self.next_id.fetch_add(1, Ordering::SeqCst))
+        }
+
+        fn send_command(
+            &self,
+            session_id: u64,
+            _command: &str,
+            _task_id: &str,
+        ) -> std::result::Result<(), String> {
+            self.sent.lock().unwrap().push(session_id);
+            Ok(())
+        }
+
+        fn read_output(
+            &self,
+            session_id: u64,
+            _max_bytes: usize,
+        ) -> std::result::Result<String, String> {
+            Ok(format!("out-{session_id}\n"))
+        }
+
+        fn kill(&self, _session_id: u64) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn is_agent_session(&self, _session_id: u64) -> bool {
+            true
+        }
+
+        fn list_agent_sessions(&self) -> Vec<AgentTerminalInfo> {
+            Vec::new()
+        }
+
+        fn take_command_finished(&self, _task_id: &str, session_id: u64) -> Vec<AgentTerminalExit> {
+            if self.sent.lock().unwrap().len() < self.release_at {
+                return Vec::new();
+            }
+            vec![AgentTerminalExit {
+                session_id,
+                label: "fake".into(),
+                last_command: None,
+                output_tail: String::new(),
+                exited_at_ms: 0,
+                kind: TerminalNoticeKind::CommandFinished,
+                output_delivered: false,
+            }]
+        }
+    }
+
+    /// A non-POSIX shell keeps the plain (unwrapped) completion path, which the fake can drive.
+    fn fake_call(command: &str, parallel: bool) -> Value {
+        json!({ "command": command, "shell": "fish", "parallel": parallel })
+    }
+
+    #[test]
+    fn wants_parallel_requires_flag_and_fresh_terminal() {
+        assert!(wants_parallel(&json!({ "command": "a", "parallel": true })));
+        assert!(wants_parallel(
+            &json!({ "command": "a", "parallel": "true" })
+        ));
+        assert!(wants_parallel(
+            &json!({ "command": "a", "parallel": true, "terminal_id": null })
+        ));
+        assert!(!wants_parallel(&json!({ "command": "a" })));
+        assert!(!wants_parallel(
+            &json!({ "command": "a", "parallel": false })
+        ));
+        assert!(!wants_parallel(
+            &json!({ "command": "a", "parallel": true, "terminal_id": 3 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn parallel_commands_overlap_and_keep_call_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        // No command can finish until all three are in flight, so this only
+        // completes if they were launched together.
+        let fake = FakeTerminals::new(3);
+        ctx.agent_terminals = Some(fake.clone());
+
+        let params = [
+            fake_call("check", true),
+            fake_call("lint", true),
+            fake_call("test", true),
+        ];
+        let calls: Vec<(&str, &Value)> = ["a", "b", "c"].into_iter().zip(params.iter()).collect();
+        let outputs = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_commands_parallel(&calls, &ctx),
+        )
+        .await
+        .expect("commands ran one after another instead of together");
+
+        assert_eq!(outputs.len(), 3);
+        for (i, out) in outputs.iter().enumerate() {
+            let id = i + 1;
+            assert!(!out.is_error, "call {id} failed: {}", out.content);
+            assert!(
+                out.content.contains(&format!("out-{id}")),
+                "{}",
+                out.content
+            );
+            assert!(
+                out.content.contains(&format!("finished in terminal #{id}")),
+                "{}",
+                out.content
+            );
+        }
+        assert_eq!(*fake.sent.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn parallel_group_reports_a_bad_call_without_blocking_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        let fake = FakeTerminals::new(2);
+        ctx.agent_terminals = Some(fake.clone());
+
+        let params = [
+            fake_call("check", true),
+            json!({ "command": "", "parallel": true }),
+            fake_call("test", true),
+        ];
+        let calls: Vec<(&str, &Value)> = ["a", "b", "c"].into_iter().zip(params.iter()).collect();
+        let outputs = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_commands_parallel(&calls, &ctx),
+        )
+        .await
+        .expect("valid commands should still launch together");
+
+        assert!(!outputs[0].is_error);
+        assert!(outputs[1].is_error);
+        assert!(outputs[1].content.contains("No command provided"));
+        assert!(!outputs[2].is_error);
+        assert_eq!(fake.sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn single_command_still_runs_through_the_staged_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        ctx.agent_terminals = Some(FakeTerminals::new(1));
+
+        let out = run_command("a", fake_call("check", false), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("out-1"), "{}", out.content);
     }
 }

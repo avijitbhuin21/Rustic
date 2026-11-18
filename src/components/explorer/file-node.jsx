@@ -460,6 +460,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
           onDrop={handleDrop}
           {...longPress}
           data-explorer-node={isFolder ? 'folder' : 'file'}
+          data-explorer-path={node.data.path}
           data-explorer-dir={isFolder ? node.data.path : parentDir}
           className={cn(
             'explorer-node-enter group/node flex h-6 cursor-pointer items-center gap-1 px-1 text-xs hover:bg-muted/50',

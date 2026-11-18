@@ -1424,12 +1424,25 @@ export function PromptBox({
     for (const k in subs) if (subs[k]?.status === 'running') n += 1;
     return n;
   });
+  const mascotNeedsInput = useAgent((s) => {
+    const id = s.activeTaskId;
+    if (!id) return false;
+    if (s.pendingPermission?.task_id === id) return true;
+    const list = s.messagesByTask[id];
+    const last = list?.[list.length - 1];
+    return !!last?.content?.some?.((b) => b?.type === 'ask_user' && !b.answered && !b.cancelled);
+  });
+  const mascotRetrying = useAgent((s) => (s.activeTaskId ? !!s.retryByTask[s.activeTaskId] : false));
+  const mascotCondensing = useAgent((s) => (s.activeTaskId ? !!s.condensingByTask[s.activeTaskId] : false));
   const mascotState = useMascotRunState({
     taskId: mascotTaskId,
     isStreaming,
     runningTool: runInfo?.runningTool || null,
     waitingOnSubagents,
     status: mascotStatus,
+    needsInput: mascotNeedsInput,
+    retrying: mascotRetrying,
+    condensing: mascotCondensing,
   });
   const contextUsage = useContextUsage();
   const [sendPetKey, setSendPetKey] = useState(0);
@@ -1715,11 +1728,22 @@ export function PromptBox({
       const next = prev.filter((t) => !t.inline || value.includes(`@${t.relativePath}`));
       return next.length === prev.length ? prev : next;
     });
+    setAttachments((prev) => {
+      const next = prev.filter((a) => !a.inline || value.includes(`@${a.relativePath}`));
+      return next.length === prev.length ? prev : next;
+    });
   }, [value]);
 
   const inlineFilePaths = useMemo(
-    () => fileTags.filter((t) => t.inline).map((t) => t.relativePath),
-    [fileTags],
+    () => [
+      ...fileTags.filter((t) => t.inline).map((t) => t.relativePath),
+      ...attachments.filter((a) => a.inline && a.relativePath).map((a) => a.relativePath),
+    ],
+    [fileTags, attachments],
+  );
+  const inlineImagePaths = useMemo(
+    () => new Set(attachments.filter((a) => a.inline).map((a) => a.relativePath)),
+    [attachments],
   );
   const mentionSegments = useMemo(
     () => splitFileMentions(value, inlineFilePaths),
@@ -2068,6 +2092,7 @@ export function PromptBox({
       toast.error('Open a project before pasting an image.');
       return;
     }
+    const inserted = [];
     for (const { file, mediaType } of images) {
       try {
         const { base64, dataUrl } = await readFileAsBase64(file);
@@ -2075,23 +2100,46 @@ export function PromptBox({
           projectRoot: activeProjectRoot,
           base64,
         });
+        const attId = `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         setAttachments((prev) => [
           ...prev,
           {
-            id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            id: attId,
             name: filename,
             url: dataUrl,
             mediaType,
             base64Data: base64,
             path: absolutePath,
             relativePath,
+            inline: true,
           },
         ]);
+        if (relativePath) inserted.push(relativePath);
       } catch (err) {
         const msg = typeof err === 'string' ? err : err?.message || String(err);
         toast.error(`Couldn't attach image: ${msg}`);
       }
     }
+    if (inserted.length > 0) insertInlineTokens(inserted);
+  };
+
+  /** Inserts `@path` tokens at the caret, like an accepted @file mention. */
+  const insertInlineTokens = (paths) => {
+    const el = textareaRef.current;
+    const start = el ? el.selectionStart ?? value.length : value.length;
+    const end = el ? el.selectionEnd ?? start : start;
+    const before = value.slice(0, start);
+    const after = value.slice(end);
+    const lead = before && !/\s$/.test(before) ? ' ' : '';
+    const token = `${lead}${paths.map((p) => `@${p}`).join(' ')}${after.startsWith(' ') ? '' : ' '}`;
+    setValue(`${before}${token}${after}`);
+    requestAnimationFrame(() => {
+      const node = textareaRef.current;
+      if (!node) return;
+      node.focus();
+      const pos = before.length + token.length;
+      node.setSelectionRange(pos, pos);
+    });
   };
 
   const removeAttachment = (id) => {
@@ -2325,7 +2373,12 @@ export function PromptBox({
               seg.type === 'file' ? (
                 <span
                   key={i}
-                  className="rounded-sm bg-muted-foreground/20 underline decoration-muted-foreground/50 underline-offset-2"
+                  className={cn(
+                    'rounded-sm underline underline-offset-2',
+                    inlineImagePaths.has(seg.path)
+                      ? 'bg-primary/15 decoration-primary/50'
+                      : 'bg-muted-foreground/20 decoration-muted-foreground/50',
+                  )}
                 >
                   @{seg.path}
                 </span>
@@ -2341,7 +2394,7 @@ export function PromptBox({
           rows={1}
           value={value}
           onScroll={syncMirrorScroll}
-          title={inlineFilePaths.length > 0 ? 'Click an @file to open it in the editor' : undefined}
+          title={inlineFilePaths.length > 0 ? 'Click an @file or pasted image to open it in the editor' : undefined}
           onChange={(e) => {
             setValue(e.target.value);
             // Defer so selectionStart reflects the post-change caret.
@@ -2457,7 +2510,7 @@ export function PromptBox({
           <GoalCapsule />
           <MascotSendButton
             usage={contextUsage}
-            mascotState={mascotState}
+            mascotState={recording ? 'listening' : mascotState}
             subagents={mascotSubagents || waitingOnSubagents}
             petKey={sendPetKey}
             badge={!isStreaming && hasContent ? 'send' : null}

@@ -11,7 +11,10 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release \
     && rm -rf src target/release/rustic-website* target/release/deps/rustic_website*
 COPY src ./src
-RUN cargo build --release && test -f target/release/rustic-website
+# COPY keeps the sources' original mtimes, which are older than the placeholder
+# build above; newer cargo then treats that placeholder as fresh and ships a
+# binary that exits immediately. Bump the mtime so the real sources are compiled.
+RUN touch src/main.rs && cargo build --release && test -f target/release/rustic-website
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

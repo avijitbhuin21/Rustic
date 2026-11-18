@@ -14,7 +14,13 @@
 //!    Rustic-owned settings file passed via `--settings` (it merges with, and
 //!    cannot clobber, the user's settings). Codex has no such flag, so its
 //!    hooks go in a project-scoped `.codex/hooks.json` that Rustic keeps out of
-//!    git — never the global `~/.codex/hooks.json`.
+//!    git — never the global `~/.codex/hooks.json`. Antigravity likewise gets
+//!    `<project>/.agents/hooks.json`, and only when the project has no hooks
+//!    file of its own.
+//!
+//! On CLI versions the extra events were verified against, the same sink also
+//! receives tool-call, approval and turn-end events, which feed the activity
+//! list (see [`super::activity`]).
 //!
 //! The hook itself copies its stdin into a spool directory, one file per event.
 //! A directory (instead of one appended log) means parallel sessions can never
@@ -47,6 +53,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::launcher::parse_version;
+use super::AgentKind;
+
 /// Rustic-owned locations backing external-agent hook capture.
 #[derive(Debug, Clone)]
 pub struct HookPaths {
@@ -56,9 +65,16 @@ pub struct HookPaths {
     pub spool: PathBuf,
     /// Settings file handed to `claude --settings`.
     pub claude_settings: PathBuf,
+    /// Directory holding one activity log per session (see [`super::activity`]).
+    pub activity: PathBuf,
     /// Directory holding the sink scripts. Equal to `root` unless that path
     /// contains a space (see the module docs).
     pub script_dir: PathBuf,
+}
+
+/// Where the per-session activity logs live, without creating anything.
+pub fn activity_dir(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("external-agents").join("activity")
 }
 
 impl HookPaths {
@@ -73,6 +89,7 @@ impl HookPaths {
         std::fs::create_dir_all(&spool)?;
         let paths = Self {
             claude_settings: root.join("claude-settings.json"),
+            activity: activity_dir(app_data_dir),
             root,
             spool,
             script_dir,
@@ -114,7 +131,10 @@ impl HookPaths {
                 concat!(
                     "spool=\"${1:-$RUSTIC_HOOK_DIR}\"\n",
                     "[ -n \"$spool\" ] && [ -n \"$RUSTIC_PTY_ID\" ] || exit 0\n",
-                    "cat > \"$spool/$RUSTIC_PTY_ID-$$-$(date +%s).json\"\n",
+                    // Write under another extension, then rename: tool payloads
+                    // can be large, and the drain must never read half of one.
+                    "f=\"$spool/$RUSTIC_PTY_ID-$$-$(date +%s)\"\n",
+                    "cat > \"$f.part\" && mv \"$f.part\" \"$f.json\"\n",
                 ),
             )?;
         }
@@ -182,39 +202,129 @@ fn sink_command(paths: &HookPaths) -> String {
     }
 }
 
-/// Build the `{ "hooks": { … } }` object both CLIs accept, wiring
-/// `SessionStart` and `UserPromptSubmit` to the spool sink.
-fn hooks_json(paths: &HookPaths) -> serde_json::Value {
-    let entry = serde_json::json!([{
-        "hooks": [{ "type": "command", "command": sink_command(paths) }]
-    }]);
-    serde_json::json!({
-        "hooks": {
-            "SessionStart": entry,
-            "UserPromptSubmit": entry,
+/// Whether the installed CLI is new enough for the activity hooks (tool calls,
+/// approvals, turn end) on top of the two session hooks.
+///
+/// The floor is the release each hook set was verified against, not the release
+/// that introduced it. Guessing lower is not safe: Claude Code blocks startup on
+/// a dialog when it meets an event name it doesn't know, and how an older Codex
+/// or Antigravity reacts is untested. An unknown version counts as too old.
+pub fn supports_activity_hooks(agent: AgentKind, version: Option<&str>) -> bool {
+    // On Windows every hook starts a PowerShell process, and the tool events
+    // fire on each tool call. That cost has not been measured there, so only
+    // the two session hooks are registered.
+    if cfg!(windows) {
+        return false;
+    }
+    let floor = match agent {
+        AgentKind::Claude => (2, 1, 325),
+        AgentKind::Codex => (0, 170, 0),
+        AgentKind::Antigravity => (1, 5, 11),
+    };
+    version
+        .and_then(parse_version)
+        .is_some_and(|found| found >= floor)
+}
+
+/// Hook events registered for Claude Code or Codex, with whether each one is a
+/// per-tool event.
+fn hook_events(agent: AgentKind, activity: bool) -> Vec<(&'static str, bool)> {
+    let mut events = vec![("SessionStart", false), ("UserPromptSubmit", false)];
+    if activity {
+        events.extend([
+            ("PreToolUse", true),
+            ("PostToolUse", true),
+            ("PermissionRequest", true),
+            ("Stop", false),
+        ]);
+        if matches!(agent, AgentKind::Claude) {
+            events.push(("PostToolUseFailure", true));
         }
-    })
+    }
+    events
+}
+
+/// Build the `{ "hooks": { … } }` object Claude Code and Codex accept, wiring
+/// each event to the spool sink.
+fn hooks_json(paths: &HookPaths, agent: AgentKind, activity: bool) -> serde_json::Value {
+    let command = serde_json::json!({ "type": "command", "command": sink_command(paths) });
+    let mut hooks = serde_json::Map::new();
+    for (event, per_tool) in hook_events(agent, activity) {
+        // Claude Code's tool events take a matcher; an empty one means every tool.
+        let entry = if per_tool && matches!(agent, AgentKind::Claude) {
+            serde_json::json!([{ "matcher": "", "hooks": [command] }])
+        } else {
+            serde_json::json!([{ "hooks": [command] }])
+        };
+        hooks.insert(event.to_string(), entry);
+    }
+    serde_json::json!({ "hooks": hooks })
 }
 
 /// Write the settings file passed to `claude --settings`. Rewritten on every
 /// spawn so a moved app-data directory can't leave a stale sink path behind.
-pub fn write_claude_settings(paths: &HookPaths) -> io::Result<()> {
+pub fn write_claude_settings(paths: &HookPaths, activity: bool) -> io::Result<()> {
     std::fs::create_dir_all(&paths.root)?;
-    let body = serde_json::to_vec_pretty(&hooks_json(paths))
+    let body = serde_json::to_vec_pretty(&hooks_json(paths, AgentKind::Claude, activity))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     std::fs::write(&paths.claude_settings, body)
 }
 
 /// Write `<project>/.codex/hooks.json` — Codex's only project-scoped hook
 /// location — and keep it out of git.
-pub fn write_codex_hooks(project_root: &Path, paths: &HookPaths) -> io::Result<()> {
+pub fn write_codex_hooks(project_root: &Path, paths: &HookPaths, activity: bool) -> io::Result<()> {
     let dir = project_root.join(".codex");
     std::fs::create_dir_all(&dir)?;
-    let body = serde_json::to_vec_pretty(&hooks_json(paths))
+    let body = serde_json::to_vec_pretty(&hooks_json(paths, AgentKind::Codex, activity))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     std::fs::write(dir.join("hooks.json"), body)?;
     exclude_from_git(project_root, "/.codex/");
     Ok(())
+}
+
+/// Name of Rustic's entry in Antigravity's `hooks.json`.
+const ANTIGRAVITY_HOOK_NAME: &str = "rustic";
+
+/// Antigravity's hook file body: one named hook wiring the spool sink.
+///
+/// `PreToolUse` is left out on purpose. It is Antigravity's permission gate and
+/// expects a decision on stdout, which a silent sink can't give; `PostToolUse`
+/// reports the same call once it has run.
+fn antigravity_hooks_json(paths: &HookPaths) -> serde_json::Value {
+    let command = serde_json::json!({ "type": "command", "command": sink_command(paths) });
+    serde_json::json!({
+        ANTIGRAVITY_HOOK_NAME: {
+            "SessionStart": [command],
+            "PreInvocation": [command],
+            "PostToolUse": [{ "matcher": "*", "hooks": [command] }],
+            "Stop": [command],
+        }
+    })
+}
+
+/// Write `<project>/.agents/hooks.json` for Antigravity and keep it out of git.
+///
+/// Returns `false` without touching anything when the project already has a
+/// hooks file with entries of its own: that file belongs to the user (and may be
+/// committed), so Rustic's activity list simply stays empty there.
+pub fn write_antigravity_hooks(project_root: &Path, paths: &HookPaths) -> io::Result<bool> {
+    let dir = project_root.join(".agents");
+    let file = dir.join("hooks.json");
+    if let Ok(existing) = std::fs::read_to_string(&file) {
+        let ours_only = serde_json::from_str::<serde_json::Value>(&existing)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .is_some_and(|map| map.keys().all(|k| k == ANTIGRAVITY_HOOK_NAME));
+        if !ours_only {
+            return Ok(false);
+        }
+    }
+    std::fs::create_dir_all(&dir)?;
+    let body = serde_json::to_vec_pretty(&antigravity_hooks_json(paths))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&file, body)?;
+    exclude_from_git(project_root, "/.agents/hooks.json");
+    Ok(true)
 }
 
 /// Add `pattern` to the repo's *local* exclude list. `.git/info/exclude` is
@@ -243,13 +353,16 @@ fn exclude_from_git(project_root: &Path, pattern: &str) {
 /// names for these; everything else in the payload is ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HookPayload {
-    #[serde(default)]
+    // Antigravity writes its payload keys in camelCase and calls a session a
+    // conversation.
+    #[serde(default, alias = "conversationId")]
     pub session_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "transcriptPath")]
     pub transcript_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "hookEventName")]
     pub hook_event_name: Option<String>,
-    #[serde(default)]
+    // Antigravity has no prompt event; each payload repeats the turn's prompt.
+    #[serde(default, alias = "lastUserInput")]
     pub prompt: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
@@ -296,8 +409,9 @@ mod tests {
     #[test]
     fn hooks_json_registers_both_events_with_a_silent_command() {
         let (tmp, paths) = probe_paths();
-        let v = hooks_json(&paths);
+        let v = hooks_json(&paths, AgentKind::Claude, false);
         let hooks = &v["hooks"];
+        assert_eq!(hooks.as_object().unwrap().len(), 2, "session hooks only");
         for event in ["SessionStart", "UserPromptSubmit"] {
             let cmd = hooks[event][0]["hooks"][0]["command"]
                 .as_str()
@@ -309,6 +423,77 @@ mod tests {
             );
             assert_eq!(hooks[event][0]["hooks"][0]["type"], "command");
         }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn activity_hooks_add_tool_approval_and_stop_events_per_cli() {
+        let (tmp, paths) = probe_paths();
+        let claude = hooks_json(&paths, AgentKind::Claude, true);
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PermissionRequest",
+            "Stop",
+        ] {
+            assert!(claude["hooks"][event].is_array(), "claude missing {event}");
+        }
+        assert_eq!(claude["hooks"]["PreToolUse"][0]["matcher"], "");
+        assert!(claude["hooks"]["Stop"][0].get("matcher").is_none());
+
+        let codex = hooks_json(&paths, AgentKind::Codex, true);
+        assert!(codex["hooks"]["PermissionRequest"].is_array());
+        assert!(codex["hooks"]["PreToolUse"][0].get("matcher").is_none());
+        assert!(
+            codex["hooks"].get("PostToolUseFailure").is_none(),
+            "Codex has no such event"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn activity_hooks_need_a_verified_cli_version() {
+        assert!(supports_activity_hooks(AgentKind::Claude, Some("2.1.325")));
+        assert!(supports_activity_hooks(AgentKind::Claude, Some("2.2.0")));
+        assert!(!supports_activity_hooks(AgentKind::Claude, Some("2.1.324")));
+        assert!(supports_activity_hooks(AgentKind::Codex, Some("0.170.0")));
+        assert!(!supports_activity_hooks(AgentKind::Codex, Some("0.125.0")));
+        assert!(supports_activity_hooks(
+            AgentKind::Antigravity,
+            Some("1.5.11")
+        ));
+        assert!(!supports_activity_hooks(AgentKind::Antigravity, None));
+    }
+
+    #[test]
+    fn antigravity_hooks_never_gate_tools_and_respect_a_user_file() {
+        let (tmp, paths) = probe_paths();
+        let project = tmp.join("project");
+        std::fs::create_dir_all(project.join(".git").join("info")).unwrap();
+
+        assert!(write_antigravity_hooks(&project, &paths).unwrap());
+        let file = project.join(".agents").join("hooks.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let ours = &v[ANTIGRAVITY_HOOK_NAME];
+        assert!(ours.get("PreToolUse").is_none(), "must not gate tool calls");
+        assert_eq!(ours["PostToolUse"][0]["matcher"], "*");
+        assert!(ours["PreInvocation"][0]["command"].is_string());
+        let exclude = std::fs::read_to_string(project.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains("/.agents/hooks.json"));
+
+        // Our own file is refreshed on the next spawn.
+        assert!(write_antigravity_hooks(&project, &paths).unwrap());
+
+        // A file with the user's own hooks is left exactly as it is.
+        let user = r#"{"lint":{"PostToolUse":[]}}"#;
+        std::fs::write(&file, user).unwrap();
+        assert!(!write_antigravity_hooks(&project, &paths).unwrap());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), user);
+        std::fs::write(&file, "not json").unwrap();
+        assert!(!write_antigravity_hooks(&project, &paths).unwrap());
         std::fs::remove_dir_all(&tmp).ok();
     }
 

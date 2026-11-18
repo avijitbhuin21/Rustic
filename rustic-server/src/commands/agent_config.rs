@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use rustic_agent::{
-    AiConfig, LoadProjectScopeResult, McpProjectSaveResult, McpProjectServerView, McpScope,
-    McpServerWithStatus, ProviderType, ToolConfig, ToolDef,
+    AiConfig, LoadProjectScopeResult, McpManager, McpProjectSaveResult, McpProjectServerView,
+    McpScope, McpServerWithStatus, ProviderType, ToolConfig, ToolDef,
 };
 use rustic_app::context::AppContext;
 use rustic_app::secrets::provider_account;
@@ -94,6 +94,7 @@ pub async fn dispatch(
         "get_pending_mcp_consent" => get_pending_mcp_consent(ctx, args).await,
         "approve_mcp_project_consent" => approve_mcp_project_consent(ctx, args).await,
         "revoke_mcp_project_consent" => revoke_mcp_project_consent(ctx, args).await,
+        "prewarm_agent_project" => prewarm_agent_project(ctx, args).await,
 
         // ── memory ─────────────────────────────────────────────────────
         "get_memory" => get_memory(ctx, args),
@@ -940,26 +941,6 @@ fn read_mcp_json(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     }
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct McpSaveResult {
-    name: String,
-    connected: bool,
-    tool_count: usize,
-    error: Option<String>,
-}
-
-impl From<rustic_agent::McpConnectResult> for McpSaveResult {
-    fn from(r: rustic_agent::McpConnectResult) -> Self {
-        Self {
-            name: r.name,
-            connected: r.connected,
-            tool_count: r.tool_count,
-            error: r.error,
-        }
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveMcpJsonArg {
@@ -968,6 +949,8 @@ struct SaveMcpJsonArg {
     content: String,
 }
 
+/// Write + reload a scope. Returns its servers at once; changed entries
+/// connect in the background and report through `mcp-server-status`.
 async fn save_mcp_json(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: SaveMcpJsonArg = parse(args)?;
     let scope = parse_scope(&a.scope)?;
@@ -975,19 +958,9 @@ async fn save_mcp_json(ctx: &ServerContext, args: &Value) -> Result<Value, ApiEr
     let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
     let content = a.content;
 
-    let res = tokio::task::spawn_blocking(move || -> Result<Vec<McpSaveResult>, String> {
-        let mut mcp = mcp_arc.lock_safe();
-        match scope {
-            McpScope::User => mcp.set_user_path(path.clone()),
-            McpScope::Project => mcp.set_project_path(path.clone()),
-        }
-        mcp.save_scope_raw(scope, &content)
-            .map_err(|e| e.to_string())?;
-        Ok(mcp
-            .test_scope(scope)
-            .into_iter()
-            .map(McpSaveResult::from)
-            .collect())
+    let res = tokio::task::spawn_blocking(move || -> Result<Vec<McpServerWithStatus>, String> {
+        McpManager::save_scope_and_connect(&mcp_arc, scope, &path, &content)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("save_mcp_json task panicked: {}", e))??;
@@ -1000,6 +973,8 @@ struct ListMcpServersArg {
     project_id: Option<String>,
 }
 
+/// Servers with their current status. Never waits on a connection: servers
+/// that aren't up yet are returned as `connecting` and settle via events.
 async fn list_mcp_servers(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ListMcpServersArg = parse(args)?;
     let user_path = resolve_scope_path(ctx, McpScope::User, None).ok();
@@ -1011,23 +986,48 @@ async fn list_mcp_servers(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
 
     let pool_only = a.project_id.is_none();
     let res = tokio::task::spawn_blocking(move || -> Vec<McpServerWithStatus> {
-        let mut mcp = mcp_arc.lock_safe();
-        if let Some(p) = user_path {
-            let _ = mcp.load_scope(McpScope::User, &p);
-        }
-        if let Some(p) = project_path {
-            let _ = mcp.load_project_scope_gated(&p);
-        }
-        let _ = mcp.connect_all();
-        if pool_only {
-            mcp.list_pool_servers_with_status()
-        } else {
-            mcp.list_servers_with_status()
-        }
+        McpManager::list_and_connect(
+            &mcp_arc,
+            user_path.as_deref(),
+            project_path.as_deref(),
+            pool_only,
+        )
     })
     .await
     .map_err(|e| format!("list_mcp_servers task panicked: {}", e))?;
     ok(res)
+}
+
+/// Warm a project's agent state when it becomes active — its file-history
+/// handle and MCP connections — so the first send doesn't pay for either.
+async fn prewarm_agent_project(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    let a: ProjectArg = parse(args)?;
+    let root = PathBuf::from(project_root(ctx, &a.project_id)?);
+    let user_mcp_path = ctx.data_dir().join("mcp.json");
+    let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
+    let mcp_root = root.clone();
+    let mcp = tokio::task::spawn_blocking(move || {
+        McpManager::prewarm_project(&mcp_arc, Some(&user_mcp_path), &mcp_root);
+    });
+    let ctx_fh = ctx.clone();
+    let file_history = tokio::task::spawn_blocking(move || {
+        let Ok(canon_root) = root.canonicalize() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        if let Err(e) = crate::commands::file_history::get_or_create_handle(
+            ctx_fh.state(),
+            &ctx_fh.data_dir(),
+            &ctx_fh.hub,
+            &canon_root,
+        ) {
+            tracing::warn!(%e, "prewarm: file_history handle init failed");
+        }
+        tracing::info!(target: "rustic::timing", elapsed_ms = started.elapsed().as_millis() as u64, "prewarm: file-history handle init");
+    });
+    let _ = mcp.await;
+    let _ = file_history.await;
+    ok(serde_json::json!(null))
 }
 
 async fn get_pending_mcp_consent(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -1067,7 +1067,7 @@ async fn approve_mcp_project_consent(ctx: &ServerContext, args: &Value) -> Resul
     let path = resolve_scope_path(ctx, McpScope::Project, Some(&a.project_id))?;
     let content_hash = a.content_hash;
     let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
-    let res = tokio::task::spawn_blocking(move || -> Result<Vec<McpSaveResult>, String> {
+    let res = tokio::task::spawn_blocking(move || -> Result<Vec<McpServerWithStatus>, String> {
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let actual = rustic_agent::mcp_sha256_hex(text.as_bytes());
         if actual != content_hash {
@@ -1076,21 +1076,22 @@ async fn approve_mcp_project_consent(ctx: &ServerContext, args: &Value) -> Resul
                 content_hash, actual
             ));
         }
-        let mut mcp = mcp_arc.lock_safe();
-        mcp.approve_project_consent(path.clone(), actual)
-            .map_err(|e| e.to_string())?;
-        match mcp.load_project_scope_gated(&path) {
-            Ok(LoadProjectScopeResult::Loaded(_)) => {}
-            Ok(other) => {
-                return Err(format!("Unexpected gated load result after approval: {:?}", other));
+        {
+            let mut mcp = mcp_arc.lock_safe();
+            mcp.approve_project_consent(path.clone(), actual)
+                .map_err(|e| e.to_string())?;
+            match mcp.load_project_scope_gated(&path) {
+                Ok(LoadProjectScopeResult::Loaded(_)) => {}
+                Ok(other) => {
+                    return Err(format!("Unexpected gated load result after approval: {:?}", other));
+                }
+                Err(e) => return Err(e.to_string()),
             }
-            Err(e) => return Err(e.to_string()),
         }
-        Ok(mcp
-            .test_scope(McpScope::Project)
-            .into_iter()
-            .map(McpSaveResult::from)
-            .collect())
+        McpManager::connect_all_in_background(&mcp_arc);
+        Ok(mcp_arc
+            .lock_safe()
+            .list_scope_with_status(McpScope::Project))
     })
     .await
     .map_err(|e| format!("approve_mcp_project_consent task panicked: {}", e))??;
@@ -1115,10 +1116,7 @@ async fn test_mcp_server(ctx: &ServerContext, args: &Value) -> Result<Value, Api
     let id = a.id;
     let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
     let res = tokio::task::spawn_blocking(move || -> Result<Vec<ToolDef>, String> {
-        mcp_arc
-            .lock_safe()
-            .test_server(&id)
-            .map_err(|e| e.to_string())
+        McpManager::retest_server(&mcp_arc, &id).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("test_mcp_server task panicked: {}", e))??;
@@ -1161,10 +1159,7 @@ async fn list_mcp_server_tools(ctx: &ServerContext, args: &Value) -> Result<Valu
     let id = a.id;
     let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
     let res = tokio::task::spawn_blocking(move || -> Result<Vec<ToolDef>, String> {
-        mcp_arc
-            .lock_safe()
-            .server_tools(&id)
-            .map_err(|e| e.to_string())
+        McpManager::list_server_tools(&mcp_arc, &id).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("list_mcp_server_tools task panicked: {}", e))??;
@@ -1505,7 +1500,7 @@ struct McpProjectAddOutcome {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct McpAddResult {
-    pool: McpSaveResult,
+    id: String,
     projects: Vec<McpProjectAddOutcome>,
 }
 
@@ -1535,40 +1530,33 @@ async fn add_mcp_pool_server(ctx: &ServerContext, args: &Value) -> Result<Value,
     let projects = workspace_projects(ctx);
     let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
     let res = tokio::task::spawn_blocking(move || -> Result<McpAddResult, String> {
-        let mut mcp = mcp_arc.lock_safe();
-        mcp.set_user_path(user_path.clone());
-        let _ = mcp.load_scope(McpScope::User, &user_path);
-        mcp.add_pool_server(&a.name, &a.entry)
-            .map_err(|e| e.to_string())?;
-        let pool = match mcp.test_server(&format!("user-{}", a.name)) {
-            Ok(tools) => McpSaveResult {
-                name: a.name.clone(),
-                connected: true,
-                tool_count: tools.len(),
-                error: None,
-            },
-            Err(e) => McpSaveResult {
-                name: a.name.clone(),
-                connected: false,
-                tool_count: 0,
-                error: Some(e.to_string()),
-            },
-        };
-        let mut outcomes = Vec::new();
-        for (pid, pname, root) in projects {
-            let selected = a.project_ids.contains(&pid);
-            let r = mcp
-                .save_project_server(&root, &a.name, None, selected, false)
-                .map_err(|e| e.to_string());
-            outcomes.push(McpProjectAddOutcome {
-                project_id: pid,
-                project_name: pname,
-                result: r.as_ref().ok().cloned(),
-                error: r.err(),
-            });
+        {
+            let mut mcp = mcp_arc.lock_safe();
+            mcp.set_user_path(user_path.clone());
+            let _ = mcp.load_scope(McpScope::User, &user_path);
         }
+        let targets: Vec<(PathBuf, bool)> = projects
+            .iter()
+            .map(|(pid, _, root)| (root.clone(), a.project_ids.contains(pid)))
+            .collect();
+        let written =
+            McpManager::add_pool_server_for_projects(&mcp_arc, &a.name, &a.entry, &targets)
+                .map_err(|e| e.to_string())?;
+        let outcomes = projects
+            .into_iter()
+            .zip(written)
+            .map(|((pid, pname, _), r)| {
+                let r = r.map_err(|e| e.to_string());
+                McpProjectAddOutcome {
+                    project_id: pid,
+                    project_name: pname,
+                    result: r.as_ref().ok().cloned(),
+                    error: r.err(),
+                }
+            })
+            .collect();
         Ok(McpAddResult {
-            pool,
+            id: format!("user-{}", a.name),
             projects: outcomes,
         })
     })
@@ -1626,10 +1614,12 @@ async fn save_mcp_project_server(ctx: &ServerContext, args: &Value) -> Result<Va
     let root = PathBuf::from(project_root(ctx, &a.project_id)?);
     let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
     let res = tokio::task::spawn_blocking(move || -> Result<McpProjectSaveResult, String> {
-        let mut mcp = mcp_arc.lock_safe();
-        mcp.set_user_path(user_path.clone());
-        let _ = mcp.load_scope(McpScope::User, &user_path);
-        mcp.save_project_server(&root, &a.name, a.entry.as_ref(), a.enabled, true)
+        {
+            let mut mcp = mcp_arc.lock_safe();
+            mcp.set_user_path(user_path.clone());
+            let _ = mcp.load_scope(McpScope::User, &user_path);
+        }
+        McpManager::save_project_server(&mcp_arc, &root, &a.name, a.entry.as_ref(), a.enabled)
             .map_err(|e| e.to_string())
     })
     .await

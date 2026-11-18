@@ -50,12 +50,13 @@ bun install
 bun run tauri dev
 ```
 
-Production build — pass `--no-default-features` to strip the bundled devtools
-inspector (installers land under `target/release/bundle/`):
+Production build — release bundles ship without the web inspector (installers
+land under `target/release/bundle/`):
 
 ```bash
-bun run tauri build -- --no-default-features   # production: devtools stripped
-bun run tauri build                            # devtools-enabled "debug-style" build
+bun run tauri build                       # production: no inspector
+bun run tauri build --features devtools   # release build that keeps the inspector
+bun run tauri build --debug               # debug build: inspector always available
 ```
 
 State-mutating git operations (commit, merge, rebase, clone) shell out to the

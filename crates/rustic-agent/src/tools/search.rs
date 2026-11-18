@@ -36,8 +36,8 @@ pub fn definitions() -> Vec<ToolDef> {
                 "properties": {
                     "query": { "type": "string", "description": "Search pattern (regex supported)" },
                     "path": { "type": "string", "description": "Subdirectory to search in, relative to project root (REQUIRED). Pass '.' to deliberately search the entire project." },
-                    "include": { "type": "string", "description": "Glob pattern for files to include (e.g. '*.rs')" },
-                    "exclude": { "type": "string", "description": "Glob pattern for files to exclude" },
+                    "include": { "type": "string", "description": "Glob pattern for files to include (e.g. '*.rs', '*.{js,jsx}')" },
+                    "exclude": { "type": "string", "description": "Glob pattern for files to exclude ({a,b} alternatives supported)" },
                     "context_before": { "type": "integer", "description": "Number of lines to show before each match (like grep -B). Capped at 10." },
                     "context_after": { "type": "integer", "description": "Number of lines to show after each match (like grep -A). Capped at 10." },
                     "context": { "type": "integer", "description": "Shorthand: show N lines before AND after each match (like grep -C). Sets both context_before and context_after. Capped at 10." }
@@ -308,12 +308,23 @@ async fn execute_grep_one(
         });
     }
 
-    let include_glob = params["include"]
-        .as_str()
-        .and_then(|s| glob::Pattern::new(s).ok());
-    let exclude_glob = params["exclude"]
-        .as_str()
-        .and_then(|s| glob::Pattern::new(s).ok());
+    let mut filters: [Option<BraceGlob>; 2] = [None, None];
+    for (slot, key) in filters.iter_mut().zip(["include", "exclude"]) {
+        let Some(pattern) = params[key].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        match BraceGlob::new(pattern) {
+            Ok(g) => *slot = Some(g),
+            Err(e) => {
+                return Ok(ToolOutput {
+                    content: format!("GREP_ERROR: invalid `{key}` pattern '{pattern}': {e}"),
+                    is_error: true,
+                    attachments: Vec::new(),
+                })
+            }
+        }
+    }
+    let [include_glob, exclude_glob] = filters;
 
     let (ctx_before, ctx_after) = parse_context_params(&params);
 
@@ -361,13 +372,93 @@ async fn execute_grep_one(
     })
 }
 
+/// Upper bound on the patterns one `{a,b}` expression may expand to.
+const MAX_BRACE_EXPANSIONS: usize = 128;
+
+/// Expand shell-style `{a,b}` alternatives (nested and repeated groups included) into plain glob patterns.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let bytes = pattern.as_bytes();
+    for open in 0..bytes.len() {
+        if bytes[open] != b'{' {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut commas: Vec<usize> = Vec::new();
+        let mut close = None;
+        for (j, &b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(j);
+                        break;
+                    }
+                }
+                b',' if depth == 1 => commas.push(j),
+                _ => {}
+            }
+        }
+        // A group needs a closing brace and at least one comma; `{a}` stays literal.
+        let Some(close) = close else { continue };
+        if commas.is_empty() {
+            continue;
+        }
+        let (prefix, suffix) = (&pattern[..open], &pattern[close + 1..]);
+        let mut out = Vec::new();
+        let mut start = open + 1;
+        for end in commas.into_iter().chain(std::iter::once(close)) {
+            out.extend(expand_braces(&format!(
+                "{prefix}{}{suffix}",
+                &pattern[start..end]
+            )));
+            if out.len() > MAX_BRACE_EXPANSIONS {
+                return out;
+            }
+            start = end + 1;
+        }
+        return out;
+    }
+    vec![pattern.to_string()]
+}
+
+/// A glob that also understands `{a,b}` alternatives, which the `glob` crate treats as literal text.
+struct BraceGlob(Vec<glob::Pattern>);
+
+impl BraceGlob {
+    /// Compile `pattern`, expanding brace alternatives first.
+    fn new(pattern: &str) -> std::result::Result<Self, String> {
+        let expanded = expand_braces(pattern);
+        if expanded.len() > MAX_BRACE_EXPANSIONS {
+            return Err(format!(
+                "too many `{{a,b}}` alternatives (more than {MAX_BRACE_EXPANSIONS} patterns)"
+            ));
+        }
+        expanded
+            .iter()
+            .map(|p| glob::Pattern::new(p).map_err(|e| e.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(Self)
+    }
+
+    /// True when any alternative matches `path`.
+    fn matches_path(&self, path: &std::path::Path) -> bool {
+        self.0.iter().any(|p| p.matches_path(path))
+    }
+
+    /// True when any alternative matches `text`.
+    fn matches(&self, text: &str) -> bool {
+        self.0.iter().any(|p| p.matches(text))
+    }
+}
+
 /// Inputs for one grep run; separated from ToolContext so the engine is testable.
 struct GrepRun {
     matcher: grep_regex::RegexMatcher,
     search_path: std::path::PathBuf,
     project_root: std::path::PathBuf,
-    include_glob: Option<glob::Pattern>,
-    exclude_glob: Option<glob::Pattern>,
+    include_glob: Option<BraceGlob>,
+    exclude_glob: Option<BraceGlob>,
     ctx_before: usize,
     ctx_after: usize,
     respect_gitignore: bool,
@@ -601,7 +692,7 @@ async fn execute_glob_one(params: Value, context: &ToolContext) -> Result<ToolOu
         .map(|p| context.project_root.join(p))
         .unwrap_or_else(|| context.project_root.clone());
 
-    let compiled = match glob::Pattern::new(pattern) {
+    let compiled = match BraceGlob::new(pattern) {
         Ok(p) => p,
         Err(e) => {
             return Ok(ToolOutput {
@@ -827,10 +918,64 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "needle\n").unwrap();
         std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
         let mut run = mk_run(dir.path(), "needle", (0, 0));
-        run.include_glob = Some(glob::Pattern::new("*.rs").unwrap());
+        run.include_glob = Some(BraceGlob::new("*.rs").unwrap());
         let out = run_grep(run, &|_, _| {});
         assert!(out.contains("a.rs:1:"), "{}", out);
         assert!(!out.contains("a.txt"), "{}", out);
+    }
+
+    #[test]
+    fn test_run_grep_brace_include_and_exclude() {
+        // Tracker #7: `*.{js,jsx}` used to match nothing and report "No matches found".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        for name in ["a.js", "sub/b.jsx", "c.ts", "d.rs"] {
+            std::fs::write(dir.path().join(name), "needle\n").unwrap();
+        }
+        let mut run = mk_run(dir.path(), "needle", (0, 0));
+        run.include_glob = Some(BraceGlob::new("*.{js,jsx}").unwrap());
+        let out = run_grep(run, &|_, _| {});
+        assert!(
+            out.contains("a.js:1:") && out.contains("sub/b.jsx:1:"),
+            "{}",
+            out
+        );
+        assert!(!out.contains("c.ts") && !out.contains("d.rs"), "{}", out);
+
+        let mut run = mk_run(dir.path(), "needle", (0, 0));
+        run.exclude_glob = Some(BraceGlob::new("*.{js,jsx,ts}").unwrap());
+        let out = run_grep(run, &|_, _| {});
+        assert_eq!(out, "d.rs:1: needle");
+    }
+
+    #[test]
+    fn test_expand_braces() {
+        assert_eq!(expand_braces("*.rs"), vec!["*.rs"]);
+        assert_eq!(expand_braces("*.{js,jsx}"), vec!["*.js", "*.jsx"]);
+        assert_eq!(
+            expand_braces("{src,tests}/**/*.{js,ts}"),
+            vec![
+                "src/**/*.js",
+                "src/**/*.ts",
+                "tests/**/*.js",
+                "tests/**/*.ts"
+            ]
+        );
+        assert_eq!(expand_braces("a{b,c{d,e}}"), vec!["ab", "acd", "ace"]);
+        assert_eq!(expand_braces("*.{js,}"), vec!["*.js", "*."]);
+        // No comma or no closing brace: not an alternative group.
+        assert_eq!(expand_braces("{a}.txt"), vec!["{a}.txt"]);
+        assert_eq!(expand_braces("a{b,c"), vec!["a{b,c"]);
+    }
+
+    #[test]
+    fn test_brace_glob_matches_and_rejects() {
+        let g = BraceGlob::new("tests/**/*.{js,ts}").unwrap();
+        assert!(g.matches("tests/unit/a.ts") && g.matches("tests/a.js"));
+        assert!(!g.matches("tests/a.rs") && !g.matches("src/a.js"));
+        assert!(BraceGlob::new("src/[a").is_err());
+        let huge = "{a,b}".repeat(8);
+        assert!(BraceGlob::new(&huge).is_err());
     }
 
     #[test]

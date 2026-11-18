@@ -29,6 +29,7 @@ const IMAGE_EXT  = new Set(['png','jpg','jpeg','gif','webp','bmp','ico','avif'])
 const MARKDOWN_EXT = new Set(['md','markdown','mdx']);
 const PDF_EXT    = new Set(['pdf']);
 const SVG_EXT    = new Set(['svg']);
+const MERMAID_EXT = new Set(['mmd','mermaid']);
 const HTML_EXT   = new Set(['html','htm']);
 const VIDEO_EXT  = new Set(['mp4','webm','mov','mkv','m4v','ogv','avi']);
 const AUDIO_EXT  = new Set(['mp3','wav','flac','ogg','oga','opus','m4a','aac','weba','aiff','aif','wma']);
@@ -74,7 +75,7 @@ const UNSUPPORTED_EXT = new Set([
 // default (see makeFileTab); the user opts into preview via the tab toggle.
 // Binary/opaque kinds (image, video, pdf, docx, xlsx, hex) are NOT here —
 // there's no text to edit, so they stay preview-only.
-export const TOGGLEABLE_PREVIEW_KINDS = new Set(['markdown', 'svg', 'html']);
+export const TOGGLEABLE_PREVIEW_KINDS = new Set(['markdown', 'svg', 'html', 'mermaid']);
 
 export function getFileKind(path) {
   if (!path) return 'code';
@@ -85,6 +86,7 @@ export function getFileKind(path) {
   if (MARKDOWN_EXT.has(ext)) return 'markdown';
   if (PDF_EXT.has(ext))    return 'pdf';
   if (SVG_EXT.has(ext))    return 'svg';
+  if (MERMAID_EXT.has(ext)) return 'mermaid';
   if (HTML_EXT.has(ext))   return 'html';
   if (DOCX_EXT.has(ext))   return 'docx';
   if (NOTEBOOK_EXT.has(ext)) return 'notebook';

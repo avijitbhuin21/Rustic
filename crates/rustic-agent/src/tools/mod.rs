@@ -357,6 +357,10 @@ pub struct ToolContext {
     pub file_read_registry: Arc<FileReadRegistry>,
     pub mcp_manager: Option<Arc<Mutex<McpManager>>>,
     pub mcp_tool_defs: Vec<ToolDef>,
+    /// MCP tool name → owning server id, for tools the server annotates
+    /// `readOnlyHint`. Scheduling input only (which calls may run in the
+    /// parallel batch) — the hint is server-supplied, so never gate permissions on it.
+    pub mcp_read_only_tools: Arc<std::collections::HashMap<String, String>>,
     pub subagent_registry: Arc<crate::task::subagent::SubagentRegistry>,
     /// 0 = main agent, 1 = sub-agent. Sub-agents cannot spawn further sub-agents.
     pub agent_depth: u8,
@@ -523,6 +527,7 @@ impl ToolContext {
             file_read_registry: Arc::new(FileReadRegistry::new()),
             mcp_manager: None,
             mcp_tool_defs: Vec::new(),
+            mcp_read_only_tools: Arc::new(std::collections::HashMap::new()),
             subagent_registry: crate::task::subagent::SubagentRegistry::new(),
             agent_depth: 0,
             ai_config: Arc::new(crate::config::AiConfig::default()),
@@ -666,6 +671,30 @@ impl BuiltinTools {
                 | "tool_search"
                 | "check_other_active_agents"
         )
+    }
+
+    /// Number of leading `calls` that form a concurrent `run_command` group (0 when fewer than two qualify).
+    pub fn parallel_command_run_len(calls: &[&(String, String, Value)]) -> usize {
+        let run = calls
+            .iter()
+            .take_while(|(_, name, input)| {
+                name.as_str() == "run_command" && terminal::wants_parallel(input)
+            })
+            .count();
+        if run >= 2 {
+            run
+        } else {
+            0
+        }
+    }
+
+    /// Run a group of `parallel: true` `run_command` calls concurrently, returning outputs in call order.
+    pub async fn run_commands_parallel(
+        &self,
+        calls: &[(&str, &Value)],
+        context: &ToolContext,
+    ) -> Vec<ToolOutput> {
+        terminal::run_commands_parallel(calls, context).await
     }
 
     /// Like `definitions()` but constrains `run_command`'s `shell` to installed shells
@@ -875,5 +904,38 @@ mod tests {
                 tool
             );
         }
+    }
+
+    fn call(name: &str, input: Value) -> (String, String, Value) {
+        ("id".to_string(), name.to_string(), input)
+    }
+
+    #[test]
+    fn parallel_run_len_counts_only_leading_flagged_commands() {
+        let par = || {
+            call(
+                "run_command",
+                serde_json::json!({ "command": "x", "parallel": true }),
+            )
+        };
+        let seq = || call("run_command", serde_json::json!({ "command": "x" }));
+        let edit = || call("edit_file", serde_json::json!({ "path": "a" }));
+
+        let owned = [par(), par(), par(), edit(), par()];
+        let refs: Vec<&(String, String, Value)> = owned.iter().collect();
+        assert_eq!(BuiltinTools::parallel_command_run_len(&refs), 3);
+        // Starting at the edit, and at the trailing lone command: no group.
+        assert_eq!(BuiltinTools::parallel_command_run_len(&refs[3..]), 0);
+        assert_eq!(BuiltinTools::parallel_command_run_len(&refs[4..]), 0);
+
+        let owned = [par(), seq(), par()];
+        let refs: Vec<&(String, String, Value)> = owned.iter().collect();
+        assert_eq!(BuiltinTools::parallel_command_run_len(&refs), 0);
+
+        // An edit between two flagged commands keeps them in order.
+        let owned = [par(), edit(), par()];
+        let refs: Vec<&(String, String, Value)> = owned.iter().collect();
+        assert_eq!(BuiltinTools::parallel_command_run_len(&refs), 0);
+        assert_eq!(BuiltinTools::parallel_command_run_len(&[]), 0);
     }
 }

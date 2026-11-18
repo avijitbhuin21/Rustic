@@ -143,12 +143,43 @@ function terminalTheme() {
   return out;
 }
 
+// Terminals that take their background from a UI token instead of the theme's
+// terminal colour (the CLI chat view sits on the chat surface). term -> CSS
+// variable name, resolved again on every theme change.
+const surfaceVars = (globalThis.__rusticTermSurfaceVars ??= new WeakMap());
+
+/** Resolve any CSS colour (the UI tokens are oklch) to the `#rrggbb` xterm needs; null if it can't be parsed. */
+function cssColorToHex(color) {
+  if (!color || typeof document === 'undefined') return null;
+  try {
+    const ctx = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+    const sentinel = '#010203';
+    ctx.fillStyle = sentinel;
+    ctx.fillStyle = color;
+    if (ctx.fillStyle === sentinel && color.trim().toLowerCase() !== sentinel) return null;
+    ctx.fillRect(0, 0, 1, 1);
+    const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+    return '#' + [r, g, b].map((n) => n.toString(16).padStart(2, '0')).join('');
+  } catch {
+    return null;
+  }
+}
+
+/** The theme for one terminal: the shared palette plus its surface override, if any. */
+function themeFor(term, base = terminalTheme()) {
+  const cssVar = surfaceVars.get(term);
+  if (!cssVar) return base;
+  const raw = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim();
+  const hex = cssColorToHex(raw);
+  return hex ? { ...base, background: hex } : base;
+}
+
 const liveTerms = (globalThis.__rusticLiveTerms ??= new Set());
 if (typeof MutationObserver !== 'undefined' && typeof document !== 'undefined' && !globalThis.__rusticTermThemeObserver) {
   globalThis.__rusticTermThemeObserver = new MutationObserver(() => {
     const theme = terminalTheme();
     for (const t of liveTerms) {
-      try { t.options.theme = theme; } catch (_) {}
+      try { t.options.theme = themeFor(t, theme); } catch (_) {}
     }
   });
   globalThis.__rusticTermThemeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
@@ -291,6 +322,10 @@ function createTerminalInstance(sessionId) {
   })();
   // Callback set by the mounted component so Ctrl+Shift+F can open its overlay.
   let onOpenSearch = null;
+  // Set by the CLI chat view so Ctrl/Cmd+Shift+A can open its insert picker.
+  let onOpenPicker = null;
+  // CSS variable this terminal takes its background from (null = theme default).
+  let surfaceVar = null;
   const searchResultSubs = new Set();
   let lastSearchResults = { index: -1, count: 0 };
 
@@ -411,6 +446,10 @@ function createTerminalInstance(sessionId) {
 
     fit = new FitAddon();
     liveTerms.add(term);
+    if (surfaceVar) {
+      surfaceVars.set(term, surfaceVar);
+      term.options.theme = themeFor(term);
+    }
     term.loadAddon(fit);
 
     // Wait for the terminal font to actually load before opening — xterm
@@ -562,6 +601,12 @@ function createTerminalInstance(sessionId) {
 
         if (k === 'f' && e.shiftKey) {
           onOpenSearch?.();
+          return false;
+        }
+
+        // Only claimed where a picker is mounted, so plain terminals keep the key.
+        if (k === 'a' && e.shiftKey && onOpenPicker) {
+          onOpenPicker();
           return false;
         }
 
@@ -810,6 +855,33 @@ function createTerminalInstance(sessionId) {
     repaint,
     debug: debugDump, // [term-diag] TEMP
     setOnOpenSearch(cb) { onOpenSearch = cb; },
+    setOnOpenPicker(cb) { onOpenPicker = cb; },
+    /**
+     * Put `text` at the running program's cursor as a paste. Never submits:
+     * trailing newlines are dropped, and inner newlines survive only while the
+     * program has bracketed paste on (where they are line breaks, not Enter).
+     */
+    insertText(text) {
+      // ESC is stripped so pasted content can't close the paste bracket early.
+      let body = String(text ?? '').replace(/\x1b/g, '').replace(/\r\n?/g, '\n').replace(/\n+$/, '');
+      if (!body) return;
+      const oneLine = (s) => s.replace(/\s*\n\s*/g, ' ');
+      if (!term) {
+        useTerminal.getState().writeTerminal(sessionId, oneLine(body));
+        return;
+      }
+      if (!term.modes?.bracketedPasteMode) body = oneLine(body);
+      term.paste(body);
+      term.focus();
+    },
+    /** Take the background from a UI colour token (e.g. '--background'); null restores the theme's. */
+    setSurface(cssVar) {
+      surfaceVar = cssVar || null;
+      if (!term) return;
+      if (surfaceVar) surfaceVars.set(term, surfaceVar);
+      else surfaceVars.delete(term);
+      try { term.options.theme = themeFor(term); } catch (_) {}
+    },
     subscribeSearchResults(cb) {
       searchResultSubs.add(cb);
       cb(lastSearchResults);

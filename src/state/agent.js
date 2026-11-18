@@ -1119,6 +1119,12 @@ export const useAgent = create((set, get) => ({
       // so switching to a project no longer force-expands its tasks.
       expandedProjects: s.expandedProjects,
     }));
+
+    // Connect the project's MCP servers and open its file-history store now,
+    // so the first send in this project doesn't wait on either.
+    if (next.id && isTauriAvailable()) {
+      safeInvoke('prewarm_agent_project', { projectId: next.id }).catch(() => {});
+    }
   },
 
   toggleProjectExpanded: (side, projectId) =>

@@ -32,6 +32,10 @@ pub fn definitions() -> Vec<ToolDef> {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed"],
                                 "description": "Current status of this task"
+                            },
+                            "group": {
+                                "type": "string",
+                                "description": "Optional short label (e.g. 'checks'). Give the SAME label to items that do not depend on each other, so their tool calls can go out together in one response. Omit it for steps that must happen in order."
                             }
                         },
                         "required": ["content", "status"]
@@ -83,7 +87,12 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
             });
         }
 
-        todos.push(TodoItem { content, status });
+        let group = TodoItem::parse_group(item.get("group"));
+        todos.push(TodoItem {
+            content,
+            status,
+            group,
+        });
     }
 
     let total = todos.len();
@@ -102,11 +111,7 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
         todos: todos.clone(),
     });
 
-    let list_lines: Vec<String> = todos
-        .iter()
-        .enumerate()
-        .map(|(i, t)| format!("{}. [{}] {}", i + 1, t.status, t.content))
-        .collect();
+    let list_lines: Vec<String> = todos.iter().enumerate().map(|(i, t)| t.line(i)).collect();
     let list_text = if list_lines.is_empty() {
         "(empty)".to_string()
     } else {
@@ -125,4 +130,44 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
         is_error: false,
         attachments: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn group_label_is_stored_rendered_and_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        let params = json!({ "todos": [
+            { "content": "Edit parser", "status": "completed" },
+            { "content": "Run typecheck", "status": "pending", "group": " checks " },
+            { "content": "Run tests", "status": "pending", "group": "checks" },
+            { "content": "Write summary", "status": "pending", "group": "  " }
+        ]});
+        let out = execute("todo_write", params, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("1. [completed] Edit parser\n"));
+        assert!(out
+            .content
+            .contains("2. [pending] Run typecheck (group: checks)"));
+        assert!(out.content.ends_with("4. [pending] Write summary"));
+
+        let stored = ctx.current_todos.lock().unwrap().clone();
+        let groups: Vec<Option<&str>> = stored.iter().map(|t| t.group.as_deref()).collect();
+        assert_eq!(groups, vec![None, Some("checks"), Some("checks"), None]);
+    }
+
+    #[test]
+    fn stored_todos_without_group_still_load() {
+        let old: Vec<TodoItem> =
+            serde_json::from_str(r#"[{"content":"a","status":"pending"}]"#).unwrap();
+        assert_eq!(old[0].group, None);
+        // Ungrouped items serialise exactly as before.
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"[{"content":"a","status":"pending"}]"#
+        );
+    }
 }

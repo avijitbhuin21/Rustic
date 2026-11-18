@@ -12,18 +12,15 @@ path = "src/lib.rs"
 tauri-build = { version = "2", features = [] }
 
 [features]
-# `devtools` is now enabled unconditionally on the `tauri` dependency below, so
-# the inspect-element / devtools panel ships in EVERY build — including release
-# bundles built with `--no-default-features`. This feature flag is kept as a
-# (now redundant) no-op so existing build scripts referencing it don't break.
-default = ["devtools"]
-devtools = []
+# The web inspector is opt-in. Release bundles (CI and local) ship without it;
+# debug builds (`tauri dev`, `tauri build --debug`) always have it because
+# Tauri enables it under debug assertions. For a release build that keeps the
+# inspector: `bun run tauri build --features devtools`.
+default = []
+devtools = ["tauri/devtools"]
 
 [dependencies]
-# `devtools` is listed here (not behind a feature) on purpose: release bundles
-# are built with `--no-default-features`, which would otherwise strip the
-# inspector. Keeping it on the dep guarantees inspect-element in every build.
-tauri = { version = "2", features = ["image-png", "devtools"] }
+tauri = { version = "2", features = ["image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
@@ -68,7 +65,7 @@ rustic-git = { workspace = true }
 rustic-terminal = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Already in the tree via tauri/tao; used to round the borderless window's top corners.
+# Already in the tree via tauri/tao; used for the borderless window's simple-fullscreen chrome.
 objc2 = "0.6"
 
 [lints]

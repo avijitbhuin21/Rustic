@@ -7,6 +7,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { useCodeCopyButtons } from '@/lib/code-copy';
+import { useMermaidBlocks } from '@/lib/mermaid';
 import { ZoomControls, useCtrlWheelZoom } from './preview-zoom';
 
 const MIN_SCALE = 0.5;
@@ -55,6 +56,8 @@ export default function MarkdownPreview({ tab }) {
 
   // Drop a hover copy button onto every fenced code block.
   useCodeCopyButtons(previewRef, [renderedHtml]);
+  // Render ```mermaid fences as diagrams, same as agent chat.
+  useMermaidBlocks(previewRef, [renderedHtml]);
 
   // Intercept link clicks in the markdown preview via the shared handler:
   // external URLs (scheme allow-listed) open in the default browser, local

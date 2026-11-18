@@ -99,6 +99,7 @@ const MarkdownPreview = React.lazy(() => import('@/components/editor/previews/ma
 const ImagePreview    = React.lazy(() => import('@/components/editor/previews/image-preview'));
 const PdfPreview      = React.lazy(() => import('@/components/editor/previews/pdf-preview'));
 const SvgPreview      = React.lazy(() => import('@/components/editor/previews/svg-preview'));
+const MermaidPreview  = React.lazy(() => import('@/components/editor/previews/mermaid-preview'));
 const HtmlPreview     = React.lazy(() => import('@/components/editor/previews/html-preview'));
 const VideoPreview    = React.lazy(() => import('@/components/editor/previews/video-preview'));
 const AudioPreview    = React.lazy(() => import('@/components/editor/previews/audio-preview'));
@@ -203,6 +204,7 @@ function ActiveView({ tab }) {
     case 'image':    return <ImagePreview tab={tab} />;
     case 'pdf':      return <PdfPreview tab={tab} />;
     case 'svg':      return <SvgPreview tab={tab} />;
+    case 'mermaid':  return <MermaidPreview tab={tab} />;
     case 'html':     return <HtmlPreview tab={tab} />;
     case 'video':    return <VideoPreview tab={tab} />;
     case 'audio':    return <AudioPreview tab={tab} />;

@@ -44,6 +44,8 @@ pub struct McpClient {
     /// A broken client must not be reused — the owner (McpManager) drops it
     /// and reconnects lazily. See `is_broken`.
     broken: bool,
+    /// Names from the last `tools/list` whose annotations set `readOnlyHint`.
+    read_only_tools: std::collections::HashSet<String>,
 }
 
 #[allow(clippy::large_enum_variant)] // one long-lived value per client
@@ -168,6 +170,7 @@ impl McpClient {
                         rx,
                     },
                     broken: false,
+                    read_only_tools: Default::default(),
                 };
 
                 // Send initialize
@@ -185,6 +188,7 @@ impl McpClient {
                 Ok(Self {
                     transport: ClientTransport::Remote(transport),
                     broken: false,
+                    read_only_tools: Default::default(),
                 })
             }
         }
@@ -214,6 +218,11 @@ impl McpClient {
         let tools_value = resp.get("tools").cloned().unwrap_or(json!([]));
 
         let tools: Vec<McpTool> = serde_json::from_value(tools_value)?;
+        self.read_only_tools = tools
+            .iter()
+            .filter(|t| t.is_read_only())
+            .map(|t| t.name.clone())
+            .collect();
         Ok(tools
             .into_iter()
             .map(|t| ToolDef {
@@ -224,6 +233,11 @@ impl McpClient {
                     .unwrap_or(json!({"type": "object", "properties": {}})),
             })
             .collect())
+    }
+
+    /// Tools the server marked `readOnlyHint` in its most recent `tools/list`.
+    pub fn read_only_tools(&self) -> &std::collections::HashSet<String> {
+        &self.read_only_tools
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
@@ -387,6 +401,20 @@ struct McpTool {
     description: Option<String>,
     #[serde(rename = "inputSchema")]
     input_schema: Option<Value>,
+    /// Kept as raw JSON so an oddly-shaped annotation can't fail the whole listing.
+    #[serde(default)]
+    annotations: Option<Value>,
+}
+
+impl McpTool {
+    /// True when the server annotated this tool `readOnlyHint: true`.
+    fn is_read_only(&self) -> bool {
+        self.annotations
+            .as_ref()
+            .and_then(|a| a.get("readOnlyHint"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 /// Read bytes up to (and including) the next `\n` from `reader`, returning
@@ -1091,5 +1119,34 @@ mod tests {
         assert!(!id_matches(&Some(json!(8)), 7));
         assert!(!id_matches(&Some(json!(null)), 7));
         assert!(!id_matches(&None, 7));
+    }
+
+    #[test]
+    fn read_only_hint_is_read_from_annotations() {
+        let tools: Vec<McpTool> = serde_json::from_value(json!([
+            { "name": "list", "annotations": { "readOnlyHint": true, "title": "List" } },
+            { "name": "deploy", "annotations": { "readOnlyHint": false, "destructiveHint": true } },
+            { "name": "plain" },
+            { "name": "no_hint", "annotations": {} }
+        ]))
+        .unwrap();
+        let hinted: Vec<&str> = tools
+            .iter()
+            .filter(|t| t.is_read_only())
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(hinted, vec!["list"]);
+    }
+
+    #[test]
+    fn malformed_annotations_do_not_break_the_listing() {
+        let tools: Vec<McpTool> = serde_json::from_value(json!([
+            { "name": "a", "annotations": "read-only" },
+            { "name": "b", "annotations": { "readOnlyHint": "true" } },
+            { "name": "c", "annotations": null }
+        ]))
+        .unwrap();
+        assert_eq!(tools.len(), 3);
+        assert!(tools.iter().all(|t| !t.is_read_only()));
     }
 }

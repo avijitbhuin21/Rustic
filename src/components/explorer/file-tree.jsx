@@ -7,6 +7,7 @@ import { FileNode } from './file-node';
 import { contextMenuState } from './context-menu-state';
 import { createFile, createFolder, readDir, renameEntry, moveEntry, deleteEntry, useExplorer } from '@/state/explorer';
 import { confirm } from '@/components/confirm-dialog';
+import { useActiveFilePath, isInside, pathKey } from '@/lib/active-file';
 
 const ROW_HEIGHT = 24;
 const SKELETON_WIDTHS = [62, 45, 78, 53];
@@ -532,6 +533,80 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
 
   const visibleCount = useMemo(() => countVisible(data, openIds), [data, openIds]);
   const treeHeight = loading ? SKELETON_HEIGHT : Math.max(ROW_HEIGHT, visibleCount * ROW_HEIGHT);
+
+  // Follow the active editor file (VS Code "autoReveal"): open each ancestor
+  // folder top-down, select the row, scroll it into view. Folders the user
+  // already opened elsewhere are never collapsed.
+  const activeFile = useActiveFilePath();
+  const revealSeq = useRef(0);
+  useEffect(() => {
+    if (loading || !rootPath || !activeFile || !isInside(rootPath, activeFile)) return;
+    const seq = ++revealSeq.current;
+    const stale = () => seq !== revealSeq.current;
+    (async () => {
+      const sep = rootPath.includes('\\') && !rootPath.includes('/') ? '\\' : '/';
+      const rel = pathKey(activeFile).slice(pathKey(rootPath).length + 1).split('/');
+      const ancestors = [];
+      let cur = rootPath.replace(/[\\/]+$/, '');
+      for (const part of rel.slice(0, -1)) {
+        cur = `${cur}${sep}${part}`;
+        ancestors.push(cur);
+      }
+      const cache = childrenCache.current;
+      // Ids in `data` are whatever readDir returned; match case/separator-insensitively.
+      const findId = (nodes, target) => {
+        const k = pathKey(target);
+        for (const n of nodes || []) {
+          if (pathKey(n.id) === k) return n.id;
+        }
+        return null;
+      };
+      let siblings = data;
+      const toOpen = [];
+      for (const dir of ancestors) {
+        const id = findId(siblings, dir);
+        if (!id) return;
+        if (!cache.has(id)) {
+          try {
+            const entries = await readDir(id);
+            if (stale()) return;
+            cache.set(id, entries.map(toNode));
+            setData((prev) => injectChildren(prev, id, cache.get(id)));
+          } catch {
+            return;
+          }
+        }
+        toOpen.push(id);
+        siblings = cache.get(id);
+      }
+      const fileId = findId(siblings, activeFile);
+      if (!fileId) return;
+      if (toOpen.length) {
+        setOpenIds((prev) => {
+          const next = new Set(prev);
+          for (const id of toOpen) next.add(id);
+          return next.size === prev.size ? prev : next;
+        });
+      }
+      await new Promise((r) => requestAnimationFrame(r));
+      await new Promise((r) => requestAnimationFrame(r));
+      if (stale()) return;
+      const api = treeRef.current;
+      for (const id of toOpen) {
+        try { if (!api?.isOpen?.(id)) api?.open?.(id); } catch {}
+      }
+      await new Promise((r) => requestAnimationFrame(r));
+      if (stale()) return;
+      try { api?.select?.(fileId, { focus: false }); } catch {}
+      const row = Array.from(document.querySelectorAll('[data-explorer-path]')).find(
+        (el) => el.getAttribute('data-explorer-path') === fileId,
+      );
+      row?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    })();
+    // `data` is read but deliberately not a dependency: re-running on every
+    // tree refresh would yank the scroll position back to the active file.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFile, rootPath, loading]);
 
   if (!loading && data.length === 0) return null;
 

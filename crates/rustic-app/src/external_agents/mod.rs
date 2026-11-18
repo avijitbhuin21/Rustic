@@ -20,6 +20,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub mod activity;
 pub mod antigravity;
 pub mod hooks;
 pub mod launcher;
@@ -333,7 +334,8 @@ pub struct LaunchPlan {
 /// `hook_dir` is the spool directory hook callbacks drop their payloads into.
 /// `launcher` is the absolute path of the copy to run — pass it so the launch
 /// can't land on a stale duplicate the shell happens to find first. `None` falls
-/// back to the bare program name.
+/// back to the bare program name. `bypass_hook_trust` adds Codex's flag for
+/// running hooks without its review dialog; it is ignored for the other CLIs.
 #[allow(clippy::too_many_arguments)]
 pub fn build_launch_plan(
     kind: AgentKind,
@@ -344,6 +346,7 @@ pub fn build_launch_plan(
     hook_dir: &Path,
     claude_settings_path: Option<&Path>,
     launcher: Option<&Path>,
+    bypass_hook_trust: bool,
 ) -> LaunchPlan {
     let q = |s: &str| shell.quote(s);
     let mut parts: Vec<String> = vec![invocation(kind, shell, launcher)];
@@ -356,6 +359,13 @@ pub fn build_launch_plan(
     if matches!(kind, AgentKind::Codex) {
         parts.push("-c".into());
         parts.push(q("check_for_update_on_startup=false"));
+        // Without this Codex stops at a "hooks need review" dialog whenever
+        // Rustic's hook file is new or changed, and runs no hooks if the user
+        // declines. The flag covers every enabled hook for this launch, not
+        // only Rustic's. A global flag, so it has to precede `resume`.
+        if bypass_hook_trust {
+            parts.push("--dangerously-bypass-hook-trust".into());
+        }
     }
 
     // Autonomy / permission flags, mapped from Rustic's mode to each CLI's own
@@ -509,6 +519,7 @@ mod tests {
             Path::new("/spool"),
             Some(Path::new("/cfg/claude.json")),
             None,
+            false,
         )
     }
 
@@ -522,6 +533,7 @@ mod tests {
             Path::new("/spool"),
             None,
             None,
+            false,
         )
     }
 
@@ -535,7 +547,39 @@ mod tests {
             Path::new("/spool"),
             None,
             Some(Path::new(launcher)),
+            false,
         )
+    }
+
+    #[test]
+    fn codex_hook_trust_bypass_precedes_the_resume_subcommand() {
+        let bypass = |kind, mode: LaunchMode| {
+            build_launch_plan(
+                kind,
+                &mode,
+                AgentPermissionMode::Edit,
+                ShellKind::Posix,
+                "pty-1",
+                Path::new("/spool"),
+                None,
+                None,
+                true,
+            )
+            .command_line
+        };
+        let resume = LaunchMode::Resume {
+            external_session_id: "abc".into(),
+        };
+        let line = bypass(AgentKind::Codex, resume.clone());
+        let flag = line.find("--dangerously-bypass-hook-trust").expect("flag");
+        assert!(flag < line.find(" resume ").expect("resume"), "{line}");
+        // Only Codex has the flag; the others would refuse to start with it.
+        for kind in [AgentKind::Claude, AgentKind::Antigravity] {
+            assert!(!bypass(kind, resume.clone()).contains("hook-trust"));
+        }
+        assert!(!plan_perm(AgentKind::Codex, AgentPermissionMode::Edit)
+            .command_line
+            .contains("hook-trust"));
     }
 
     #[test]
