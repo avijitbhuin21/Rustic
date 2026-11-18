@@ -1214,7 +1214,7 @@ impl McpManager {
 
     /// Re-list tools for connected servers whose cache is older than
     /// `max_age`, inline. Tests only — production re-lists on background threads.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn refresh_stale_tools(&mut self, max_age: std::time::Duration) {
         for job in self.claim_stale_tools(max_age) {
             let outcome = list_for_refresh(&job.client);
@@ -2097,6 +2097,7 @@ mod project_scope_tests {
 mod turn_tools_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
     use std::time::Duration;
 
     /// Stdio MCP server advertising one tool whose name is the content of the
@@ -2131,6 +2132,7 @@ done
         (base, root, tool_file, mgr)
     }
 
+    #[cfg(unix)]
     fn names(tools: &[ToolDef]) -> Vec<&str> {
         tools.iter().map(|t| t.name.as_str()).collect()
     }
