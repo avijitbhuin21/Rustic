@@ -935,8 +935,10 @@ mod tests {
         let mut run = mk_run(dir.path(), "needle", (0, 0));
         run.include_glob = Some(BraceGlob::new("*.{js,jsx}").unwrap());
         let out = run_grep(run, &|_, _| {});
+        // Windows prints the sub-directory match as `sub\b.jsx`.
+        let listed = out.replace('\\', "/");
         assert!(
-            out.contains("a.js:1:") && out.contains("sub/b.jsx:1:"),
+            listed.contains("a.js:1:") && listed.contains("sub/b.jsx:1:"),
             "{}",
             out
         );
