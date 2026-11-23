@@ -17,12 +17,10 @@ Logic for these is unit-tested, cross-compiled for `x86_64-pc-windows-msvc` and 
 
 ## v0.8.6 follow-ups (tracker #15 / #16 fixes, paste bug)
 
-- [ ] Close tracker #15 and #16 via `website/issue-actions.json` + deploy once the user says so (fixed in source, left open on purpose)
 - [ ] Verify in a built app: `grep_search` with `include: "{a.jsx,b.jsx}"` and `exclude: "{vendor,references}/**"`; `list_themes` / `read_theme` after `tool_search`; Cmd+V of a screenshot into the composer after a `.pptx` tab has been opened
 
 ## v0.8.6 follow-ups (tracker #17 fix)
 
-- [ ] Close tracker #17 via `website/issue-actions.json` + deploy once the user says so (fixed in source, left open on purpose)
 - [ ] Verify in a built app: run `echo repro17-0123456789-0123456789-0123456789-0123456789-0123456789-0123456789-0123456` in an agent terminal, then `read_terminal_output` (default and `rendered: true`) shows no wrapper text
 
 
@@ -53,5 +51,4 @@ Audit items not done:
 - [ ] Verify in a built app (DB test only): quit with a `/goal` blocked and with one mid-loop; on reopen the capsule shows the same turn count, the blocked one still shows blocked with its reason, and nothing runs until a message, an answer or a new `/goal` is sent
 
 Release:
-- [ ] Close tracker #18 to #21 via `website/issue-actions.json` + deploy once the user says so
 - [ ] `docker-compose.yml` now sets `RUSTIC_TRUSTED_PROXIES` for the bundled Caddy. Anyone publishing the server port directly must remove it
