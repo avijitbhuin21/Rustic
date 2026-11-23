@@ -63,7 +63,7 @@ export function BottomPanelHost() {
     window.dispatchEvent(new Event(TERMINAL_PICKER_EVENT));
 
   return (
-    <div className="flex h-full w-full flex-col bg-background">
+    <div data-ink-frame="panel" className="flex h-full w-full flex-col bg-background">
       {/* Header with new-terminal, fullscreen and close buttons. We only
           reserve the window-controls offset on the right when this panel
           reaches the window's right edge (see needsWindowControlsOffset) so

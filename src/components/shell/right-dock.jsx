@@ -136,9 +136,13 @@ export function RightDock() {
               'flex flex-col items-center px-1.5 py-3',
               'border border-ink/[0.09]',
               'bg-background/80 backdrop-blur-2xl',
-              'shadow-[0_8px_32px_color-mix(in_oklab,var(--scrim)_55%,transparent),inset_0_1px_0_color-mix(in_oklab,var(--ink)_5%,transparent)]',
+              // No outer shadow: the wrapper clips overflow (it hides the
+              // dock off-screen), which cut a drop shadow off in straight lines.
+              'shadow-[inset_0_1px_0_color-mix(in_oklab,var(--ink)_5%,transparent)]',
               'transition-[border-radius] duration-200',
-              panelOpen ? 'rounded-l-[14px] rounded-r-none border-r-0' : 'rounded-[14px]',
+              // Joined: the island overlaps the panel's left border by 1px so
+              // the two read as one outline around the panel's rounded corners.
+              panelOpen ? 'relative z-10 -mr-px rounded-l-[14px] rounded-r-none border-r-0' : 'rounded-[14px]',
             )}
           >
             <div className="relative flex flex-col items-center gap-1">
@@ -196,17 +200,22 @@ export function RightDock() {
             }
             className={cn(
               'h-[80vh] max-h-[calc(100vh-4rem)] overflow-hidden',
-              'rounded-[14px] rounded-l-none',
-              'border border-l-0 border-ink/[0.09]',
+              'rounded-[14px]',
+              'border border-ink/[0.09]',
+              // Collapsed to zero width: no left border, so it adds no extra pixel.
+              rightPanel == null && 'border-l-0',
               'bg-background/80 backdrop-blur-2xl',
-              'shadow-[0_8px_32px_color-mix(in_oklab,var(--scrim)_55%,transparent),inset_0_1px_0_color-mix(in_oklab,var(--ink)_5%,transparent)]',
+              'shadow-[inset_0_1px_0_color-mix(in_oklab,var(--ink)_5%,transparent)]',
             )}
           >
             <PanelSideContext.Provider value="right">
               {/* Panels like the agent tree paint their own bg-sidebar (matches
                   the left SidebarHost); inside the glassy dock that reads as a
-                  lighter gray, so neutralize it and let the dock bg show. */}
-              <div className="h-full w-72 [&_.bg-sidebar]:bg-transparent">
+                  lighter gray, so neutralize it and let the dock bg show.
+                  Width is in px to match the animated panel width above minus
+                  its two borders: a spacing-scaled `w-72` grew past it under
+                  roomier themes and the right edge of every panel was clipped. */}
+              <div className="h-full w-[286px] [&_.bg-sidebar]:bg-transparent">
                 {ITEMS.map(({ id }) => {
                   if (!everMounted.has(id)) return null;
                   return (

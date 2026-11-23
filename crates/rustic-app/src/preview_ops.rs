@@ -39,6 +39,56 @@ pub struct HexChunkResponse {
     pub bytes_read: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PdfEditResponse {
+    /// `{"info":…,"objects":…,"layout":…,"notes":[…]}` for the requested page.
+    pub state: serde_json::Value,
+    /// The edited document, base64-encoded, when it was asked for.
+    pub pdf: Option<String>,
+}
+
+/// Replays a list of PDF content edits on a file and returns the objects of
+/// one page, plus the edited document when `want_pdf` is set. The file on disk
+/// is not modified; `pdf_edit_save` writes the result.
+/// Runs in a child process (see `rustic_agent::tools::pdf_edit`).
+pub fn pdf_edit(
+    path: &str,
+    ops: Vec<rustic_agent::tools::pdf_edit::PdfEditOp>,
+    page: u32,
+    want_pdf: bool,
+) -> Result<PdfEditResponse, String> {
+    let p = Path::new(path);
+    validate_readable_path(p)?;
+    ensure_existing_file(p)?;
+    let request = rustic_agent::tools::pdf_edit::PdfEditRequest {
+        path: path.to_string(),
+        ops,
+        page,
+        want_pdf,
+    };
+    let outcome = rustic_agent::tools::pdf_edit::edit(&request)?;
+    Ok(PdfEditResponse {
+        state: serde_json::from_str(&outcome.state).map_err(|e| e.to_string())?,
+        pdf: outcome
+            .pdf
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+    })
+}
+
+/// Replays a list of PDF content edits on a file and overwrites the file with
+/// the result. Returns the byte count written. Unlike `write_file_base64` the
+/// document never travels through the frontend, so there is no size cap.
+pub fn pdf_edit_save(
+    path: &str,
+    ops: Vec<rustic_agent::tools::pdf_edit::PdfEditOp>,
+) -> Result<u64, String> {
+    let p = Path::new(path);
+    validate_readable_path(p)?;
+    validate_writable_path(p)?;
+    ensure_existing_file(p)?;
+    rustic_agent::tools::pdf_edit::edit_to_file(path, ops, p)
+}
+
 fn ensure_existing_file(p: &Path) -> Result<(), String> {
     if !p.exists() || !p.is_file() {
         return Err(format!("File does not exist: {}", p.display()));

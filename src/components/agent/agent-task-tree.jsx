@@ -31,7 +31,7 @@ import { usePanelSide } from '@/lib/panel-side';
 import { AddProjectButton } from '@/components/shell/add-project-button';
 import { SortableProjectList, useProjectSortable, ProjectDragHandle } from '@/components/shell/sortable-projects';
 import { confirm } from '@/components/confirm-dialog';
-import { useRelativeTime } from '@/lib/relative-time';
+import { parseTimestamp, useRelativeTime } from '@/lib/relative-time';
 import { ExternalAgentButtons, CliSessionRow, useProjectCliSessions } from '@/components/agent/external-agent-launchers';
 import { cn } from '@/lib/utils';
 import { useCoarsePointer } from '@/lib/use-coarse-pointer';
@@ -67,8 +67,8 @@ function sortTasks(tasks, streamingByTask, statusByTask) {
     const ar = isRunning(a.t, streamingByTask, statusByTask);
     const br = isRunning(b.t, streamingByTask, statusByTask);
     if (ar !== br) return ar ? -1 : 1;
-    const at = new Date(a.t.updated_at ?? a.t.created_at ?? 0).getTime();
-    const bt = new Date(b.t.updated_at ?? b.t.created_at ?? 0).getTime();
+    const at = parseTimestamp(a.t.updated_at ?? a.t.created_at);
+    const bt = parseTimestamp(b.t.updated_at ?? b.t.created_at);
     if (at !== bt) return bt - at;
     return a.i - b.i;
   });
@@ -121,8 +121,8 @@ function TaskRow({
   onDelete,
 }) {
   const timestampMs = useMemo(() => {
-    const t = new Date(task.updated_at ?? task.created_at ?? 0).getTime();
-    return Number.isFinite(t) && t > 0 ? t : null;
+    const t = parseTimestamp(task.updated_at ?? task.created_at);
+    return t > 0 ? t : null;
   }, [task.updated_at, task.created_at]);
   const relative = useRelativeTime(timestampMs);
   const handleClick = () => {
@@ -376,10 +376,7 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
   const activeCliSessionId = useExternalAgents((s) => s.activeSessionId);
 
   const rows = useMemo(() => {
-    const stamp = (v) => {
-      const t = new Date(v ?? 0).getTime();
-      return Number.isFinite(t) ? t : 0;
-    };
+    const stamp = parseTimestamp;
     const entries = [...pinned, ...running, ...history].map((task) => ({
       kind: 'task',
       key: `t:${task.id}`,

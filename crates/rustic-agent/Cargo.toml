@@ -64,6 +64,9 @@ docx-rs = "0.4.22"
 # tag: the API is still settling, so it is deliberately not taken from
 # crates.io yet.
 lattice-merge = { path = "../../vendor/lattice-merge" }
+# PDF content editing (move/delete objects, replace text) for the PDF preview.
+# Vendored like lattice-merge; adds no crate beyond what pdf-extract pulls in.
+palimpsest-pdf = { path = "../../vendor/palimpsest-pdf" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

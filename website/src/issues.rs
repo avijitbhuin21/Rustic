@@ -171,6 +171,9 @@ fn db_err(e: sqlx::Error) -> Response {
 }
 
 /// Client IP: first `X-Forwarded-For` hop (Railway's proxy), then `X-Real-IP`, then the socket.
+/// Checked against Railway's edge on 23 Nov 2026: it discards a client-sent
+/// `X-Forwarded-For` and `X-Real-IP` and writes its own, so the first hop is
+/// the connecting address. Only `X-Real-IP` is in Railway's documentation.
 fn client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
     headers
         .get("x-forwarded-for")

@@ -63,7 +63,7 @@ pub fn list_tasks(state: &AppState, project_id: Option<&str>) -> Result<Vec<Task
                     db_status = %row.status,
                     "found stale Running/Waiting task on startup — defensively marking Completed",
                 );
-                let _ = db.update_task_status(&row.id, "Completed");
+                let _ = db.reset_stale_task_status(&row.id, "Completed");
             }
         }
     }
@@ -145,6 +145,9 @@ pub fn list_tasks(state: &AppState, project_id: Option<&str>) -> Result<Vec<Task
                     thinking_tier: row.thinking_tier.clone(),
                     pinned: row.pinned,
                     goal: row.goal.clone(),
+                    goal_turns: row.goal_turns.max(0) as u32,
+                    goal_status: row.goal_status.clone(),
+                    goal_reason: row.goal_reason.clone(),
                 },
                 messages: Vec::new(),
                 permissions,
@@ -154,7 +157,7 @@ pub fn list_tasks(state: &AppState, project_id: Option<&str>) -> Result<Vec<Task
                 goal: Arc::new(Mutex::new(row.goal.clone().map(|condition| {
                     rustic_agent::task::goal::GoalState {
                         condition,
-                        turns: 0,
+                        turns: row.goal_turns.max(0) as u32,
                     }
                 }))),
                 last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -164,9 +167,15 @@ pub fn list_tasks(state: &AppState, project_id: Option<&str>) -> Result<Vec<Task
 
     // Keep the frontend-visible goal in sync with the DB — the executor and
     // event forwarder clear tasks.goal on "met" without touching TaskInfo.
+    // Same for updated_at: only the DB row is bumped as turns run, so the
+    // cached TaskInfo would otherwise report the chat's creation time forever.
     for row in &rows {
         if let Some(t) = agent.tasks.get_mut(&row.id) {
             t.info.goal = row.goal.clone();
+            t.info.goal_turns = row.goal_turns.max(0) as u32;
+            t.info.goal_status = row.goal_status.clone();
+            t.info.goal_reason = row.goal_reason.clone();
+            t.info.updated_at = row.updated_at.clone();
         }
     }
 

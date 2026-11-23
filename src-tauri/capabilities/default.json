@@ -3,6 +3,7 @@
   "description": "Default capabilities for Rustic",
   "windows": ["main"],
   "permissions": [
+    "app-commands",
     "core:default",
     "core:event:default",
     "core:webview:allow-set-webview-zoom",

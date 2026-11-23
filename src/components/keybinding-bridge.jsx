@@ -46,6 +46,7 @@ export function KeybindingBridge() {
       if (!id) return;
       const cmd = COMMAND_BY_ID[id];
       if (!cmd?.run) return;
+      if (cmd.when && !cmd.when(e)) return;
 
       if (isTypingTarget(e.target) && !isModifiedShortcut(key)) return;
 

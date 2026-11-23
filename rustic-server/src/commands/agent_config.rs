@@ -107,6 +107,8 @@ pub async fn dispatch(
         "set_source_control_config" => set_source_control_config(ctx, args),
         "clear_source_control_config" => clear_source_control_config(ctx),
         "generate_commit_message" => generate_commit_message(ctx, args).await,
+        "inline_edit" => inline_edit(ctx, args).await,
+        "cancel_inline_edit" => cancel_inline_edit(args),
 
         // ── project defaults ───────────────────────────────────────────
         "get_project_defaults" => get_project_defaults(ctx, args),
@@ -1378,6 +1380,65 @@ async fn generate_commit_message(ctx: &ServerContext, args: &Value) -> Result<Va
         .await
         .map_err(ApiError::from)?;
     ok(json!({ "message": message }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InlineEditArg {
+    provider_type: String,
+    model: String,
+    input: rustic_agent::inline_edit::InlineEditInput,
+}
+
+/// Inline editor chat (Ctrl+I). Prompt, protocol and streaming live in
+/// `rustic_agent::inline_edit` (shared with the desktop host).
+async fn inline_edit(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    use rustic_agent::inline_edit::{run_inline_edit, InlineEditTarget, DELTA_EVENT};
+    use rustic_app::context::EventEmitter;
+
+    let a: InlineEditArg = parse(args)?;
+
+    let (mut target, account) = {
+        let agent = ctx.state().agent.lock_safe();
+        let target = InlineEditTarget::resolve(&agent.ai_config, &a.provider_type, &a.model)
+            .map_err(ApiError::from)?;
+        let account = agent
+            .ai_config
+            .find_by_key(a.provider_type.trim())
+            .map(|entry| provider_account(entry.provider_type.as_str(), entry.name.as_deref()));
+        (target, account)
+    };
+    // The in-memory key is cleared after a provider is saved on the server;
+    // fall back to the secret store like the chat send path does.
+    if target.api_key.is_empty() {
+        if let Some(acct) = account {
+            target.api_key = ctx.secrets().get(&acct).ok().flatten().unwrap_or_default();
+        }
+    }
+
+    let emitter = ctx.clone();
+    let output = run_inline_edit(
+        target,
+        a.input,
+        Arc::new(move |delta| match serde_json::to_value(delta) {
+            Ok(payload) => emitter.emit_json(DELTA_EVENT, payload),
+            Err(e) => tracing::error!(error = %e, "failed to serialize inline-edit delta"),
+        }),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    ok(output)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelInlineEditArg {
+    request_id: String,
+}
+
+fn cancel_inline_edit(args: &Value) -> Result<Value, ApiError> {
+    let a: CancelInlineEditArg = parse(args)?;
+    ok(rustic_agent::inline_edit::cancel(&a.request_id))
 }
 
 #[derive(Deserialize)]

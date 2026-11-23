@@ -1,0 +1,32 @@
+# Vendored from the sibling project Palimpsest (tag v0.1.4, commit
+# dd0dec817e453dbab44537424f6652e50870d65a). Kept as an in-repo path dependency for the same reason as
+# vendor/lattice-merge: cargo cannot fetch an external git repo in the hermetic
+# build environments (CI runners, the cargo-deny action, the Railway Docker
+# build). Workspace-inherited fields have been made explicit so it builds
+# standalone. License: MIT OR Apache-2.0. To update: re-copy the crate's src/
+# from the upstream tag and bump the version below.
+[package]
+name = "palimpsest-pdf"
+version = "0.1.4"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+authors = ["Avijit Bhuin"]
+description = "Pure-Rust engine for editing the content of existing PDF pages."
+publish = false
+
+[dependencies]
+# Same versions rustic-agent already locks through pdf-extract; no new crates.
+lopdf = { version = "0.42", default-features = false }
+flate2 = "1"
+ttf-parser = "0.25"
+
+[lints.rust]
+unsafe_code = "forbid"
+# Upstream has an optional `shaping` feature (rustybuzz). It is left out here so
+# that Rustic's lock file gains no crate; this only tells rustc the name is known.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("shaping"))'] }
+
+# Declared as its own workspace so the parent Rustic workspace does not pull
+# this vendored crate in as an implicit member (see vendor/lattice-merge).
+[workspace]

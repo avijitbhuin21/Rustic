@@ -57,7 +57,8 @@ pub trait PeerHost: Send + Sync + 'static {
             .join("projects")
             .join(crate::cloud_sync::safe_dir_name(&entry.name))
     }
-    /// Approve incoming PUSH requests without prompting (headless server).
+    /// Approve incoming PUSH requests without prompting. Off on every host by
+    /// default; rustic-server turns it on only when its operator opts in.
     /// Pulls always prompt and are limited by the sharing allowlist.
     fn auto_accept_push(&self) -> bool {
         false
@@ -274,6 +275,9 @@ pub struct LanInner {
     /// Incoming pairing prompt per requesting device id → request id, so the
     /// requester can cancel it.
     pub pair_by_device: HashMap<String, String>,
+    /// Token minted when our pairing code for a device was shown; the pairing
+    /// request that follows must carry the same one or the codes won't match.
+    pub pair_tokens: HashMap<String, String>,
     /// Incoming transfer prompts per requesting device id → request ids.
     pub transfer_by_device: HashMap<String, Vec<String>>,
     /// Our outgoing pair / transfer-approval requests per target device, so
@@ -335,11 +339,15 @@ pub fn fingerprint(bytes: &[u8]) -> String {
 }
 
 /// 6-digit code both sides display during pairing, derived from both
-/// certificate fingerprints (order-independent). A man-in-the-middle presents
-/// a different certificate, so the two screens would show different codes.
-pub fn pairing_code(a: &str, b: &str) -> String {
+/// certificate fingerprints (order-independent) and the requester's fresh
+/// pairing token. The token is known only to the requester and whoever
+/// received its request, so a third party that sends its own request in the
+/// requester's name cannot make the two screens agree. Not a defence against
+/// an active man-in-the-middle on an unpinned (URL) address, who sees the
+/// token and can search for a colliding one.
+pub fn pairing_code(a: &str, b: &str, token: &str) -> String {
     let (x, y) = if a <= b { (a, b) } else { (b, a) };
-    let h = Sha256::digest(format!("{x}|{y}").as_bytes());
+    let h = Sha256::digest(format!("{x}|{y}|{token}").as_bytes());
     let n = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 1_000_000;
     format!("{n:06}")
 }
@@ -924,11 +932,16 @@ mod tests {
 
     #[test]
     fn pairing_code_is_symmetric_and_six_digits() {
-        let a = pairing_code("aaa", "bbb");
-        assert_eq!(a, pairing_code("bbb", "aaa"));
+        let a = pairing_code("aaa", "bbb", "t1");
+        assert_eq!(a, pairing_code("bbb", "aaa", "t1"));
         assert_eq!(a.len(), 6);
         assert!(a.chars().all(|c| c.is_ascii_digit()));
-        assert_ne!(a, pairing_code("aaa", "ccc"));
+        assert_ne!(a, pairing_code("aaa", "ccc", "t1"));
+        assert_ne!(
+            a,
+            pairing_code("aaa", "bbb", "t2"),
+            "a different request shows a different code"
+        );
     }
 
     #[test]

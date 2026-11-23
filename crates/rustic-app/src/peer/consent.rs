@@ -81,6 +81,10 @@ pub struct Ticket {
     pub meta: HashSet<String>,
     /// `project_id/path` of approved files and folders.
     pub files: HashSet<String>,
+    /// Upload only: `project_id/path` → top-level names the prompt listed for that folder.
+    pub names: std::collections::HashMap<String, HashSet<String>>,
+    /// Total bytes the prompt showed, when the caller declared one.
+    pub total_bytes: Option<u64>,
     pub expires: Instant,
 }
 
@@ -102,7 +106,35 @@ impl Ticket {
                 .iter()
                 .map(|f| file_key(&f.project_id, &f.path))
                 .collect(),
+            names: req
+                .files
+                .iter()
+                .map(|f| {
+                    (
+                        file_key(&f.project_id, &f.path),
+                        f.names.iter().cloned().collect(),
+                    )
+                })
+                .collect(),
+            total_bytes: req.total_bytes,
             expires: Instant::now() + TICKET_TTL,
+        }
+    }
+
+    /// What this ticket lets an upload into `project_id/dir` replace and how
+    /// much it may write: only the names the prompt listed for that folder,
+    /// and the size it showed plus a margin.
+    pub fn upload_approval(&self, project_id: &str, dir: &str) -> super::files::UploadApproval {
+        super::files::UploadApproval {
+            replaceable: Some(
+                self.names
+                    .get(&file_key(project_id, dir))
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            max_bytes: self
+                .total_bytes
+                .map(super::files::UploadApproval::limit_for),
         }
     }
 

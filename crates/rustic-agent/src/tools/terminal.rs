@@ -49,10 +49,16 @@ const OUTPUT_MAX_BYTES: usize = 16 * 1024;
 const READ_OUTPUT_DEFAULT: usize = 8 * 1024;
 /// Hard cap for `read_terminal_output`.
 const READ_OUTPUT_MAX: usize = 32 * 1024;
+/// Extra raw bytes `read_terminal_output` reads beyond the requested size, to
+/// cover the hidden wrapper echoes (about 1.4x the command's length each).
+const WRAPPER_ECHO_SLACK: usize = 64 * 1024;
 
 /// How long `run_command` waits inline for the command to finish before
 /// returning STILL_RUNNING and handing off to the wake-on-completion path.
+#[cfg(not(test))]
 const RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
+#[cfg(test)]
+const RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Poll cadence for the inline completion wait. Sentinel-wrapped commands are
 /// detected from their end marker, so a short interval is what makes fast
 /// commands return about as fast as a human sees them finish.
@@ -599,16 +605,7 @@ async fn launch_command(
             }
         }
         if sentinel_done || !notices.is_empty() {
-            if let (Some(worker), Some(message_id)) = (
-                context.sweep_worker.as_ref(),
-                context.current_user_message_id.as_ref(),
-            ) {
-                let _ = worker.enqueue(crate::file_history::SweepJob {
-                    task_id: context.task_id.clone(),
-                    message_id: message_id.clone(),
-                    bash_start: bash_start_for_sweep,
-                });
-            }
+            enqueue_sweep(context, bash_start_for_sweep);
 
             let shell_exited = notices.iter().any(|n| n.kind == TerminalNoticeKind::Exited);
             // Prefer a fresh, larger read over the 4KB tail captured at
@@ -676,6 +673,13 @@ async fn launch_command(
         }
     }
 
+    // Hand-off: the command keeps running in the background. Sweep now so what
+    // it wrote during the inline wait is credited to the task. The window is
+    // deliberately not held open until the command ends: a never-ending
+    // process (dev server) would then pull every later change on disk — the
+    // user's own edits included — into this task's revert scope.
+    enqueue_sweep(context, bash_start_for_sweep);
+
     Ok(ToolOutput {
         content: format!(
             "{note}STILL_RUNNING: the command has been running for {}s in terminal #{id} and continues in the background without blocking the chat.\n\
@@ -689,6 +693,20 @@ async fn launch_command(
         is_error: false,
         attachments: Vec::new(),
     })
+}
+
+/// Queue a file-history sweep that credits what changed on disk since the pre-command checkpoint to this task.
+fn enqueue_sweep(context: &ToolContext, bash_start: std::time::SystemTime) {
+    if let (Some(worker), Some(message_id)) = (
+        context.sweep_worker.as_ref(),
+        context.current_user_message_id.as_ref(),
+    ) {
+        let _ = worker.enqueue(crate::file_history::SweepJob {
+            task_id: context.task_id.clone(),
+            message_id: message_id.clone(),
+            bash_start,
+        });
+    }
 }
 
 fn derive_label(cmd: &str) -> String {
@@ -712,6 +730,15 @@ fn parse_terminal_id(params: &Value) -> Option<u64> {
         return s.trim().parse::<u64>().ok();
     }
     None
+}
+
+/// True when a `read_terminal_output` call asks for the rendered screen; providers send booleans as strings too (as they do for `terminal_id`).
+fn wants_rendered(params: &Value) -> bool {
+    match &params["rendered"] {
+        Value::Bool(b) => *b,
+        Value::String(s) => s.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
 }
 
 async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -745,29 +772,33 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
 
     // `rendered: true` asks the headless emulator for the current visible
     // screen (escape codes resolved); otherwise we return the raw byte tail.
-    let rendered = params["rendered"].as_bool().unwrap_or(false);
+    let rendered = wants_rendered(&params);
 
     let result = if rendered {
         broker
             .render_screen(id)
-            .map(|s| crate::terminal_text::hide_sentinels(&s))
+            .map(|s| crate::terminal_text::clean_rendered_screen(&s))
     } else {
-        broker.read_output(id, max_bytes).map(|raw| {
-            crate::terminal_text::hide_sentinels(&crate::terminal_text::sanitize_terminal_output(
-                &raw,
-            ))
-        })
+        // Read past the requested size so a long wrapper echo (hidden below)
+        // neither starts before the tail nor eats the caller's byte budget.
+        broker
+            .read_output(id, max_bytes + WRAPPER_ECHO_SLACK)
+            .map(|raw| {
+                let cleaned = crate::terminal_text::clean_terminal_scrollback(&raw);
+                crate::terminal_text::tail_lines(&cleaned, max_bytes).to_string()
+            })
     };
 
     match result {
         Ok(text) => {
-            let body = if text.trim().is_empty() {
-                format!("(terminal #{} has produced no output yet)", id)
-            } else {
-                text
-            };
+            // A read that succeeds for a terminal that is no longer listed is
+            // served from the retained output of a closed agent terminal.
+            let closed = !broker
+                .list_all_sessions()
+                .iter()
+                .any(|s| s.session_id == id);
             Ok(ToolOutput {
-                content: body,
+                content: terminal_read_body(id, &text, closed),
                 is_error: false,
                 attachments: Vec::new(),
             })
@@ -777,6 +808,22 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
             is_error: true,
             attachments: Vec::new(),
         }),
+    }
+}
+
+/// Shape a `read_terminal_output` result, saying so when the terminal has already closed.
+fn terminal_read_body(id: u64, text: &str, closed: bool) -> String {
+    let empty = text.trim().is_empty();
+    match (closed, empty) {
+        (false, true) => format!("(terminal #{id} has produced no output yet)"),
+        (false, false) => text.to_string(),
+        (true, true) => format!(
+            "(terminal #{id} has closed and left no output — a new run_command starts a fresh terminal)"
+        ),
+        (true, false) => format!(
+            "{}\n\n[terminal #{id} has closed — this is its last output; a new run_command starts a fresh terminal]",
+            text.trim_end()
+        ),
     }
 }
 
@@ -1056,6 +1103,133 @@ mod tests {
         }
     }
 
+    /// Broker that serves a fixed raw buffer and a fixed rendered screen.
+    struct ScriptedTerminals {
+        raw: String,
+        screen: String,
+        asked_bytes: AtomicU64,
+    }
+
+    impl AgentTerminals for ScriptedTerminals {
+        fn spawn(
+            &self,
+            _cwd: std::path::PathBuf,
+            _label: String,
+            _task_id: &str,
+            _shell: Option<String>,
+        ) -> std::result::Result<u64, String> {
+            Ok(1)
+        }
+
+        fn send_command(
+            &self,
+            _id: u64,
+            _command: &str,
+            _task: &str,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn read_output(&self, _id: u64, max_bytes: usize) -> std::result::Result<String, String> {
+            self.asked_bytes.store(max_bytes as u64, Ordering::SeqCst);
+            Ok(self.raw.clone())
+        }
+
+        fn render_screen(&self, _id: u64) -> std::result::Result<String, String> {
+            Ok(self.screen.clone())
+        }
+
+        fn kill(&self, _id: u64) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn is_agent_session(&self, _id: u64) -> bool {
+            true
+        }
+
+        fn list_agent_sessions(&self) -> Vec<AgentTerminalInfo> {
+            Vec::new()
+        }
+
+        fn take_command_finished(&self, _task: &str, _id: u64) -> Vec<AgentTerminalExit> {
+            Vec::new()
+        }
+    }
+
+    /// Tracker issue #17: neither read mode shows the command wrapper, even
+    /// when the echo wrapped inside the marker text.
+    #[tokio::test]
+    async fn read_terminal_output_never_shows_the_command_wrapper() {
+        let cmd = "echo hello";
+        let wrapper = crate::terminal_text::wrap_posix_command(cmd, 5);
+        // Readline-style wrap in the middle of the end marker's text.
+        let split = wrapper.rfind("RSTC_E").unwrap();
+        let echo = format!("{} \r{}\r\n", &wrapper[..split], &wrapper[split..]);
+        let raw = format!(
+            "host:proj user$ \n$ {cmd}\n{echo}__RSTC_B_5\r\nhello\r\n\r\n__RSTC_E_5_0\r\nhost:proj user$ "
+        );
+        let screen = format!(
+            "host:proj user${}\n{}\n__RSTC_B_5\nscreen-out\n\n__RSTC_E_5_0\nhost:proj user$",
+            &wrapper[..split],
+            &wrapper[split..]
+        );
+        let broker = Arc::new(ScriptedTerminals {
+            raw,
+            screen,
+            asked_bytes: AtomicU64::new(0),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        ctx.agent_terminals = Some(broker.clone());
+
+        let out = read_terminal_output(json!({ "terminal_id": 1 }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.content
+                .starts_with("host:proj user$\n$ echo hello\nhello\n\nhost:proj user$"),
+            "{}",
+            out.content
+        );
+        assert!(
+            broker.asked_bytes.load(Ordering::SeqCst) as usize > READ_OUTPUT_DEFAULT,
+            "the raw read must reach past the requested size"
+        );
+
+        // Providers send the flag as a string as well as a boolean.
+        for rendered in [json!(true), json!("true")] {
+            let out = read_terminal_output(json!({ "terminal_id": 1, "rendered": rendered }), &ctx)
+                .await
+                .unwrap();
+            assert!(
+                out.content.starts_with("screen-out\n\nhost:proj user$"),
+                "{}",
+                out.content
+            );
+        }
+
+        // The requested size bounds the cleaned text, not the raw read.
+        let out = read_terminal_output(json!({ "terminal_id": 1, "max_bytes": 20 }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.content.trim_start().starts_with("host:proj user$\n"),
+            "{}",
+            out.content
+        );
+        assert!(!out.content.contains("hello"), "{}", out.content);
+    }
+
+    #[test]
+    fn wants_rendered_accepts_booleans_and_strings() {
+        assert!(wants_rendered(&json!({ "rendered": true })));
+        assert!(wants_rendered(&json!({ "rendered": "true" })));
+        assert!(wants_rendered(&json!({ "rendered": " True " })));
+        assert!(!wants_rendered(&json!({ "rendered": false })));
+        assert!(!wants_rendered(&json!({ "rendered": "false" })));
+        assert!(!wants_rendered(&json!({})));
+    }
+
     /// A non-POSIX shell keeps the plain (unwrapped) completion path, which the fake can drive.
     fn fake_call(command: &str, parallel: bool) -> Value {
         json!({ "command": command, "shell": "fish", "parallel": parallel })
@@ -1157,5 +1331,106 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("out-1"), "{}", out.content);
+    }
+
+    #[test]
+    fn terminal_read_body_marks_closed_terminals() {
+        assert_eq!(terminal_read_body(3, "hello\n", false), "hello\n");
+        assert!(terminal_read_body(3, " \n", false).contains("no output yet"));
+        let closed = terminal_read_body(3, "hello\n", true);
+        assert!(
+            closed.starts_with("hello\n\n[terminal #3 has closed"),
+            "{closed}"
+        );
+        assert!(terminal_read_body(3, "", true).contains("has closed and left no output"));
+    }
+
+    /// Tracker issue #14: reading a terminal that is no longer listed returns
+    /// its retained output with a note, not an error.
+    #[tokio::test]
+    async fn reading_a_closed_terminal_returns_output_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        // The fake lists no sessions, so terminal 5 counts as closed, yet
+        // still answers the read — as a closed agent terminal does.
+        ctx.agent_terminals = Some(FakeTerminals::new(1));
+
+        let out = read_terminal_output(json!({ "terminal_id": 5 }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("out-5"), "{}", out.content);
+        assert!(
+            out.content.contains("terminal #5 has closed"),
+            "{}",
+            out.content
+        );
+    }
+
+    /// A command that outlives the inline wait still gets its writes so far
+    /// credited to the task (the sweep used to run only on inline completion).
+    #[tokio::test]
+    async fn backgrounded_command_is_swept_at_the_hand_off() {
+        use crate::file_history::{FileHistory, SweepWorker};
+
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let root = proj_dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let db = Arc::new(Mutex::new(rustic_db::Database::in_memory().unwrap()));
+        {
+            let g = db.lock().unwrap();
+            g.conn()
+                .execute(
+                    "INSERT INTO projects (id, name, root_path) VALUES ('p', 'p', 'p')",
+                    [],
+                )
+                .unwrap();
+            g.conn()
+                .execute(
+                    "INSERT INTO tasks (id, project_id, title, status, provider_type, model)
+                     VALUES ('t', 'p', 'title', 'created', 'native', 'm')",
+                    [],
+                )
+                .unwrap();
+        }
+        let history = Arc::new(FileHistory::new(db, root.clone(), cfg_dir.path()).unwrap());
+        history.open_snapshot("m", "t").unwrap();
+        let worker = Arc::new(SweepWorker::spawn(
+            tokio::runtime::Handle::current(),
+            (*history).clone(),
+            Arc::new(|_: &str, _: &str, _: &[String]| {}),
+        ));
+
+        let (mut ctx, _rx) = ToolContext::new_test(root.clone());
+        ctx.file_history = Some(history.clone());
+        ctx.sweep_worker = Some(worker);
+        ctx.current_user_message_id = Some("m".to_string());
+        // Never reports completion, so the call takes the STILL_RUNNING path.
+        ctx.agent_terminals = Some(FakeTerminals::new(usize::MAX));
+
+        std::fs::write(root.join("made-by-command.txt"), b"x").unwrap();
+        let out = run_command("a", fake_call("slow", false), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("STILL_RUNNING"), "{}", out.content);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let writes = history
+                .db()
+                .lock()
+                .unwrap()
+                .fh_list_task_writes("t")
+                .unwrap();
+            if writes.iter().any(|p| p == "made-by-command.txt") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hand-off sweep never recorded the write: {writes:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 }

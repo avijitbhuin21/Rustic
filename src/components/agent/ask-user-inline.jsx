@@ -17,6 +17,14 @@ import {
   Plus,
 } from 'lucide-react';
 import { extractImagesFromClipboard, readFileAsBase64 } from '@/lib/clipboard-image';
+import {
+  askAnswersAsMessage,
+  askQuestionsKey,
+  askUserMarkdown,
+  normalizeAskOption,
+  parseAskOutcome,
+  parseAskQuestions,
+} from '@/lib/ask-user-format';
 
 const OTHER_SENTINEL = '__rustic_ask_user_other__';
 const AUTO_ADVANCE_MS = 280;
@@ -27,7 +35,17 @@ const slideVariants = {
   exit: (dir) => ({ opacity: 0, x: dir * -28 }),
 };
 
-export function AskUserInline({ requestId, questions, answered, answers, cancelled, interrupted }) {
+export function AskUserInline({
+  requestId,
+  questions,
+  answered,
+  answers,
+  cancelled,
+  interrupted,
+  // Set for a question whose run is gone: the answers go to this callback
+  // instead of the waiting tool, and there is nothing to dismiss.
+  onAnswer,
+}) {
   const respond = useAgent((s) => s.respondQuestion);
 
   const safeQuestions = Array.isArray(questions) ? questions : [];
@@ -131,6 +149,10 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
   }
 
   function onSubmit() {
+    if (onAnswer) {
+      onAnswer(buildAnswers(), images);
+      return;
+    }
     respond(requestId, buildAnswers(), { cancelled: false, images });
   }
 
@@ -171,6 +193,7 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
         initial={{ opacity: 0, y: 6 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.2, ease: 'easeOut' }}
+        data-ink-frame="card"
         className="overflow-hidden rounded-lg border border-border/70 bg-card shadow-sm"
         onPaste={onPaste}
         onDragOver={(e) => {
@@ -294,14 +317,16 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
             >
               <ImagePlus className="size-3.5" />
             </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 px-2 text-xs text-muted-foreground"
-              onClick={onCancel}
-            >
-              Dismiss
-            </Button>
+            {!onAnswer && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-xs text-muted-foreground"
+                onClick={onCancel}
+              >
+                Dismiss
+              </Button>
+            )}
           </div>
           <div className="flex items-center gap-1.5">
             {multi && activeIdx > 0 && (
@@ -344,17 +369,7 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
   );
 }
 
-function normalizeOption(opt) {
-  /** Coerces a string or {value,label,description} option into a stable shape. */
-  if (opt && typeof opt === 'object') {
-    const value = String(opt.value ?? opt.label ?? '');
-    const label = String(opt.label ?? opt.value ?? '');
-    const description = opt.description != null ? String(opt.description) : '';
-    return { value, label, description };
-  }
-  const str = String(opt ?? '');
-  return { value: str, label: str, description: '' };
-}
+const normalizeOption = normalizeAskOption;
 
 function Chip({ selected, onClick, children, title }) {
   /** Pill-shaped selectable option button. */
@@ -679,6 +694,81 @@ function AnsweredView({ questions, answers }) {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * How an ask_user call found in the transcript should be shown: `live` when
+ * this session's question card for it is on screen, `answerable` when its run
+ * is gone and nothing was sent since, `waiting` when a run is still going
+ * without a card here, `closed` once a later user message exists.
+ */
+export function askCardMode(state, messageId, questionsKey) {
+  const taskId = state.activeTaskId;
+  const list = state.messagesByTask[taskId] || [];
+  let at = list.length - 1;
+  while (at >= 0 && list[at].id !== messageId) at--;
+  if (at < 0) return 'closed';
+  for (let i = at + 1; i < list.length; i++) {
+    const m = list[i];
+    if (m.role === 'user') return 'closed';
+    for (const b of m.content || []) {
+      if (b?.type === 'ask_user' && askQuestionsKey(b.questions) === questionsKey) return 'live';
+    }
+  }
+  return state._isTaskRunning(taskId) ? 'waiting' : 'answerable';
+}
+
+/**
+ * The question card for an ask_user call read back from the transcript, shown
+ * when the live card is not there (after a restart or reload). Draws nothing
+ * while the live card exists.
+ */
+export function AskUserFromTranscript({ messageId, input, output, isError, interrupted }) {
+  const questions = useMemo(() => parseAskQuestions(input), [input]);
+  const questionsKey = useMemo(() => askQuestionsKey(questions), [questions]);
+  const outcome = useMemo(
+    () => parseAskOutcome(output, { isError, interrupted }),
+    [output, isError, interrupted],
+  );
+  const mode = useAgent((s) => askCardMode(s, messageId, questionsKey));
+  const sendMessage = useAgent((s) => s.sendMessage);
+
+  if (mode === 'live' || questions.length === 0) return null;
+  if (outcome.state === 'answered') {
+    return <AnsweredView questions={questions} answers={outcome.answers} />;
+  }
+  if (outcome.state === 'dismissed') {
+    return <AskUserInline questions={questions} cancelled />;
+  }
+  if (mode === 'answerable') {
+    return (
+      <AskUserInline
+        questions={questions}
+        onAnswer={(answers, images) =>
+          sendMessage(askAnswersAsMessage(questions, answers), images, { askAnswer: true })
+        }
+      />
+    );
+  }
+  const waiting = mode === 'waiting' && outcome.state === 'pending';
+  return (
+    <div className="relative py-1 pl-7">
+      <span className="absolute left-1.5 top-2.5 grid size-3.5 place-items-center rounded-full bg-background">
+        <HelpCircle className="size-3 text-muted-foreground" />
+      </span>
+      <div className="min-w-0 overflow-hidden rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2">
+        <MarkdownBlock
+          text={askUserMarkdown(questions, { state: waiting ? 'none' : 'unanswered' })}
+          className="break-words [overflow-wrap:anywhere]"
+        />
+        {waiting && (
+          <div className="mt-1 text-xs text-muted-foreground">
+            This window is not attached to the question. Stop the run to answer it here.
+          </div>
+        )}
       </div>
     </div>
   );

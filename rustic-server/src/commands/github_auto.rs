@@ -41,6 +41,9 @@ struct SetConfigArg {
     enabled: bool,
     public_base_url: String,
     label: String,
+    /// Omitted by callers that only flip the master switch; the stored list is kept.
+    #[serde(default)]
+    allowed_logins: Option<Vec<String>>,
 }
 
 fn set_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -49,10 +52,15 @@ fn set_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     if label.is_empty() {
         return Err(ApiError::bad("Label cannot be empty"));
     }
+    let allowed_logins = match a.allowed_logins {
+        Some(list) => github::normalize_logins(&list),
+        None => github::load_global_config(ctx).allowed_logins,
+    };
     let cfg = github::GithubAutoConfig {
         enabled: a.enabled,
         public_base_url: a.public_base_url.trim().trim_end_matches('/').to_string(),
         label,
+        allowed_logins,
     };
     github::save_global_config(ctx, &cfg)?;
     if cfg.enabled {

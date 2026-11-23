@@ -10,7 +10,9 @@ import { Button } from '@/components/ui/button';
 // (translate3d + scale, origin top-left) written straight to the DOM once
 // per animation frame; React only re-renders the % readout.
 //
-// Interaction (same for every preview):
+// Interaction:
+//   paged documents (`wheel: 'scroll'`, PDF): wheel scrolls, pinch or
+//   Cmd/Ctrl+wheel zooms around the cursor; everything else below is shared
 //   wheel / trackpad pinch → zoom around the cursor
 //   Shift+wheel → pan vertically · horizontal swipe → pan horizontally
 //   left-drag (where `canPan` allows) or middle-drag → pan
@@ -42,6 +44,9 @@ export function usePanZoom({
   padding = 24,
   onSettle,
   canPan,
+  // 'zoom': wheel zooms (images, canvases). 'scroll': wheel scrolls and only
+  // pinch or Cmd/Ctrl+wheel zooms (paged documents).
+  wheel = 'zoom',
   // Keep the content on its own GPU layer permanently. Right for images
   // (promoting a huge bitmap at gesture start costs a long frame); wrong for
   // text, which only re-rasterises crisply once `will-change` is dropped.
@@ -55,7 +60,7 @@ export function usePanZoom({
   const raf = useRef(0);
   const settleTimer = useRef(0);
   const opts = useRef({});
-  opts.current = { fitMode, minScale, maxScale, padding, onSettle, canPan, keepLayer };
+  opts.current = { fitMode, minScale, maxScale, padding, onSettle, canPan, keepLayer, wheel };
   const [scale, setScale] = useState(1);
   const [fitScale, setFitScale] = useState(1);
   const [dragging, setDragging] = useState(false);
@@ -184,6 +189,18 @@ export function usePanZoom({
       e.stopPropagation();
       const rect = vp.getBoundingClientRect();
       const { dx, dy } = wheelPixels(e, rect.height);
+      if (opts.current.wheel === 'scroll') {
+        if (!(e.ctrlKey || e.metaKey)) {
+          // Shift turns a vertical mouse wheel into a horizontal scroll.
+          if (e.shiftKey && !dx) panBy(-dy, 0);
+          else panBy(-dx, -dy);
+          return;
+        }
+        // Pinch sends small ctrl+wheel deltas; a mouse wheel notch sends ~100, so cap the step.
+        const step = -dy * (e.ctrlKey ? 0.012 : 0.0022);
+        zoomAt(Math.exp(Math.max(-0.25, Math.min(0.25, step))), e.clientX - rect.left, e.clientY - rect.top);
+        return;
+      }
       if (e.shiftKey) {
         panBy(-(dx || 0), -dy);
         return;

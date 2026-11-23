@@ -259,43 +259,32 @@ fn cached_gitignore(
     Some(gi)
 }
 
-pub(crate) async fn check_sensitive_path(
-    rel_path: &str,
-    full_path: &std::path::Path,
-    context: &crate::tools::ToolContext,
-) -> Option<ToolOutput> {
+/// Why `full_path` is permanently off limits (private key, certificate, cloud
+/// credential), as the tool error text; `None` when it is not such a file.
+pub(crate) fn tier1_block_reason(rel_path: &str, full_path: &std::path::Path) -> Option<String> {
     let filename = full_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let path_str = full_path.to_string_lossy().to_lowercase();
     let filename_lower = filename.to_lowercase();
 
-    // Tier 1: always block
     let tier1_names = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"];
     let tier1_extensions = [".pem", ".p12", ".pfx"];
 
     if tier1_names.contains(&filename_lower.as_str()) {
-        return Some(ToolOutput {
-            content: format!(
-                "SENSITIVE_FILE_BLOCKED: Access to '{}' is permanently denied. \
-                 Private key files cannot be read or modified by the agent.",
-                rel_path
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
+        return Some(format!(
+            "SENSITIVE_FILE_BLOCKED: Access to '{}' is permanently denied. \
+             Private key files cannot be read or modified by the agent.",
+            rel_path
+        ));
     }
     if tier1_extensions
         .iter()
         .any(|ext| filename_lower.ends_with(ext))
     {
-        return Some(ToolOutput {
-            content: format!(
-                "SENSITIVE_FILE_BLOCKED: Access to '{}' is permanently denied. \
-                 Certificate/key files cannot be read or modified by the agent.",
-                rel_path
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
+        return Some(format!(
+            "SENSITIVE_FILE_BLOCKED: Access to '{}' is permanently denied. \
+             Certificate/key files cannot be read or modified by the agent.",
+            rel_path
+        ));
     }
     // Standalone .key files (not build artifacts — check it's not something like keymap.key)
     if filename_lower == ".key"
@@ -303,32 +292,52 @@ pub(crate) async fn check_sensitive_path(
             && !filename_lower.contains("map")
             && !filename_lower.contains("board"))
     {
-        return Some(ToolOutput {
-            content: format!(
-                "SENSITIVE_FILE_BLOCKED: Access to '{}' is permanently denied. Key files cannot be accessed.",
-                rel_path
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
+        return Some(format!(
+            "SENSITIVE_FILE_BLOCKED: Access to '{}' is permanently denied. Key files cannot be accessed.",
+            rel_path
+        ));
     }
     // AWS credentials
     if path_str.contains(".aws") && filename_lower == "credentials" {
-        return Some(ToolOutput {
-            content:
-                "SENSITIVE_FILE_BLOCKED: Access to AWS credentials file is permanently denied."
-                    .to_string(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
+        return Some(
+            "SENSITIVE_FILE_BLOCKED: Access to AWS credentials file is permanently denied."
+                .to_string(),
+        );
     }
     // Service account JSON
     if filename_lower.starts_with("service-account") && filename_lower.ends_with(".json") {
+        return Some(format!(
+            "SENSITIVE_FILE_BLOCKED: Access to service account key '{}' is permanently denied.",
+            rel_path
+        ));
+    }
+    None
+}
+
+/// Whether a lowercased file name looks like a secrets file (`.env`, `credentials*`, `*.token`, …).
+pub(crate) fn is_tier2_secret_name(filename_lower: &str) -> bool {
+    let n = filename_lower;
+    n == ".env"
+        || n.starts_with(".env.")
+        || n.ends_with(".env") // production.env, local.env, …
+        || n.starts_with("credentials")
+        || n.starts_with("secrets")
+        || n.ends_with(".secret")
+        || n.ends_with(".token")
+}
+
+pub(crate) async fn check_sensitive_path(
+    rel_path: &str,
+    full_path: &std::path::Path,
+    context: &crate::tools::ToolContext,
+) -> Option<ToolOutput> {
+    let filename = full_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let filename_lower = filename.to_lowercase();
+
+    // Tier 1: always block
+    if let Some(content) = tier1_block_reason(rel_path, full_path) {
         return Some(ToolOutput {
-            content: format!(
-                "SENSITIVE_FILE_BLOCKED: Access to service account key '{}' is permanently denied.",
-                rel_path
-            ),
+            content,
             is_error: true,
             attachments: Vec::new(),
         });
@@ -353,17 +362,7 @@ pub(crate) async fn check_sensitive_path(
     }
 
     // Tier 2: sensitive patterns — require confirmation unless sensitive_files_allowed
-    let is_tier2 = {
-        let n = &filename_lower;
-        n == ".env"
-            || n.starts_with(".env.")
-            || n.ends_with(".env") // production.env, local.env, …
-            || n.starts_with("credentials")
-            || n == "credentials"
-            || n.starts_with("secrets")
-            || n.ends_with(".secret")
-            || n.ends_with(".token")
-    };
+    let is_tier2 = is_tier2_secret_name(&filename_lower);
 
     if is_tier2 {
         // Tier-2 (likely secrets) is prompted even in FullAuto — autonomy
@@ -449,8 +448,98 @@ pub(crate) fn is_scratch_path(project_root: &std::path::Path, rel_path: &str) ->
     normalized.starts_with(".rustic/tmp/") && !normalized.split('/').any(|seg| seg == "..")
 }
 
-/// Returns `Some(error)` when `rel_path` is outside the sub-agent's declared write scope.
+#[cfg(test)]
+mod allowed_files_guard_tests {
+    use super::{check_write_scope, is_allowed_files_list};
+    use crate::tools::ToolContext;
+    use std::path::Path;
+
+    #[test]
+    fn every_spelling_of_the_list_is_recognised() {
+        let root = Path::new("/work/proj");
+        for path in [
+            ".rustic/allowed-files.txt",
+            "./.rustic/allowed-files.txt",
+            "src/../.rustic/allowed-files.txt",
+            ".rustic/tmp/../allowed-files.txt",
+            ".Rustic/Allowed-Files.TXT",
+            "/work/proj/.rustic/allowed-files.txt",
+            ".rustic\\allowed-files.txt"
+                .replace('\\', std::path::MAIN_SEPARATOR_STR)
+                .as_str(),
+        ] {
+            assert!(is_allowed_files_list(root, path), "{path}");
+        }
+        for path in [
+            ".rustic/allowed-files.txt.bak",
+            ".rustic/memory/allowed-files.txt",
+            "allowed-files.txt",
+            "../other/.rustic/allowed-files.txt",
+            ".rustic/tmp/x.txt",
+        ] {
+            assert!(!is_allowed_files_list(root, path), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_main_agent_cannot_write_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, rx) = ToolContext::new_test(dir.path().to_path_buf());
+        std::mem::forget(rx);
+        let out = check_write_scope(&ctx, "./.rustic/allowed-files.txt").expect("blocked");
+        assert!(
+            out.is_error && out.content.starts_with("PERMISSION_DENIED"),
+            "{}",
+            out.content
+        );
+        assert!(check_write_scope(&ctx, ".rustic/memory/note.md").is_none());
+        assert!(check_write_scope(&ctx, "src/main.rs").is_none());
+    }
+}
+
+/// The user's list of files the agent may read without being asked.
+const ALLOWED_FILES_LIST: &str = ".rustic/allowed-files.txt";
+
+/// Whether `rel_path` names the project's `.rustic/allowed-files.txt`, however
+/// it is spelled (`./`, `..` detours, absolute, different letter case).
+pub(crate) fn is_allowed_files_list(project_root: &std::path::Path, rel_path: &str) -> bool {
+    use std::path::Component;
+    let mut parts: Vec<String> = Vec::new();
+    for component in project_root.join(rel_path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_string_lossy().to_lowercase()),
+        }
+    }
+    let mut target: Vec<String> = project_root
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    target.extend(ALLOWED_FILES_LIST.split('/').map(str::to_string));
+    parts == target
+}
+
+/// Returns `Some(error)` when `rel_path` may not be written by this agent: the
+/// user's file-approval list (any agent), or a path outside a sub-agent's
+/// declared write scope.
 pub(crate) fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option<ToolOutput> {
+    // The entries in this file skip the "may contain secrets" prompt on later
+    // runs, so an agent that could write it would be approving itself.
+    if is_allowed_files_list(&context.project_root, rel_path) {
+        return Some(ToolOutput {
+            content: format!(
+                "PERMISSION_DENIED: `{ALLOWED_FILES_LIST}` is the user's list of files the agent \
+                 may read without asking, and the agent cannot change it. Ask the user to add \
+                 the path themselves if they want it pre-approved."
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+
     let scope = match &context.write_scope {
         None => return None, // main agent: unrestricted
         Some(s) => s,
@@ -498,11 +587,10 @@ pub(crate) fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option
 
 const DEFAULT_READ_LIMIT: usize = 500;
 
-// Two-layer read cap: 256 KB byte gate (pre-read stat) + 10K token estimate (post-read).
-// Both are overridable via env var for power users. The token cap only
-// truncates default-window reads; explicit offset/limit ranges may go up to
-// `P1_11_MAX_EXPLICIT_TOKEN_ESTIMATE`.
-const P1_11_MAX_READ_BYTES: u64 = 256 * 1024;
+// Read cap: a ~10K token estimate on what is returned. Text is read as a
+// stream, so the size of the file itself does not matter. Overridable via env
+// var for power users. The token cap only truncates default-window reads;
+// explicit offset/limit ranges may go up to `P1_11_MAX_EXPLICIT_TOKEN_ESTIMATE`.
 const P1_11_MAX_TOKEN_ESTIMATE: usize = 10_000;
 const P1_11_MAX_EXPLICIT_TOKEN_ESTIMATE: usize = 25_000;
 
@@ -534,7 +622,8 @@ pub fn definitions() -> Vec<ToolDef> {
                             sheet, first 500 rows.\n\
                           • Legacy binary OLE (`.doc` / `.xls`): not supported — convert to \
                             the modern .docx / .xlsx first.\n\
-                          • Files are capped pre-read at 256 KB (text). A read without \
+                          • Text files of any size can be read: only the requested lines \
+                            are loaded. A read without \
                             `offset` / `limit` returns at most ~10K tokens (truncated with a \
                             notice); pass an explicit `offset` / `limit` to read further — \
                             explicit ranges may return up to ~25K tokens, beyond which an \
@@ -960,84 +1049,68 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
         _ => {}
     }
 
-    let byte_cap: u64 = std::env::var("RUSTIC_FILE_READ_MAX_BYTES")
+    let explicit_range = start_line.is_some() || end_line.is_some();
+    let env_cap: Option<usize> = std::env::var("RUSTIC_FILE_READ_MAX_OUTPUT_TOKENS")
         .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(P1_11_MAX_READ_BYTES);
-    if let Ok(metadata) = std::fs::metadata(&full_path) {
-        if metadata.is_file()
-            && metadata.len() > byte_cap
-            && (start_line.is_some() || end_line.is_some())
-        {
-            return Ok(ToolOutput {
-                content: format!(
-                    "READ_TOO_LARGE: '{}' is {} bytes, exceeding the {}-byte read cap \
-                         even with the requested range. Pick a smaller offset/limit window \
-                         and retry. (Override the cap process-wide with the \
-                         RUSTIC_FILE_READ_MAX_BYTES env var.)",
-                    path,
-                    metadata.len(),
-                    byte_cap
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-    }
+        .and_then(|s| s.parse::<usize>().ok());
+    let token_cap: usize = env_cap.unwrap_or(if explicit_range {
+        P1_11_MAX_EXPLICIT_TOKEN_ESTIMATE
+    } else {
+        P1_11_MAX_TOKEN_ESTIMATE
+    });
+    // Enough text to overflow the token cap in any encoding; nothing past it is kept.
+    let budget = token_cap.saturating_mul(16);
+    let requested_start = start_line.map(|n| n.saturating_sub(1)).unwrap_or(0);
+    let window = if explicit_range {
+        read_line_window(&full_path, requested_start, end_line, budget, false)
+    } else {
+        read_line_window(&full_path, 0, Some(DEFAULT_READ_LIMIT), budget, true)
+    };
 
-    match std::fs::read_to_string(&full_path) {
-        Ok(content) => {
-            let lines: Vec<&str> = content.lines().collect();
-            let total = lines.len();
-
-            let (recorded_start, mut recorded_end, mut output) =
-                if start_line.is_none() && end_line.is_none() {
-                    let end = total.min(DEFAULT_READ_LIMIT);
-                    let body = lines[..end].join("\n");
-                    let text = if total > DEFAULT_READ_LIMIT {
-                        format!(
-                            "{}\n\n[TRUNCATED: showing lines 1-{} of {} total. \
+    match window {
+        Ok(window) => {
+            let lines = &window.lines;
+            let (recorded_start, mut recorded_end, mut output) = if !explicit_range {
+                let end = lines.len();
+                let total = window.total.unwrap_or(end);
+                let body = lines.join("\n");
+                let text = if total > end {
+                    format!(
+                        "{}\n\n[TRUNCATED: showing lines 1-{} of {} total. \
                          Pass offset/limit (or start_line/end_line) to read beyond line {}.]",
-                            body, end, total, end
-                        )
-                    } else {
-                        body
-                    };
-                    (1usize, end.max(1), text)
+                        body, end, total, end
+                    )
                 } else {
-                    let start = start_line
-                        .map(|n| n.saturating_sub(1))
-                        .unwrap_or(0)
-                        .min(total);
-                    let end = end_line.map(|n| n.min(total)).unwrap_or(total);
-                    let end = end.max(start);
-                    let selected: Vec<String> = lines[start..end]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, line)| format!("{}: {}", start + i + 1, *line))
-                        .collect();
-                    (start + 1, end.max(start + 1), selected.join("\n"))
+                    body
                 };
-
-            let env_cap: Option<usize> = std::env::var("RUSTIC_FILE_READ_MAX_OUTPUT_TOKENS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok());
-            let explicit_range = start_line.is_some() || end_line.is_some();
-            let token_cap: usize = env_cap.unwrap_or(if explicit_range {
-                P1_11_MAX_EXPLICIT_TOKEN_ESTIMATE
+                (1usize, end.max(1), text)
             } else {
-                P1_11_MAX_TOKEN_ESTIMATE
-            });
+                // A start past the end of the file reads as an empty range at the end.
+                let start = window
+                    .total
+                    .map_or(requested_start, |t| requested_start.min(t));
+                let end = start + lines.len();
+                let selected: Vec<String> = lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| format!("{}: {}", start + i + 1, line))
+                    .collect();
+                (start + 1, end.max(start + 1), selected.join("\n"))
+            };
+
             let estimated_tokens = output.len() / 4;
             if estimated_tokens > token_cap {
                 if explicit_range {
                     return Ok(ToolOutput {
                         content: format!(
-                            "READ_TOO_LARGE: '{}' range ≈{} tokens (cap = {}). Even with \
+                            "READ_TOO_LARGE: '{}' range ≈{}{} tokens (cap = {}). Even with \
                              the explicit offset/limit you passed, the body is too large to \
                              fit in context. Pick a narrower range and retry. (Override \
                              with RUSTIC_FILE_READ_MAX_OUTPUT_TOKENS env var.)",
-                            path, estimated_tokens, token_cap
+                            path,
+                            estimated_tokens,
+                            if window.over_budget { "+" } else { "" },
+                            token_cap
                         ),
                         is_error: true,
                         attachments: Vec::new(),
@@ -1084,6 +1157,204 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
             is_error: true,
             attachments: Vec::new(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod large_file_read_tests {
+    use super::execute_read_file_one;
+    use crate::tools::ToolContext;
+    use serde_json::json;
+
+    /// Read `params` from a fresh context, so no earlier read turns this one into a stub.
+    async fn read(root: &std::path::Path, params: serde_json::Value) -> crate::tools::ToolOutput {
+        let (ctx, rx) = ToolContext::new_test(root.to_path_buf());
+        std::mem::forget(rx);
+        execute_read_file_one(params, &ctx).await.unwrap()
+    }
+
+    /// Tracker issue #18: a window of a file over 256 KB used to fail whatever its size.
+    #[tokio::test]
+    async fn a_window_of_a_large_file_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=20_000)
+            .map(|n| format!("line {n} of a large generated source file\n"))
+            .collect();
+        assert!(body.len() > 700 * 1024, "{}", body.len());
+        std::fs::write(dir.path().join("big.ts"), &body).unwrap();
+
+        let out = read(
+            dir.path(),
+            json!({ "path": "big.ts", "offset": 1790, "limit": 50 }),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        let lines: Vec<&str> = out.content.lines().collect();
+        assert_eq!(lines.len(), 50);
+        assert_eq!(lines[0], "1790: line 1790 of a large generated source file");
+        assert_eq!(
+            lines[49],
+            "1839: line 1839 of a large generated source file"
+        );
+
+        // The last lines, and a start past the end.
+        let out = read(
+            dir.path(),
+            json!({ "path": "big.ts", "offset": 19_999, "limit": 50 }),
+        )
+        .await;
+        assert_eq!(
+            out.content,
+            "19999: line 19999 of a large generated source file\n\
+             20000: line 20000 of a large generated source file"
+        );
+        let out = read(
+            dir.path(),
+            json!({ "path": "big.ts", "offset": 30_000, "limit": 5 }),
+        )
+        .await;
+        assert!(!out.is_error && out.content.is_empty(), "{}", out.content);
+
+        // No range: the default window, with the real line count in the notice.
+        let out = read(dir.path(), json!({ "path": "big.ts" })).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.starts_with("line 1 of a large"),
+            "{}",
+            &out.content[..60]
+        );
+        assert!(
+            out.content
+                .contains("[TRUNCATED: showing lines 1-500 of 20000 total."),
+            "{}",
+            &out.content[out.content.len() - 160..]
+        );
+
+        // A range that is itself too big still says so, and names the fix.
+        let out = read(
+            dir.path(),
+            json!({ "path": "big.ts", "offset": 1, "limit": 20_000 }),
+        )
+        .await;
+        assert!(
+            out.is_error && out.content.starts_with("READ_TOO_LARGE"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("Pick a narrower range"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn small_files_read_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\r\nthree").unwrap();
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        std::fs::write(
+            dir.path().join("bin.dat"),
+            [0x66, 0x6f, 0xff, 0xfe, 0x0a, 0x41],
+        )
+        .unwrap();
+
+        let out = read(dir.path(), json!({ "path": "a.txt" })).await;
+        assert_eq!(out.content, "one\ntwo\nthree");
+        let out = read(
+            dir.path(),
+            json!({ "path": "a.txt", "offset": 2, "limit": 2 }),
+        )
+        .await;
+        assert_eq!(out.content, "2: two\n3: three");
+        let out = read(dir.path(), json!({ "path": "a.txt", "offset": 3 })).await;
+        assert_eq!(out.content, "3: three");
+        let out = read(dir.path(), json!({ "path": "empty.txt" })).await;
+        assert!(!out.is_error && out.content.is_empty(), "{:?}", out.content);
+
+        let out = read(dir.path(), json!({ "path": "bin.dat" })).await;
+        assert!(out.is_error, "{}", out.content);
+        let out = read(
+            dir.path(),
+            json!({ "path": "bin.dat", "offset": 2, "limit": 1 }),
+        )
+        .await;
+        assert!(
+            out.is_error,
+            "binary content before the window is still refused: {}",
+            out.content
+        );
+    }
+}
+
+/// A slice of a text file's lines, as returned by [`read_line_window`].
+struct LineWindow {
+    /// The requested lines that exist, without line endings.
+    lines: Vec<String>,
+    /// Line count of the whole file; `None` when reading stopped before its end.
+    total: Option<usize>,
+    /// True when collecting stopped because `budget` bytes were exceeded.
+    over_budget: bool,
+}
+
+/// Read lines `start..end` (0-based, `end` exclusive, `None` = to the end) of
+/// a text file as a stream, so the cost is the window and not the file: a
+/// 600 KB source file and a multi-gigabyte log both answer a 50-line read.
+/// Collecting stops once more than `budget` bytes are held. With `count_all`
+/// the rest of the file is still scanned so `total` is known.
+fn read_line_window(
+    path: &std::path::Path,
+    start: usize,
+    end: Option<usize>,
+    budget: usize,
+    count_all: bool,
+) -> std::io::Result<LineWindow> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+    let mut window = LineWindow {
+        lines: Vec::new(),
+        total: None,
+        over_budget: false,
+    };
+    let mut held = 0usize;
+    let mut index = 0usize;
+    let mut raw: Vec<u8> = Vec::new();
+    // An empty or inverted range still reads to the end, to learn the line count.
+    let stop_at = end.filter(|e| *e > start);
+    loop {
+        if !count_all && (window.over_budget || stop_at.is_some_and(|e| index >= e)) {
+            return Ok(window);
+        }
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            window.total = Some(index);
+            return Ok(window);
+        }
+        let wanted = index >= start && end.is_none_or(|e| index < e) && !window.over_budget;
+        if wanted {
+            if raw.last() == Some(&b'\n') {
+                raw.pop();
+                if raw.last() == Some(&b'\r') {
+                    raw.pop();
+                }
+            }
+            let line = std::str::from_utf8(&raw).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                )
+            })?;
+            held += line.len();
+            window.lines.push(line.to_string());
+            window.over_budget = held > budget;
+        } else if index < start && std::str::from_utf8(&raw).is_err() {
+            // Keep refusing binary files, as a whole-file read did.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            ));
+        }
+        index += 1;
     }
 }
 

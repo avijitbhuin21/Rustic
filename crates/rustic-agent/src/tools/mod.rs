@@ -6,6 +6,7 @@ pub(crate) mod guarded_write;
 pub mod history;
 pub mod media_tools;
 pub mod notebook;
+pub mod pdf_edit;
 pub mod pdf_worker;
 pub mod peer_tools;
 pub mod search;
@@ -592,6 +593,11 @@ impl BuiltinTools {
     }
 
     pub fn is_builtin(name: &str) -> bool {
+        // Theme tools keep their own name list; anything missing here is sent
+        // to the MCP manager and fails with "No MCP server provides tool".
+        if theme_tools::handles(name) {
+            return true;
+        }
         matches!(
             name,
             "read_file"
@@ -670,6 +676,8 @@ impl BuiltinTools {
                 | "call_sites"
                 | "tool_search"
                 | "check_other_active_agents"
+                | "list_themes"
+                | "read_theme"
         )
     }
 
@@ -904,6 +912,46 @@ mod tests {
                 tool
             );
         }
+    }
+
+    /// Tracker issue #16: a tool that is defined but missing from `is_builtin`
+    /// is sent to the MCP manager and fails with "No MCP server provides tool".
+    #[test]
+    fn every_defined_tool_is_routed_as_builtin() {
+        let missing: Vec<String> = BuiltinTools::new()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .filter(|name| !BuiltinTools::is_builtin(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "defined but not routed as built-in: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn theme_tools_are_builtin_and_only_the_readers_are_read_only() {
+        for tool in ["list_themes", "read_theme", "write_theme", "delete_theme"] {
+            assert!(BuiltinTools::is_builtin(tool), "{tool} should be built-in");
+        }
+        assert!(BuiltinTools::is_read_only("list_themes"));
+        assert!(BuiltinTools::is_read_only("read_theme"));
+        assert!(!BuiltinTools::is_read_only("write_theme"));
+        assert!(!BuiltinTools::is_read_only("delete_theme"));
+    }
+
+    /// The call reaches the theme handler, not the "Unknown tool" fallback.
+    #[tokio::test]
+    async fn list_themes_reaches_the_theme_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        let out = BuiltinTools::new()
+            .execute("list_themes", "id", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.content.contains("Unknown tool"), "{}", out.content);
+        assert!(!out.content.contains("No MCP server"), "{}", out.content);
     }
 
     fn call(name: &str, input: Value) -> (String, String, Value) {

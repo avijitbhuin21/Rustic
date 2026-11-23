@@ -77,6 +77,15 @@ pub struct TaskRow {
     /// is set; cleared automatically once the evaluator confirms the goal.
     #[serde(default)]
     pub goal: Option<String>,
+    /// Extra turns the /goal loop has forced so far (migration 030).
+    #[serde(default)]
+    pub goal_turns: i64,
+    /// `"blocked"` while the worker has reported it cannot go on; NULL otherwise.
+    #[serde(default)]
+    pub goal_status: Option<String>,
+    /// The reason that came with `goal_status`.
+    #[serde(default)]
+    pub goal_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

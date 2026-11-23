@@ -67,6 +67,7 @@ export function GithubAutoResolveSection() {
         enabled: next.enabled,
         publicBaseUrl: next.publicBaseUrl ?? '',
         label: next.label || 'rustic',
+        allowedLogins: next.allowedLogins ?? [],
       });
       setCfg(saved);
       toast.success('GitHub auto-resolve settings saved');
@@ -173,6 +174,29 @@ export function GithubAutoResolveSection() {
               placeholder="rustic"
               title="Only issues with this label are processed"
               className="h-7 w-28 text-xs font-mono"
+            />
+            <Button size="sm" className="text-xs" onClick={() => saveGlobal(cfg)}>Save</Button>
+          </div>
+        </div>
+
+        <div className="px-3 py-3">
+          <div className="mb-2 flex items-center gap-1.5 text-[13px] font-medium">
+            Trusted accounts
+            <InfoTip>
+              Whose issue comments and issue edits the agent acts on. Leave empty to trust the
+              repo's owner, organisation members and collaborators. Everyone else is ignored.
+            </InfoTip>
+          </div>
+          <div className="flex items-center gap-2">
+            <Input
+              value={(cfg.allowedLogins || []).join(', ')}
+              onChange={(e) => setCfg({
+                ...cfg,
+                allowedLogins: e.target.value.split(',').map((s) => s.trimStart()),
+              })}
+              placeholder="owner, members and collaborators"
+              title="Comma-separated GitHub logins"
+              className="h-7 flex-1 text-xs font-mono"
             />
             <Button size="sm" className="text-xs" onClick={() => saveGlobal(cfg)}>Save</Button>
           </div>

@@ -1,11 +1,16 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { ChevronDown, Maximize2, Menu, TableOfContents, ZoomIn, ZoomOut } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { MOD_LABEL } from '@/lib/platform';
 import { fetchFileBytes } from '@/lib/file-bytes';
 import { useFileReloadVersion } from '@/lib/use-file-change';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useEditor } from '@/state/editor';
 import { setActiveSaver, clearActiveSaver } from '@/lib/active-editor';
+import { extractImagesFromClipboard, readImagesFromAsyncClipboard } from '@/lib/clipboard-image';
 import './docx-preview.css';
 
 // We dynamic-import the DOCX editor + its CSS so the ~500 KB bundle
@@ -28,14 +33,14 @@ function bytesToBase64(bytes) {
 }
 
 /**
- * Wheel = zoom (around the cursor), drag on the background / middle-drag /
- * Space+drag = pan, for the docx editor. Live zoom is a GPU transform on the
+ * Wheel scrolls the pages; pinch or Cmd/Ctrl+wheel = zoom (around the cursor),
+ * drag on the background / middle-drag / Space+drag = pan. Live zoom is a GPU transform on the
  * page area; when the gesture settles we commit once through the editor's
  * own setZoom (which re-lays the document out crisply) and re-anchor the
  * scroll so the point under the cursor stays put. Dragging on text still
  * selects it, so editing keeps working.
  */
-function useDocxPanZoom(hostRef, editorRef, ready) {
+function useDocxPanZoom(hostRef, editorRef, ready, onZoom) {
   useEffect(() => {
     const host = hostRef.current;
     if (!host || !ready) return undefined;
@@ -59,6 +64,7 @@ function useDocxPanZoom(hostRef, editorRef, ready) {
       el.style.transformOrigin = '';
       el.style.willChange = '';
       editorRef.current.setZoom?.(z1);
+      onZoom?.(z1);
       // Two frames: let the editor re-render at the new zoom, then re-anchor.
       requestAnimationFrame(() => requestAnimationFrame(() => {
         scroll.scrollLeft = docX * z1 - g.cx;
@@ -68,13 +74,10 @@ function useDocxPanZoom(hostRef, editorRef, ready) {
 
     const onWheel = (e) => {
       if (!scroll || !scroll.contains(e.target)) return;
+      // Plain wheel / two-finger swipe is left alone so the pages scroll natively.
+      if (!(e.ctrlKey || e.metaKey)) return;
       e.preventDefault();
       e.stopPropagation();
-      if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
-        scroll.scrollLeft += e.shiftKey ? 0 : e.deltaX;
-        scroll.scrollTop += e.shiftKey ? e.deltaY : 0;
-        return;
-      }
       const rect = scroll.getBoundingClientRect();
       const cx = e.clientX - rect.left;
       const cy = e.clientY - rect.top;
@@ -92,7 +95,9 @@ function useDocxPanZoom(hostRef, editorRef, ready) {
         el.style.willChange = 'transform';
       }
       const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
-      gesture.factor *= Math.exp(-dy * (e.ctrlKey ? 0.012 : 0.0022));
+      // Pinch sends small ctrl+wheel deltas; a mouse wheel notch sends ~100, so cap the step.
+      const step = -dy * (e.ctrlKey ? 0.012 : 0.0022);
+      gesture.factor *= Math.exp(Math.max(-0.25, Math.min(0.25, step)));
       const z0 = editorRef.current?.getZoom?.() ?? 1;
       gesture.factor = Math.min(4 / z0, Math.max(0.25 / z0, gesture.factor));
       el.style.transform = `scale(${gesture.factor})`;
@@ -155,7 +160,266 @@ function useDocxPanZoom(hostRef, editorRef, ready) {
       window.removeEventListener('keydown', onKey);
       window.removeEventListener('keyup', onKey);
     };
-  }, [hostRef, editorRef, ready]);
+  }, [hostRef, editorRef, ready, onZoom]);
+}
+
+/** Clamps a docx zoom factor to the range the editor lays out well. */
+function clampDocxZoom(z) {
+  return Math.min(4, Math.max(0.25, z));
+}
+
+// Desk kept on each side of a page.
+const DOCX_GUTTER = 24;
+
+/** Unscaled page width plus any extra width the editor reserves (open sidebar), or null before layout. */
+function docxLayoutMetrics(host) {
+  const scroll = host?.querySelector('.docx-editor__scroll-container');
+  const page = host?.querySelector('.layout-page');
+  const frame = scroll?.firstElementChild;
+  if (!scroll || !frame || !page?.offsetWidth) return null;
+  // The editor's own minimum is page + 2 × 20px (outline button off); whatever exceeds that is sidebar room.
+  const reserved = parseFloat(frame.style.minWidth) || 0;
+  return { scroll, pageWidth: page.offsetWidth, extra: Math.max(0, reserved - page.offsetWidth - 40) };
+}
+
+/** Zoom at which one page spans the visible width of the docx scroll area, or null before layout. */
+function docxFitWidthZoom(host) {
+  const m = docxLayoutMetrics(host);
+  if (!m) return null;
+  return clampDocxZoom((m.scroll.clientWidth - 2 * DOCX_GUTTER - m.extra) / m.pageWidth);
+}
+
+/**
+ * Keeps the docx layout as wide as the zoomed page plus its gutters. The
+ * editor fixes that width for 100% and scales the page about its centre, so
+ * a zoomed-in page lost its left edge and a fitted page sat off-centre.
+ */
+function useDocxLayoutWidth(hostRef, zoom, ready) {
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!ready || !host) return undefined;
+    let frameMo = null;
+    const sync = () => {
+      const m = docxLayoutMetrics(host);
+      if (!m) return false;
+      host.style.setProperty('--docx-layout-min', `${Math.round(m.pageWidth * zoom + 2 * DOCX_GUTTER + m.extra)}px`);
+      if (!frameMo) {
+        frameMo = new MutationObserver(sync);
+        frameMo.observe(m.scroll.firstElementChild, { attributes: true, attributeFilter: ['style'] });
+      }
+      return true;
+    };
+    let hostMo = null;
+    if (!sync()) {
+      hostMo = new MutationObserver(() => { if (sync()) hostMo.disconnect(); });
+      hostMo.observe(host, { childList: true, subtree: true });
+    }
+    return () => {
+      hostMo?.disconnect();
+      frameMo?.disconnect();
+    };
+  }, [hostRef, zoom, ready]);
+}
+
+/**
+ * Holds a freshly opened document at its top while the editor settles. After
+ * a zoom change the editor restores a scroll anchor on each layout pass, which
+ * left a just-fitted document a few dozen pixels down. Ends on the first user
+ * input or after 2.5s; returns a function that ends it early.
+ */
+function holdDocxAtTop(scroll) {
+  const inputs = ['wheel', 'pointerdown', 'keydown', 'touchstart'];
+  const onScroll = () => { if (scroll.scrollTop !== 0) scroll.scrollTop = 0; };
+  let timer = 0;
+  const stop = () => {
+    clearTimeout(timer);
+    scroll.removeEventListener('scroll', onScroll);
+    for (const type of inputs) window.removeEventListener(type, stop, true);
+  };
+  scroll.addEventListener('scroll', onScroll);
+  for (const type of inputs) window.addEventListener(type, stop, true);
+  timer = setTimeout(stop, 2500);
+  onScroll();
+  return stop;
+}
+
+/** Single toolbar button that reveals the editor's File / Format / Insert / Help menus. */
+function DocxMenuButton({ open, onToggle }) {
+  return (
+    <button
+      type="button"
+      className="rustic-docx-menu-btn"
+      aria-label="Document menu"
+      aria-expanded={open}
+      title="File, Format, Insert, Help"
+      onClick={onToggle}
+    >
+      <Menu />
+    </button>
+  );
+}
+
+/** Chevron that shows or hides the toolbar controls that did not fit on the first row. */
+function DocxToolbarOverflowButton({ expanded, onToggle }) {
+  return (
+    <button
+      type="button"
+      className="rustic-docx-menu-btn rustic-docx-more-btn"
+      aria-label={expanded ? 'Show fewer tools' : 'Show more tools'}
+      aria-expanded={expanded}
+      title={expanded ? 'Show fewer tools' : 'Show more tools'}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onToggle}
+    >
+      <ChevronDown />
+    </button>
+  );
+}
+
+/** Floating zoom out / percentage / zoom in / fit-width control for the docx page area. */
+function DocxZoomControl({ zoom, onZoom, onFit }) {
+  return (
+    <div className="rustic-docx-zoom absolute bottom-3 right-6 z-20 flex items-center gap-0.5 rounded-md border border-border bg-popover/95 p-0.5 shadow-sm">
+      <Button size="icon-xs" variant="ghost" onClick={() => onZoom(zoom / 1.15)} aria-label="Zoom out" title={`Zoom out (${MOD_LABEL}+scroll or pinch)`}>
+        <ZoomOut />
+      </Button>
+      <button
+        type="button"
+        className="w-11 text-center text-xs tabular-nums text-muted-foreground hover:text-foreground"
+        onClick={() => onZoom(1)}
+        title="Reset to 100%"
+      >
+        {Math.round(zoom * 100)}%
+      </button>
+      <Button size="icon-xs" variant="ghost" onClick={() => onZoom(zoom * 1.15)} aria-label="Zoom in" title={`Zoom in (${MOD_LABEL}+scroll or pinch)`}>
+        <ZoomIn />
+      </Button>
+      <Button size="icon-xs" variant="ghost" onClick={onFit} aria-label="Fit width" title="Fit width">
+        <Maximize2 />
+      </Button>
+    </div>
+  );
+}
+
+/** Headings of the open document as `{ text, level, pos }`, by outline level or a `HeadingN` style (the editor's own rule). */
+function collectDocxHeadings(doc) {
+  const headings = [];
+  doc?.descendants((node, pos) => {
+    if (node.type.name !== 'paragraph') return;
+    let level = node.attrs.outlineLevel;
+    if (level == null) {
+      const match = /^[Hh]eading(\d)$/.exec(node.attrs.styleId || '');
+      if (match) level = Number(match[1]) - 1;
+    }
+    if (level == null || level < 0 || level > 8) return;
+    let text = '';
+    node.forEach((child) => { if (child.isText) text += child.text || ''; });
+    if (text.trim()) headings.push({ text: text.trim(), level, pos });
+  });
+  return headings;
+}
+
+/** Floating bottom-left button that lists the document's headings; picking one jumps to it and the list stays open. */
+function DocxContentsButton({ editorRef }) {
+  const [open, setOpen] = useState(false);
+  const [headings, setHeadings] = useState([]);
+  const collect = () => collectDocxHeadings(editorRef.current?.getEditorRef?.()?.getView?.()?.state.doc);
+  const onOpenChange = (next) => {
+    if (next) setHeadings(collect());
+    setOpen(next);
+  };
+  const jump = (index) => {
+    // The list stays open while the document is edited, so positions are re-read at jump time.
+    const fresh = collect();
+    const wanted = headings[index];
+    const target = fresh[index]?.text === wanted.text ? fresh[index] : fresh.find((h) => h.text === wanted.text) || wanted;
+    setHeadings(fresh);
+    const paged = editorRef.current?.getEditorRef?.();
+    paged?.scrollToPosition?.(target.pos);
+    paged?.setSelection?.(target.pos + 1);
+    paged?.focus?.();
+  };
+  const top = headings.length ? Math.min(...headings.map((h) => h.level)) : 0;
+  return (
+    <Popover open={open} onOpenChange={onOpenChange}>
+      <div className="rustic-docx-contents absolute bottom-3 left-6 z-20 flex items-center rounded-md border border-border bg-popover/95 p-0.5 shadow-sm">
+        <PopoverTrigger asChild>
+          <Button size="icon-xs" variant={open ? 'secondary' : 'ghost'} aria-label="Table of contents" title="Table of contents">
+            <TableOfContents />
+          </Button>
+        </PopoverTrigger>
+      </div>
+      <PopoverContent
+        side="top"
+        align="start"
+        sideOffset={8}
+        className="w-72 gap-1 p-1.5"
+        // Keep the caret in the document instead of returning focus to the button.
+        onCloseAutoFocus={(e) => e.preventDefault()}
+        // The list behaves like a panel: jumping, clicking or typing in the
+        // document leaves it open. Only its button and Escape close it.
+        onInteractOutside={(e) => e.preventDefault()}
+      >
+        <div className="px-2 pt-1 text-xs font-medium text-muted-foreground">Contents</div>
+        {headings.length === 0 ? (
+          <div className="px-2 py-3 text-xs text-muted-foreground">This document has no headings.</div>
+        ) : (
+          <div className="max-h-[min(60vh,420px)] overflow-y-auto">
+            {headings.map((h, index) => (
+              <button
+                key={h.pos}
+                type="button"
+                title={h.text}
+                onClick={() => jump(index)}
+                style={{ paddingLeft: 8 + (h.level - top) * 12 }}
+                className={`block w-full truncate rounded-md py-1 pr-2 text-left text-xs hover:bg-accent hover:text-accent-foreground ${h.level === top ? 'font-medium text-foreground' : 'text-muted-foreground'}`}
+              >
+                {h.text}
+              </button>
+            ))}
+          </div>
+        )}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/**
+ * Image paste fallback for the docx editor. The editor inserts images that
+ * arrive as files on the paste event; this covers pastes that carry nothing
+ * usable (its own right-click Paste forwards text only, and WebKit can expose
+ * a copied image solely through the async clipboard) by reading the image
+ * from the async clipboard and replaying it as a file paste.
+ */
+function useDocxImagePaste(editorRef, ready) {
+  useEffect(() => {
+    if (!ready) return undefined;
+    // The editor mounts its ProseMirror element under <body>, not inside our
+    // host, so the event is matched against this editor's own views instead.
+    const ownView = (target) => {
+      const paged = editorRef.current?.getEditorRef?.();
+      const views = [paged?.getView?.(), ...(paged?.getHfPmViews?.()?.values?.() || [])];
+      return views.find((v) => v?.dom?.contains(target))?.dom || null;
+    };
+    const onPaste = async (e) => {
+      const pm = ownView(e.target);
+      if (!pm) return;
+      const data = e.clipboardData;
+      const hasImageFile = extractImagesFromClipboard(data).length > 0
+        || Array.from(data?.files || []).some((f) => f.type.startsWith('image/'));
+      if (hasImageFile) return;
+      if (Array.from(data?.types || []).some((t) => t !== 'Files')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const images = await readImagesFromAsyncClipboard();
+      if (!images.length) return;
+      const transfer = new DataTransfer();
+      for (const { file } of images) transfer.items.add(file);
+      pm.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }));
+    };
+    document.addEventListener('paste', onPaste, true);
+    return () => document.removeEventListener('paste', onPaste, true);
+  }, [editorRef, ready]);
 }
 
 export default function DocxPreview({ tab }) {
@@ -286,7 +550,125 @@ export default function DocxPreview({ tab }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.path, dirty]);
 
-  useDocxPanZoom(hostRef, editorRef, !!EditorComponent && !!buffer);
+  const ready = !!EditorComponent && !!buffer;
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [zoom, setZoom] = useState(1);
+
+  const applyZoom = useCallback((z) => {
+    const next = clampDocxZoom(z);
+    editorRef.current?.setZoom?.(next);
+    setZoom(next);
+  }, []);
+  const fitWidth = useCallback(() => {
+    const fit = docxFitWidthZoom(hostRef.current);
+    if (fit) applyZoom(fit);
+  }, [applyZoom]);
+
+  useDocxPanZoom(hostRef, editorRef, ready, setZoom);
+  useDocxLayoutWidth(hostRef, zoom, ready);
+  useDocxImagePaste(editorRef, ready);
+
+  // A page wider than the pane opens fitted to its width instead of cut off
+  // on the right. Runs once per file; it never enlarges a page that fits.
+  const autoFitRef = useRef(null);
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!ready || !host || autoFitRef.current === tab.path) return undefined;
+    let release = null;
+    const tryFit = () => {
+      const fit = docxFitWidthZoom(host);
+      if (fit == null) return false;
+      autoFitRef.current = tab.path;
+      if (fit < 1) {
+        applyZoom(fit);
+        const scroll = host.querySelector('.docx-editor__scroll-container');
+        if (scroll) release = holdDocxAtTop(scroll);
+      }
+      return true;
+    };
+    if (tryFit()) return () => release?.();
+    const mo = new MutationObserver(() => { if (tryFit()) mo.disconnect(); });
+    mo.observe(host, { childList: true, subtree: true });
+    return () => {
+      mo.disconnect();
+      release?.();
+    };
+  }, [ready, tab.path, applyZoom]);
+
+  // Keep the readout right if a zoom key handled elsewhere changes the editor's zoom.
+  useEffect(() => {
+    if (!ready) return undefined;
+    const onKey = (e) => {
+      if (!(e.ctrlKey || e.metaKey) || !['+', '=', '-', '0'].includes(e.key)) return;
+      requestAnimationFrame(() => {
+        const z = editorRef.current?.getZoom?.();
+        if (z) setZoom(z);
+      });
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [ready]);
+
+  // The toolbar is one row; when its groups wrap (narrow pane, or the extra
+  // table tools) a chevron offers the rest.
+  const [toolbarOverflow, setToolbarOverflow] = useState(false);
+  const [toolbarExpanded, setToolbarExpanded] = useState(false);
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!ready || !host) return undefined;
+    let bar = null;
+    let barMo = null;
+    // One row is 24px tall; anything taller means groups wrapped.
+    const measure = () => { if (bar) setToolbarOverflow(bar.scrollHeight > 30); };
+    const attach = () => {
+      bar = host.querySelector('[data-testid="formatting-bar"]');
+      if (!bar) return false;
+      barMo = new MutationObserver(measure);
+      barMo.observe(bar, { childList: true, subtree: true });
+      measure();
+      return true;
+    };
+    let hostMo = null;
+    if (!attach()) {
+      hostMo = new MutationObserver(() => { if (attach()) hostMo.disconnect(); });
+      hostMo.observe(host, { childList: true, subtree: true });
+    }
+    const ro = new ResizeObserver(measure);
+    ro.observe(host);
+    return () => {
+      hostMo?.disconnect();
+      barMo?.disconnect();
+      ro.disconnect();
+    };
+  }, [ready]);
+  const toolbarOpen = toolbarOverflow && toolbarExpanded;
+
+  // The menu strip closes on Escape, on a press outside it, and once a menu item has run.
+  useEffect(() => {
+    if (!menuOpen) return undefined;
+    const host = hostRef.current;
+    const onDown = (e) => {
+      if (!host?.querySelector('[data-testid="title-bar"]')?.contains(e.target)) setMenuOpen(false);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') setMenuOpen(false); };
+    const onClick = (e) => {
+      const menubar = host?.querySelector('[data-testid="title-bar"] [role="menubar"]');
+      if (!menubar?.contains(e.target)) return;
+      // A menu name only opens its list; a submenu parent leaves the list open.
+      if (e.target.closest('button')?.parentElement?.parentElement === menubar) return;
+      requestAnimationFrame(() => {
+        if (!menubar.querySelector(':scope > div > div')) setMenuOpen(false);
+      });
+    };
+    document.addEventListener('pointerdown', onDown, true);
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('click', onClick);
+    return () => {
+      document.removeEventListener('pointerdown', onDown, true);
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('click', onClick);
+    };
+  }, [menuOpen]);
 
   if (error) {
     return (
@@ -308,7 +690,13 @@ export default function DocxPreview({ tab }) {
   }
 
   return (
-    <div ref={hostRef} className="rustic-docx-host flex h-full w-full flex-col">
+    <div
+      ref={hostRef}
+      className="rustic-docx-host flex h-full w-full flex-col"
+      data-menu-open={menuOpen ? '' : undefined}
+      data-toolbar-overflow={toolbarOverflow ? '' : undefined}
+      data-toolbar-expanded={toolbarOpen ? '' : undefined}
+    >
       <EditorComponent
         ref={editorRef}
         documentBuffer={buffer}
@@ -324,9 +712,17 @@ export default function DocxPreview({ tab }) {
           toast.error(`Editor error: ${e?.message || e}`);
         }}
         showToolbar
-        showZoomControl
+        showZoomControl={false}
+        showOutlineButton={false}
+        initialZoom={zoom}
+        renderLogo={() => <DocxMenuButton open={menuOpen} onToggle={() => setMenuOpen((v) => !v)} />}
         className="h-full w-full"
       />
+      {toolbarOverflow && (
+        <DocxToolbarOverflowButton expanded={toolbarOpen} onToggle={() => setToolbarExpanded((v) => !v)} />
+      )}
+      <DocxContentsButton editorRef={editorRef} />
+      <DocxZoomControl zoom={zoom} onZoom={applyZoom} onFit={fitWidth} />
     </div>
   );
 }

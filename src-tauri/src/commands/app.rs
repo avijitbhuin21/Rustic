@@ -14,13 +14,86 @@ fn remote_window_label(base: &str) -> String {
     format!("{REMOTE_WINDOW_LABEL}-{hex}")
 }
 
-/// Trimmed, validated `http(s)://` base URL.
+/// Whether plain HTTP to `host` stays on this machine or the local network
+/// (loopback, private, link-local and CGNAT/Tailscale addresses, `localhost`,
+/// `.local` and single-label names).
+fn is_local_network_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || (o[0] == 100 && (64..=127).contains(&o[1]))
+            }
+            std::net::IpAddr::V6(v6) => {
+                let first = v6.segments()[0];
+                v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || !host.contains('.')
+}
+
+/// Trimmed, validated base URL: `https://` anywhere, `http://` only on this
+/// machine or the local network. Over plain HTTP the password, the session and
+/// everything the server sends are readable and replaceable in transit.
 fn remote_base(url: &str) -> Result<String, String> {
     let base = url.trim().trim_end_matches('/').to_string();
     if !base.starts_with("http://") && !base.starts_with("https://") {
         return Err("URL must start with http:// or https://".into());
     }
+    let parsed = tauri::Url::parse(&base).map_err(|e| format!("Invalid URL: {e}"))?;
+    let host = parsed.host_str().ok_or("URL has no host")?;
+    if parsed.scheme() == "http" && !is_local_network_host(host) {
+        return Err(format!(
+            "{host} is not on this machine or the local network, so it must be reached over https://"
+        ));
+    }
     Ok(base)
+}
+
+#[cfg(test)]
+mod remote_base_tests {
+    use super::remote_base;
+
+    #[test]
+    fn plain_http_is_local_network_only() {
+        for url in [
+            "https://rustic.example.com",
+            "https://1.2.3.4:8787/",
+            "http://localhost:8787",
+            "http://127.0.0.1:8787",
+            "http://[::1]:8787",
+            "http://192.168.1.20:8787",
+            "http://10.0.0.5",
+            "http://100.101.102.103:8787",
+            "http://mybox:8787",
+            "http://mybox.local:8787",
+        ] {
+            assert!(remote_base(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://rustic.example.com",
+            "http://1.2.3.4:8787",
+            "http://192.168.1.20.example.com",
+            "http://localhost.example.com",
+            "ftp://localhost",
+            "rustic.example.com",
+        ] {
+            assert!(remote_base(url).is_err(), "{url}");
+        }
+        assert_eq!(
+            remote_base(" https://a.example.com/ ").unwrap(),
+            "https://a.example.com"
+        );
+    }
 }
 
 /// Return the absolute path to the rotating-log directory, so the frontend
@@ -295,10 +368,7 @@ pub fn remote_backend_open_urls(app: AppHandle) -> Vec<String> {
 /// webview's CORS policy can't get in the way.
 #[tauri::command]
 pub async fn remote_backend_test(url: String, password: String) -> Result<String, String> {
-    let base = url.trim().trim_end_matches('/').to_string();
-    if !base.starts_with("http://") && !base.starts_with("https://") {
-        return Err("URL must start with http:// or https://".into());
-    }
+    let base = remote_base(&url)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()

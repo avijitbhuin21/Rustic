@@ -42,19 +42,22 @@ import { cn } from '@/lib/utils';
 
 const EMPTY = [];
 
-function PlanStatusIcon({ status }) {
+function PlanStatusIcon({ status, live }) {
   if (status === 'completed') {
     return <CheckCircle2 className="size-3.5 shrink-0 text-success" />;
   }
   if (status === 'in_progress') {
-    return (
+    // Nothing is working on the item once the run stopped or ended.
+    return live ? (
       <CircleDotDashed className="size-3.5 shrink-0 animate-spin text-info [animation-duration:3s]" />
+    ) : (
+      <CircleDotDashed className="size-3.5 shrink-0 text-muted-foreground" />
     );
   }
   return <Circle className="size-3.5 shrink-0 text-muted-foreground/60" />;
 }
 
-function PlanContent({ todos }) {
+function PlanContent({ todos, live }) {
   if (!todos || todos.length === 0) {
     return (
       <EmptyState
@@ -78,7 +81,7 @@ function PlanContent({ todos }) {
           )}
         >
           <span className="pt-0.5">
-            <PlanStatusIcon status={t.status} />
+            <PlanStatusIcon status={t.status} live={live} />
           </span>
           <span className="min-w-0 flex-1 whitespace-pre-wrap break-words leading-relaxed">
             {t.content}
@@ -570,6 +573,12 @@ export function AgentToolDock() {
   const todos = useAgent((s) =>
     activeTaskId ? s.todosByTask[activeTaskId] || EMPTY : EMPTY,
   );
+  // Running its own turn, or parked while its sub-agents work.
+  const planLive = useAgent((s) => {
+    if (!activeTaskId) return false;
+    if (s.streamingByTask[activeTaskId]) return true;
+    return String(s.statusByTask[activeTaskId] || '').toLowerCase() === 'waitingonsubagents';
+  });
   const fileEntries = useAgent((s) =>
     activeTaskId ? s.filesByTask[activeTaskId]?.entries || EMPTY : EMPTY,
   );
@@ -1042,7 +1051,7 @@ export function AgentToolDock() {
               className="overflow-hidden"
             >
               <div className="max-h-[40vh] overflow-y-auto border-t border-border/40">
-                {activeTab === 'plan' && <PlanContent todos={todos} />}
+                {activeTab === 'plan' && <PlanContent todos={todos} live={planLive} />}
                 {activeTab === 'files' && (
                   <FilesContent
                     entries={fileEntries}

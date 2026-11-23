@@ -527,6 +527,9 @@ async fn create_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
             thinking_tier: None,
             pinned: false,
             goal: None,
+            goal_turns: 0,
+            goal_status: None,
+            goal_reason: None,
         };
 
         let permissions = if let Some(ref perm_str) = project_defaults.permission_level {
@@ -935,21 +938,21 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                     // Supersession check + in-memory history sync under ONE
                     // lock, so a mid-run send snapshots everything produced so
                     // far (parity with the desktop host).
+                    // Copied before the lock is taken: see `sync_history_if_current`.
+                    let snapshot = msgs.to_vec();
                     if let Ok(mut agent) = persist_agent_arc.lock() {
                         if rustic_app::host_ops::agent_history::sync_history_if_current(
                             &mut agent,
                             &persist_task_id,
                             &persist_cancel_token,
-                            msgs,
+                            snapshot,
                         ) {
                             tracing::info!(target: "rustic::persist", task = %persist_task_id, "persist callback: skipped — superseded by a newer run");
                             return;
                         }
                     }
-                    let Ok(db) = persist_db_arc.lock() else {
-                        tracing::error!(target: "rustic::persist", task = %persist_task_id, "persist callback: db lock failed — messages NOT saved");
-                        return;
-                    };
+                    // Rows are built before the database lock is taken, so the
+                    // lock is held only for the write itself.
                     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let mut rows = Vec::with_capacity(msgs.len());
                     for (i, msg) in msgs.iter().enumerate() {
@@ -975,6 +978,10 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                             turn_usage_json: None,
                         });
                     }
+                    let Ok(db) = persist_db_arc.lock() else {
+                        tracing::error!(target: "rustic::persist", task = %persist_task_id, "persist callback: db lock failed — messages NOT saved");
+                        return;
+                    };
                     match db.upsert_messages_for_task(&persist_task_id, &rows) {
                         Ok(()) => {}
                         Err(e) => {
@@ -1110,6 +1117,8 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
 
             // event-forwarding loop
             let ctx_events = ctx_thread.clone();
+            let status_agent_arc = Arc::clone(&agent_arc);
+            let status_cancel_token = Arc::clone(&cancel_token);
             let cost_map = Arc::clone(&task_costs_arc);
             let cost_db = Arc::clone(&db_arc);
             let thinking_start: Arc<std::sync::Mutex<Option<std::time::Instant>>> =
@@ -1124,8 +1133,18 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             let mut subagent_costs: std::collections::HashMap<(String, String), TaskCost> =
                 std::collections::HashMap::new();
             let mut event_rx = rustic_app::host_ops::stream_coalesce::batch_deltas(event_rx);
+            let output_db = Arc::clone(&cost_db);
+            let mut subagent_output =
+                rustic_app::host_ops::stream_coalesce::SubagentOutputWriter::new(
+                    move |task_id, agent_id, text| {
+                        if let Ok(db) = output_db.lock() {
+                            let _ = db.append_subagent_output(task_id, agent_id, text);
+                        }
+                    },
+                );
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
+                    subagent_output.before(&event);
                     match event {
                         TaskEvent::TextDelta { task_id, text } => {
                             if let Ok(mut start) = thinking_start.lock() {
@@ -1181,7 +1200,21 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                             ctx_events.emit("agent-tool-result", AgentToolResultEvent { task_id, tool_use_id, output, is_error });
                         }
                         TaskEvent::StatusChange { task_id, status } => {
-                            ctx_events.emit("agent-task-status", AgentStatusEvent { task_id, status });
+                            // Parity with the desktop host: a run replaced by a
+                            // newer send no longer speaks for the task.
+                            let stale = status_agent_arc
+                                .lock()
+                                .map(|agent| {
+                                    rustic_app::host_ops::agent_history::run_superseded(
+                                        &agent,
+                                        &task_id,
+                                        &status_cancel_token,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if !stale {
+                                ctx_events.emit("agent-task-status", AgentStatusEvent { task_id, status });
+                            }
                         }
                         TaskEvent::TaskComplete { task_id, summary } => {
                             ctx_events.emit("agent-task-complete", AgentTaskCompleteEvent { task_id, summary });
@@ -1330,9 +1363,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                             ctx_events.emit("agent-subagent-failed", AgentSubagentFailedEvent { task_id, agent_id, error });
                         }
                         TaskEvent::SubagentTextDelta { task_id, agent_id, text } => {
-                            if let Ok(db) = cost_db.lock() {
-                                let _ = db.append_subagent_output(&task_id, &agent_id, &text);
-                            }
+                            subagent_output.push(&task_id, &agent_id, &text);
                             ctx_events.emit("agent-subagent-text-delta", AgentSubagentTextDeltaEvent { task_id, agent_id, text });
                         }
                         TaskEvent::SubagentThinkingDelta { task_id, agent_id, text } => {
@@ -1441,9 +1472,20 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                             // The executor already cleared the in-memory slot on
                             // "met"; mirror that into the DB so the goal doesn't
                             // resurrect on the next server start.
-                            if status == "met" {
-                                if let Ok(db) = cost_db.lock() {
+                            // Every other status records where the loop
+                            // stands, so a restart shows the same turn count
+                            // and a blocked goal stays blocked.
+                            if let Ok(db) = cost_db.lock() {
+                                if status == "met" {
                                     let _ = db.update_task_goal(&task_id, None);
+                                } else {
+                                    let blocked = status == "blocked";
+                                    let _ = db.update_task_goal_progress(
+                                        &task_id,
+                                        turns,
+                                        blocked.then_some("blocked"),
+                                        if blocked { reason.as_deref() } else { None },
+                                    );
                                 }
                             }
                             ctx_events.emit("agent-goal-update", AgentGoalUpdateEvent { task_id, status, condition, turns, reason });
@@ -1495,12 +1537,13 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             // window where a concurrent send could interleave). The DB write
             // stays outside the lock; a stale write is self-healing because
             // the newer run re-persists at every stable point.
+            let snapshot = messages.clone();
             let superseded = match agent_arc.lock() {
                 Ok(mut agent) => rustic_app::host_ops::agent_history::sync_history_if_current(
                     &mut agent,
                     &task_id_clone,
                     &cancel_token,
-                    &messages,
+                    snapshot,
                 ),
                 Err(_) => false,
             };
@@ -1603,7 +1646,9 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                 });
             }
 
-            {
+            // A run replaced by a newer send reports nothing (parity with the
+            // desktop host): the task now belongs to that run.
+            let stale_run = {
                 let status_str = match final_status {
                     TaskStatus::Preparing => "Preparing",
                     TaskStatus::Completed => "Completed",
@@ -1612,20 +1657,37 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                     TaskStatus::Running => "Running",
                     TaskStatus::WaitingOnSubagents => "Waiting",
                 };
-                if let Ok(db) = db_arc.lock() {
-                    let _ = db.update_task_status(&task_id_clone, status_str);
-                }
-                if let Ok(mut agent) = agent_arc.lock() {
-                    if let Some(t) = agent.tasks.get_mut(&task_id_clone) {
-                        t.info.status = final_status;
+                let stale = match agent_arc.lock() {
+                    Ok(mut agent) => {
+                        if rustic_app::host_ops::agent_history::run_superseded(
+                            &agent,
+                            &task_id_clone,
+                            &cancel_token,
+                        ) {
+                            true
+                        } else {
+                            if let Some(t) = agent.tasks.get_mut(&task_id_clone) {
+                                t.info.status = final_status;
+                            }
+                            false
+                        }
+                    }
+                    Err(_) => false,
+                };
+                if !stale {
+                    if let Ok(db) = db_arc.lock() {
+                        let _ = db.update_task_status(&task_id_clone, status_str);
                     }
                 }
-            }
+                stale
+            };
 
-            ctx_thread.emit("agent-task-status", AgentStatusEvent {
-                task_id: task_id_clone.clone(),
-                status: final_status,
-            });
+            if !stale_run {
+                ctx_thread.emit("agent-task-status", AgentStatusEvent {
+                    task_id: task_id_clone.clone(),
+                    status: final_status,
+                });
+            }
 
             // Park watcher: auto-resumes the task when a child completes,
             // fails, or escalates (see watch_subagents_and_resume).
@@ -1951,6 +2013,9 @@ fn build_turn_prep(
             thinking_tier: None,
             pinned: false,
             goal: None,
+            goal_turns: 0,
+            goal_status: None,
+            goal_reason: None,
         })
         .map_err(|e| format!("Failed to persist task: {}", e))?;
     }
@@ -2616,6 +2681,7 @@ async fn delete_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
     let a: TaskIdArg = crate::api::parse(args)?;
     let task_id = a.task_id;
     let state = ctx.state();
+    crate::commands::terminal::close_task_terminals(ctx, &task_id);
 
     {
         let agent = state.agent.lock_safe();
@@ -2682,6 +2748,9 @@ async fn delete_tasks_for_project(ctx: &ServerContext, args: &Value) -> Result<V
             .map(|(id, _)| id.clone())
             .collect()
     };
+    for tid in &project_task_ids {
+        crate::commands::terminal::close_task_terminals(ctx, tid);
+    }
     {
         let agent = state.agent.lock_safe();
         for tid in &project_task_ids {
@@ -2797,6 +2866,9 @@ fn set_task_goal(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
         let mut agent = state.agent.lock_safe();
         if let Some(task) = agent.tasks.get_mut(&a.task_id) {
             task.info.goal = goal.clone();
+            task.info.goal_turns = 0;
+            task.info.goal_status = None;
+            task.info.goal_reason = None;
             if let Ok(mut slot) = task.goal.lock() {
                 *slot = goal
                     .clone()

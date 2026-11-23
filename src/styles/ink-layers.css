@@ -1,0 +1,289 @@
+/* Vendored verbatim from Looseleaf (src/styles/looseleaf.css, commit 4bdb647, MIT;
+   see src/lib/ink/VENDORED.md). Shows / hides the pre-drawn ink layers from the
+   host's own state (:hover, :active, :focus-visible, data-state, aria-*). It only
+   matches `svg[data-ink]` / `[data-ink-host]`, which exist only while a theme
+   with `style.ink` is active. Do not edit: re-run the extraction instead. */
+@layer components {
+  svg[data-ink] {
+    overflow: visible;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    isolation: isolate;
+  }
+
+  :where([data-ink-host], .ll-ink-host) {
+    position: relative;
+    isolation: isolate;
+  }
+
+  :where(svg[data-ink] [data-layer]:not([data-layer="rest"])) {
+    opacity: 0;
+    visibility: hidden;
+    transform-box: fill-box;
+    transform-origin: 50% 50%;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      scale var(--ll-dur-press) var(--ll-ease-out),
+      rotate var(--ll-dur-press) var(--ll-ease-out),
+      translate var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s linear var(--ll-dur-press);
+  }
+  :where(svg[data-ink] [data-layer="checked"], svg[data-ink] [data-layer="indeterminate"]) {
+    scale: 0.9;
+    rotate: -3deg;
+  }
+  :where(svg[data-ink] [data-hide-on]) {
+    transition:
+      opacity var(--ll-dur-fade) var(--ll-ease-out),
+      visibility 0s;
+  }
+  :where(svg[data-ink]) {
+    transition: rotate var(--ll-dur-hover) var(--ll-ease-settle);
+  }
+  :where(svg[data-ink] [data-part], svg[data-ink] [data-layer="rest"]) {
+    transition: translate var(--ll-dur-hover) var(--ll-ease-settle);
+  }
+  svg[data-ink]:not(:has([data-layer="rest"])) :is([data-layer="disabled"], [data-layer="invalid"], [data-layer="checked"], [data-layer="indeterminate"], [data-layer="open"], [data-layer="busy"]) {
+    opacity: 1;
+    visibility: visible;
+    scale: none;
+    rotate: none;
+  }
+  svg[data-ink] [data-layer][data-on]:not([data-layer="rest"]) {
+    opacity: 1;
+    visibility: visible;
+    scale: none;
+    rotate: none;
+  }
+
+  @media (hover: hover) {
+    :hover:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))) > svg[data-ink] [data-layer="hover"] {
+      opacity: 1;
+      visibility: visible;
+      transition:
+        opacity var(--ll-dur-fade) var(--ll-ease-out),
+        visibility 0s;
+    }
+    :hover:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))) > svg[data-ink]:where(:has([data-layer="hover"]):not([data-still])) {
+      rotate: var(--ll-hover-tilt);
+    }
+    :hover:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))) > svg[data-ink]:where(:has([data-layer="hover"])) [data-part="fill"] {
+      translate: calc(var(--mx, 0) * var(--ll-hover-misreg) * 1px) calc(var(--my, 0) * var(--ll-hover-misreg) * 1px);
+    }
+    :hover:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))) > svg[data-ink] [data-hide-on~="hover"] {
+      opacity: 0;
+      visibility: hidden;
+      transition:
+        opacity var(--ll-dur-press) var(--ll-ease-out),
+        visibility 0s linear var(--ll-dur-press);
+    }
+  }
+
+  [data-hover]:not([data-hover="false"]):where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))) > svg[data-ink] [data-layer="hover"] {
+    opacity: 1;
+    visibility: visible;
+  }
+  [data-hover]:not([data-hover="false"]):where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))) > svg[data-ink]:where(:has([data-layer="hover"]):not([data-still])) {
+    rotate: var(--ll-hover-tilt);
+  }
+  [data-hover]:not([data-hover="false"]):where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))) > svg[data-ink]:where(:has([data-layer="hover"])) [data-part="fill"] {
+    translate: calc(var(--mx, 0) * var(--ll-hover-misreg) * 1px) calc(var(--my, 0) * var(--ll-hover-misreg) * 1px);
+  }
+
+  :is(:active:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))), [data-pressed]:not([data-pressed="false"])) > svg[data-ink] [data-layer="pressed"] {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s;
+  }
+  :is(:active:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))), [data-pressed]:not([data-pressed="false"])) > svg[data-ink]:where(:has([data-layer="hover"]):not([data-still])) {
+    rotate: none;
+    transition: rotate var(--ll-dur-press) var(--ll-ease-out);
+  }
+  :is(:active:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))), [data-pressed]:not([data-pressed="false"])) > svg[data-ink] [data-part="fill"] {
+    translate: calc(var(--mx, 0) * var(--ll-press-misreg) * 1px) calc(var(--my, 0) * var(--ll-press-misreg) * 1px);
+    transition: translate var(--ll-dur-press) var(--ll-ease-out);
+  }
+  :is(:active:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))), [data-pressed]:not([data-pressed="false"])) > svg[data-ink] [data-layer="rest"] {
+    translate: calc(var(--ll-press-sink) * 0.6) var(--ll-press-sink);
+    transition: translate var(--ll-dur-press) var(--ll-ease-out);
+  }
+  [data-ink-sink="self"]:is(:active:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))), [data-pressed]:not([data-pressed="false"])) > svg[data-ink] [data-layer="rest"] {
+    translate: calc(var(--ll-press-sink) * 0.6) 0;
+  }
+  :is(:active:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))), [data-pressed]:not([data-pressed="false"])) > svg[data-ink] :is([data-layer="hover"], [data-hide-on~="pressed"]) {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s linear var(--ll-dur-press);
+  }
+
+  :is(:focus-visible, [data-focus-visible], :has(> :is(input, textarea, select):focus-visible), [data-ink-focus="within"]:has(:focus-visible)) > svg[data-ink] [data-layer="focus"] {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity var(--ll-dur-fade) var(--ll-ease-out),
+      visibility 0s;
+  }
+  :is(:focus-visible, [data-focus-visible], :has(> :is(input, textarea, select):focus-visible), [data-ink-focus="within"]:has(:focus-visible)) > svg[data-ink] [data-hide-on~="focus"] {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s linear var(--ll-dur-press);
+  }
+
+  :is(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]), :has(> :is(input, textarea, select, button):disabled)) > svg[data-ink] [data-layer="disabled"] {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity var(--ll-dur-fade) var(--ll-ease-out),
+      visibility 0s;
+  }
+  :is(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]), :has(> :is(input, textarea, select, button):disabled)) > svg[data-ink] [data-hide-on~="disabled"] {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s linear var(--ll-dur-press);
+  }
+
+  :is([data-invalid]:not([data-invalid="false"]), [aria-invalid="true"], :has(> :is(input, textarea, select)[aria-invalid="true"])) > svg[data-ink] [data-layer="invalid"] {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity var(--ll-dur-fade) var(--ll-ease-out),
+      visibility 0s;
+  }
+  :is([data-invalid]:not([data-invalid="false"]), [aria-invalid="true"], :has(> :is(input, textarea, select)[aria-invalid="true"])) > svg[data-ink] [data-hide-on~="invalid"] {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s linear var(--ll-dur-press);
+  }
+
+  :is([data-state="checked"], [data-state="on"], [data-state="active"], [aria-checked="true"], [aria-pressed="true"], [aria-selected="true"], [data-checked]:not([data-checked="false"]), [data-selected]:not([data-selected="false"]), :has(> input:checked)) > svg[data-ink] [data-layer="checked"] {
+    opacity: 1;
+    visibility: visible;
+    scale: none;
+    rotate: none;
+    transition:
+      opacity var(--ll-dur-fade) var(--ll-ease-out),
+      scale var(--ll-dur-pop) var(--ll-ease-pop),
+      rotate var(--ll-dur-pop) var(--ll-ease-pop),
+      visibility 0s;
+  }
+  :is([data-state="checked"], [data-state="on"], [data-state="active"], [aria-checked="true"], [aria-pressed="true"], [aria-selected="true"], [data-checked]:not([data-checked="false"]), [data-selected]:not([data-selected="false"]), :has(> input:checked)) > svg[data-ink] [data-hide-on~="checked"] {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s linear var(--ll-dur-press);
+  }
+
+  :is([data-state="indeterminate"], [aria-checked="mixed"], :has(> input:indeterminate)) > svg[data-ink] [data-layer="indeterminate"] {
+    opacity: 1;
+    visibility: visible;
+    scale: none;
+    rotate: none;
+    transition:
+      opacity var(--ll-dur-fade) var(--ll-ease-out),
+      scale var(--ll-dur-pop) var(--ll-ease-pop),
+      rotate var(--ll-dur-pop) var(--ll-ease-pop),
+      visibility 0s;
+  }
+  :is([data-state="indeterminate"], [aria-checked="mixed"], :has(> input:indeterminate)) > svg[data-ink] [data-hide-on~="indeterminate"] {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s linear var(--ll-dur-press);
+  }
+
+  :is([data-state="open"], [aria-expanded="true"]) > svg[data-ink] [data-layer="open"] {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity var(--ll-dur-fade) var(--ll-ease-out),
+      visibility 0s;
+  }
+  :is([data-state="open"], [aria-expanded="true"]) > svg[data-ink] [data-hide-on~="open"] {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s linear var(--ll-dur-press);
+  }
+
+  :is([aria-busy="true"], [data-loading]:not([data-loading="false"])) > svg[data-ink] [data-layer="busy"] {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity var(--ll-dur-fade) var(--ll-ease-out),
+      visibility 0s;
+  }
+  :is([aria-busy="true"], [data-loading]:not([data-loading="false"])) > svg[data-ink] [data-hide-on~="busy"] {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      visibility 0s linear var(--ll-dur-press);
+  }
+
+  [data-slot="paper-face"][data-layer] {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--ll-dur-press) var(--ll-ease-out),
+      rotate var(--ll-dur-sheet) var(--ll-ease-settle),
+      visibility 0s linear var(--ll-dur-press);
+  }
+  :is([data-state="checked"], [data-state="on"], [data-state="active"], [aria-checked="true"], [aria-pressed="true"], [aria-selected="true"], [data-checked]:not([data-checked="false"]), [data-selected]:not([data-selected="false"]), :has(> input:checked)) > [data-slot="paper-face"][data-layer="checked"],
+  :is([data-state="open"], [aria-expanded="true"]) > [data-slot="paper-face"][data-layer="open"] {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity var(--ll-dur-fade) var(--ll-ease-out),
+      rotate var(--ll-dur-sheet) var(--ll-ease-settle),
+      visibility 0s;
+  }
+  @media (hover: hover) {
+    :hover:where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))) > [data-slot="paper-face"][data-layer="hover"] {
+      opacity: 1;
+      visibility: visible;
+      transition:
+        opacity var(--ll-dur-fade) var(--ll-ease-out),
+        rotate var(--ll-dur-sheet) var(--ll-ease-settle),
+        visibility 0s;
+    }
+  }
+  [data-hover]:not([data-hover="false"]):where(:not(:disabled, [aria-disabled="true"], [data-disabled]:not([data-disabled="false"]))) > [data-slot="paper-face"][data-layer="hover"] {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  :is([data-ink-host], .ll-ink-host) {
+    outline: 1.5px solid var(--ll-pencil-mark);
+    outline-offset: -1.5px;
+  }
+  :is([data-ink-host], .ll-ink-host)[data-ink-ready] {
+    outline-color: transparent;
+  }
+  :is([data-ink-host], .ll-ink-host):focus-visible:not([data-ink-ready]),
+  :is([data-ink-host], .ll-ink-host)[data-ink-ready]:focus-visible:not(:has(> svg[data-ink] [data-layer="focus"])) {
+    outline: 2px solid var(--ll-focus);
+    outline-offset: 2px;
+  }
+
+  :is([data-ink-host], .ll-ink-host)[data-ink-ready]:has(> svg[data-ink] [data-layer="focus"]) > :is(input, textarea, select):focus-visible {
+    outline: none;
+  }
+
+  svg[data-ink="sheet"] {
+    rotate: clamp(calc(var(--ll-tilt-max) * -1), var(--ll-tilt, 0deg), var(--ll-tilt-max));
+  }
+}

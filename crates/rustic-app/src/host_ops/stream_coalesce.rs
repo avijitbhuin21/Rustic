@@ -10,6 +10,9 @@
 //! shapes are unchanged (strings are simply longer).
 //!
 //! Used by both hosts (src-tauri agent forward loop and rustic-server agent_chat).
+//!
+//! `SubagentOutputWriter` batches further on the storage side: the merged
+//! sub-agent text is written to the database a few times a second.
 
 use std::time::Duration;
 
@@ -163,6 +166,216 @@ pub fn batch_deltas(mut rx: Receiver<TaskEvent>) -> Receiver<TaskEvent> {
         }
     });
     out
+}
+
+/// How long streamed sub-agent text may wait before it is written.
+const OUTPUT_FLUSH_AFTER: Duration = Duration::from_millis(300);
+/// Buffered sub-agent text is written once it reaches this size, whatever its age.
+const OUTPUT_FLUSH_BYTES: usize = 4096;
+
+struct PendingOutput {
+    task_id: String,
+    agent_id: String,
+    text: String,
+    since: Instant,
+}
+
+/// Persists streamed sub-agent text in batches.
+///
+/// Storing each delta appends to one growing column, and SQLite rewrites the
+/// whole value every time: a long sub-agent reply cost one full rewrite per
+/// delta, many times a second, each under the database lock. Text is held
+/// here instead and written through `sink(task_id, agent_id, text)` when it is
+/// 300 ms old or 4 KB long, before any other persisted event of the same
+/// sub-agent (so stored text and tool calls stay in order), and when the
+/// writer is dropped at the end of the run. A crash loses at most that tail.
+/// Writes one batch: `(task_id, agent_id, text)`.
+type OutputSink = Box<dyn FnMut(&str, &str, &str) + Send>;
+
+pub struct SubagentOutputWriter {
+    sink: OutputSink,
+    pending: Vec<PendingOutput>,
+}
+
+impl SubagentOutputWriter {
+    pub fn new(sink: impl FnMut(&str, &str, &str) + Send + 'static) -> Self {
+        Self {
+            sink: Box::new(sink),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Buffer streamed text of one sub-agent.
+    pub fn push(&mut self, task_id: &str, agent_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match self
+            .pending
+            .iter_mut()
+            .find(|p| p.task_id == task_id && p.agent_id == agent_id)
+        {
+            Some(p) => p.text.push_str(text),
+            None => self.pending.push(PendingOutput {
+                task_id: task_id.to_string(),
+                agent_id: agent_id.to_string(),
+                text: text.to_string(),
+                since: Instant::now(),
+            }),
+        }
+    }
+
+    /// Write whatever is due. Call before handling each event of the run.
+    pub fn before(&mut self, next: &TaskEvent) {
+        self.flush_due(next, Instant::now());
+    }
+
+    fn flush_due(&mut self, next: &TaskEvent, now: Instant) {
+        use TaskEvent::*;
+        // Events whose own write must land after the sub-agent's buffered text.
+        let settles = match next {
+            SubagentCompleted {
+                task_id, agent_id, ..
+            }
+            | SubagentFailed {
+                task_id, agent_id, ..
+            }
+            | SubagentToolUse {
+                task_id, agent_id, ..
+            }
+            | SubagentToolResult {
+                task_id, agent_id, ..
+            } => Some((task_id.as_str(), agent_id.as_str())),
+            _ => None,
+        };
+        let mut i = 0;
+        while i < self.pending.len() {
+            let p = &self.pending[i];
+            let due = p.text.len() >= OUTPUT_FLUSH_BYTES
+                || now.duration_since(p.since) >= OUTPUT_FLUSH_AFTER
+                || settles == Some((p.task_id.as_str(), p.agent_id.as_str()));
+            if due {
+                let p = self.pending.remove(i);
+                (self.sink)(&p.task_id, &p.agent_id, &p.text);
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+impl Drop for SubagentOutputWriter {
+    fn drop(&mut self) {
+        for p in std::mem::take(&mut self.pending) {
+            (self.sink)(&p.task_id, &p.agent_id, &p.text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_writer_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    type Written = Arc<Mutex<Vec<(String, String, String)>>>;
+
+    fn writer() -> (SubagentOutputWriter, Written) {
+        let written: Written = Arc::default();
+        let sink = Arc::clone(&written);
+        let w = SubagentOutputWriter::new(move |t, a, text| {
+            sink.lock().unwrap().push((t.into(), a.into(), text.into()));
+        });
+        (w, written)
+    }
+
+    fn other() -> TaskEvent {
+        TaskEvent::TextDelta {
+            task_id: "t".into(),
+            text: "x".into(),
+        }
+    }
+
+    fn tool_use(agent: &str) -> TaskEvent {
+        TaskEvent::SubagentToolUse {
+            task_id: "t".into(),
+            agent_id: agent.into(),
+            tool_name: "read_file".into(),
+            tool_use_id: "u".into(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn text_is_batched_until_it_is_old_or_large() {
+        let (mut w, written) = writer();
+        let start = Instant::now();
+        for piece in ["a", "b", "c"] {
+            w.push("t", "one", piece);
+        }
+        w.flush_due(&other(), start + Duration::from_millis(100));
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "young and small: still buffered"
+        );
+
+        w.flush_due(&other(), start + Duration::from_millis(400));
+        assert_eq!(
+            *written.lock().unwrap(),
+            vec![("t".to_string(), "one".to_string(), "abc".to_string())],
+            "one write for the three deltas"
+        );
+
+        w.push("t", "one", &"z".repeat(OUTPUT_FLUSH_BYTES));
+        w.flush_due(&other(), Instant::now());
+        assert_eq!(
+            written.lock().unwrap().len(),
+            2,
+            "large text is written at once"
+        );
+    }
+
+    #[test]
+    fn text_lands_before_the_same_agents_next_persisted_event() {
+        let (mut w, written) = writer();
+        w.push("t", "one", "before the tool call");
+        w.push("t", "two", "other agent");
+        w.flush_due(&tool_use("one"), Instant::now());
+        assert_eq!(
+            *written.lock().unwrap(),
+            vec![(
+                "t".to_string(),
+                "one".to_string(),
+                "before the tool call".to_string()
+            )],
+            "only the agent whose event arrived is flushed"
+        );
+        w.flush_due(
+            &TaskEvent::SubagentFailed {
+                task_id: "t".into(),
+                agent_id: "two".into(),
+                error: "boom".into(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(written.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn nothing_is_lost_when_the_run_ends() {
+        let (mut w, written) = writer();
+        w.push("t", "one", "tail ");
+        w.push("t", "one", "of the reply");
+        w.push("t", "one", "");
+        drop(w);
+        assert_eq!(
+            *written.lock().unwrap(),
+            vec![(
+                "t".to_string(),
+                "one".to_string(),
+                "tail of the reply".to_string()
+            )]
+        );
+    }
 }
 
 #[cfg(test)]

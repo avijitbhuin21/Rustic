@@ -90,6 +90,52 @@ fn health_is_open() {
 }
 
 #[test]
+fn default_password_instance_answers_only_on_loopback_names() {
+    let get = |host: &'static str| {
+        req("GET", "/healthz")
+            .header("host", host)
+            .body(Body::empty())
+            .unwrap()
+    };
+    // The dev default password: a rebinding page's own host name is refused.
+    run("rustic", |app| async move {
+        for host in [
+            "localhost:8787",
+            "127.0.0.1:8787",
+            "[::1]:8787",
+            "LOCALHOST",
+        ] {
+            let resp = app.clone().oneshot(get(host)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{host}");
+        }
+        for host in [
+            "evil.example:8787",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example:8787",
+        ] {
+            let resp = app.clone().oneshot(get(host)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{host}");
+        }
+        let login = with_peer(
+            req("POST", "/login")
+                .header("host", "evil.example:8787")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"password":"rustic"}"#))
+                .unwrap(),
+        );
+        assert_eq!(
+            app.oneshot(login).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    });
+    // A real password is its own defence; a local reverse proxy may forward any host.
+    run("correct-horse", |app| async move {
+        let resp = app.oneshot(get("rustic.example.com")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    });
+}
+
+#[test]
 fn api_requires_auth() {
     run("pw", |app| async move {
         let resp = app
@@ -624,4 +670,124 @@ fn mcp_list_returns_before_servers_connect_and_pushes_their_status() {
     drop(shared);
     drop(rt);
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// POST an authed API command and return the response.
+async fn api_call(
+    app: &axum::Router,
+    token: &str,
+    command: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            req("POST", &format!("/api/{command}"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Film view: the session id is the only credential for `/film`, hidden files stay
+/// unreachable, and a film page (no cookie, `Origin: null`) cannot call the API.
+#[test]
+fn film_session_serves_by_id_only_and_api_rejects_null_origin() {
+    run("pw", |app| async move {
+        let token = login_token(&app, "pw").await;
+        let dir = std::env::temp_dir().join(format!(
+            "rustic-it-film-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("index.html");
+        std::fs::write(&page, "<html><head></head><body></body></html>").unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        let page_arg = serde_json::json!({ "path": page.to_string_lossy() });
+
+        // Not inside a project yet: refused.
+        let early = api_call(&app, &token, "film_open", page_arg.clone()).await;
+        assert_eq!(early.status(), StatusCode::BAD_REQUEST);
+
+        let added = api_call(
+            &app,
+            &token,
+            "add_project",
+            serde_json::json!({ "path": dir.to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(added.status(), StatusCode::OK);
+        let opened = api_call(&app, &token, "film_open", page_arg).await;
+        assert_eq!(opened.status(), StatusCode::OK);
+        let opened = body_json(opened).await;
+        let id = opened["id"].as_str().unwrap().to_string();
+        assert_eq!(opened["url"], format!("/film/{id}/@rustic/shell"));
+
+        // No cookie, no bearer, Origin: null — exactly what the sandboxed frame sends.
+        let get = |path: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    req("GET", &path)
+                        .header("host", "rustic.test")
+                        .header("origin", "null")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let shell = get(format!("/film/{id}/@rustic/shell")).await;
+        assert_eq!(shell.status(), StatusCode::OK);
+        let csp = shell.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("sandbox allow-scripts"));
+        assert!(csp.contains(&format!("frame-src rustic.test/film/{id}/")));
+
+        let html = get(format!("/film/{id}/index.html")).await;
+        assert_eq!(html.status(), StatusCode::OK);
+        let html = to_bytes(html.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&html).contains("@rustic/bridge.js"));
+
+        assert_eq!(
+            get(format!("/film/{id}/.env")).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get("/film/not-a-session/index.html".to_string())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // The same caller is turned away from the API even with a valid token.
+        let api = app
+            .clone()
+            .oneshot(
+                req("POST", "/api/list_projects")
+                    .header("host", "rustic.test")
+                    .header("origin", "null")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::FORBIDDEN);
+
+        let closed = api_call(&app, &token, "film_close", serde_json::json!({ "id": id })).await;
+        assert_eq!(closed.status(), StatusCode::OK);
+        assert_eq!(
+            get(format!("/film/{id}/index.html")).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }

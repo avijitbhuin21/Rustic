@@ -250,6 +250,12 @@ pub async fn remove_project(state: State<'_, AppState>, project_id: String) -> R
     if let Some(path) = project_path {
         let mut watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
         watcher.unwatch_project(&path);
+        drop(watcher);
+        // Free its parse trees and symbol index. A task still running there
+        // holds its own handle, and a later task rebuilds the index.
+        state
+            .workspace_services
+            .drop_project(std::path::Path::new(&path));
     }
 
     Ok(())
@@ -291,6 +297,9 @@ pub async fn prune_missing_projects(state: State<'_, AppState>) -> Result<Vec<Pr
         for p in &missing {
             watcher.unwatch_project(&p.root_path.to_string_lossy());
         }
+    }
+    for p in &missing {
+        state.workspace_services.drop_project(&p.root_path);
     }
 
     Ok(missing)

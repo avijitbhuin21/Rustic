@@ -5,6 +5,8 @@ import { isTauriAvailable } from '@/lib/platform';
 import { toast } from 'sonner';
 import { notifyTaskEvent, primeNotificationPermission } from '@/lib/task-notify';
 import { confirm } from '@/components/confirm-dialog';
+import { settleRunMessages } from '@/lib/settle-run';
+import { parsePartialJson } from '@/lib/partial-json';
 
 // IMPORTANT: these names must match the strings the Rust backend passes to
 // app.emit(...) in src-tauri/src/commands/agent/mod.rs (and stream_coalesce.rs).
@@ -98,6 +100,39 @@ const pendingDeltas = new Map(); // taskId -> { kind: 'text' | 'thinking', buf, 
 // input still arrives whole on `agent-tool-use`.
 const TOOL_INPUT_PARSE_MS = 200;
 const toolInputParseAt = new Map(); // toolUseId -> last parse timestamp
+// toolUseId -> { taskId, text }: raw partial input JSON received so far. Kept
+// out of the store (nothing renders it) and dropped when the call's input is
+// complete or its run is settled.
+const toolInputBuffers = new Map();
+
+/** Forget the streamed input of one tool call. */
+function dropToolInputBuffer(toolUseId) {
+  toolInputParseAt.delete(toolUseId);
+  toolInputBuffers.delete(toolUseId);
+}
+
+/** Forget every streamed input of a task whose run ended without finishing them. */
+function dropToolInputBuffersForTask(taskId) {
+  for (const [toolUseId, entry] of toolInputBuffers) {
+    if (entry.taskId === taskId) dropToolInputBuffer(toolUseId);
+  }
+}
+
+// The chat list labels each row with the time of the last entry in its thread.
+// Streaming fires many events a second and each stamp re-renders the task
+// tree, so stamp at most once per interval; the run's terminal status always
+// stamps the final value.
+const ACTIVITY_TOUCH_MS = 10_000;
+const lastActivityTouch = new Map(); // taskId -> last stamp (epoch ms)
+
+/** Stamp the cached task record's updated_at for a live thread entry, throttled per task unless `force`. */
+function touchTaskActivity(taskId, force = false) {
+  if (!taskId) return;
+  const now = Date.now();
+  if (!force && now - (lastActivityTouch.get(taskId) || 0) < ACTIVITY_TOUCH_MS) return;
+  lastActivityTouch.set(taskId, now);
+  useAgent.getState()._patchTaskRecord(taskId, { updated_at: new Date(now).toISOString() });
+}
 
 function flushPendingDeltas(taskId) {
   const p = pendingDeltas.get(taskId);
@@ -649,7 +684,10 @@ function subagentRecordToLive(record) {
       // whole hydration. The text + summary still render.
     }
   }
+  // A finished child's call without a result was cut off, not still running.
+  const finished = (record.status || 'completed') !== 'running';
   for (const tc of toolCalls) {
+    const hasResult = tc.result !== null && tc.result !== undefined;
     messages.push({
       id: `sub-tool-${tc.tool_use_id}`,
       role: 'assistant',
@@ -659,11 +697,12 @@ function subagentRecordToLive(record) {
           id: tc.tool_use_id,
           name: tc.tool_name,
           input: tc.input,
+          ...(finished && !hasResult ? { interrupted: true } : {}),
         },
       ],
       timestamp: tsUpdated,
     });
-    if (tc.result !== null && tc.result !== undefined) {
+    if (hasResult) {
       messages.push({
         id: `sub-tool-result-${tc.tool_use_id}`,
         role: 'tool',
@@ -736,6 +775,15 @@ function subagentRecordToLive(record) {
 // can ask for the same block in the same frame (a card re-rendering while its
 // fetch is still open would otherwise re-issue it every time).
 const blockCache = new Map();
+
+// Prompts that are asked every time: secrets files and extension changes. The
+// backend never session-allows them, so "always allow" must not either.
+const NEVER_REMEMBERED_PERMISSIONS = /^(sensitive_file_|install_|uninstall_|download_)/;
+
+/** Whether an approval for `operation` may be remembered for the rest of the task. */
+export function canRememberPermission(operation) {
+  return !!operation && !NEVER_REMEMBERED_PERMISSIONS.test(operation);
+}
 
 export function fetchMessageBlock(taskId, sortOrder, blockIndex) {
   if (!taskId || typeof sortOrder !== 'number' || typeof blockIndex !== 'number') {
@@ -844,14 +892,6 @@ export const useAgent = create((set, get) => ({
   // error resets the count; MAX_AUTO_REPAIRS attempts on the same one and we
   // stop trying and leave the banner for the user.
   repairAttemptsByTask: {},
-  // Buffer of in-progress tool_use input JSON during streaming. The provider
-  // emits tool-use-input-delta fragments which we concatenate here keyed by
-  // tool_use_id. On each delta we attempt a tolerant JSON.parse — when it
-  // succeeds (rare mid-stream, but free) the parsed object is mirrored
-  // onto the message's tool_use block so the user sees the input fill in
-  // live. Cleared when tool-use-stop fires (or on the canonical tool-use
-  // event that follows from the executor with the authoritative parse).
-  streamingToolInputs: {}, // tool_use_id -> raw partial JSON string
   // Per-task accumulated set of files the agent has touched. Live updates
   // arrive via agent-file-tracked (just paths, no stats yet); the richer
   // hydration call (fh_list_task_net_changes) populates the full per-entry
@@ -1373,69 +1413,42 @@ export const useAgent = create((set, get) => ({
   },
 
   accumulateToolInputDelta: (taskId, toolUseId, partialJson) => {
+    // Fragments are collected outside the store: a store write per fragment
+    // woke every subscriber for text nothing renders.
+    const updated = (toolInputBuffers.get(toolUseId)?.text || '') + partialJson;
+    toolInputBuffers.set(toolUseId, { taskId, text: updated });
+
+    const now = Date.now();
+    if (now - (toolInputParseAt.get(toolUseId) || 0) < TOOL_INPUT_PARSE_MS) return;
+    toolInputParseAt.set(toolUseId, now);
+
+    // The input is one JSON object that is only complete with its last
+    // fragment, so read what is certain so far and show that.
+    const parsed = parsePartialJson(updated);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+
     set((s) => {
-      const buffer = s.streamingToolInputs[toolUseId] || '';
-      const updated = buffer + partialJson;
-
-      const now = Date.now();
-      const lastAt = toolInputParseAt.get(toolUseId) || 0;
-      if (now - lastAt < TOOL_INPUT_PARSE_MS) {
-        return {
-          streamingToolInputs: { ...s.streamingToolInputs, [toolUseId]: updated },
-        };
-      }
-      toolInputParseAt.set(toolUseId, now);
-
-      // Optimistic parse: if it succeeds, update the message's tool_use block
-      // immediately so the user sees the input fill in live.
-      let parsed = null;
-      try {
-        parsed = JSON.parse(updated);
-      } catch {
-        // Incomplete JSON, leave it buffered
-      }
-
-      if (parsed) {
-        // Update the tool_use message in place
-        const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
-        const idx = list.findIndex((m) => m.id === `tool-${toolUseId}`);
-        if (idx >= 0) {
-          const msg = list[idx];
-          const block = msg.content[0];
-          if (block && block.type === 'tool_use') {
-            list[idx] = {
-              ...msg,
-              content: [{ ...block, input: parsed }],
-            };
-          }
-        }
-        return {
-          streamingToolInputs: { ...s.streamingToolInputs, [toolUseId]: updated },
-          messagesByTask: { ...s.messagesByTask, [taskId]: list },
-        };
-      }
-      
-      return {
-        streamingToolInputs: { ...s.streamingToolInputs, [toolUseId]: updated },
-      };
+      const current = s.messagesByTask[taskId];
+      const idx = current ? current.findIndex((m) => m.id === `tool-${toolUseId}`) : -1;
+      const block = idx >= 0 ? current[idx].content[0] : null;
+      if (!block || block.type !== 'tool_use') return s;
+      const list = [...current];
+      list[idx] = { ...current[idx], content: [{ ...block, input: parsed }] };
+      return { messagesByTask: { ...s.messagesByTask, [taskId]: list } };
     });
   },
 
   finalizeToolInputStreaming: (taskId, toolUseId) => {
-    toolInputParseAt.delete(toolUseId);
+    dropToolInputBuffer(toolUseId);
     set((s) => {
-      const next = { ...s.streamingToolInputs };
-      delete next[toolUseId];
-      
       // Mark the tool_use message as no longer streaming
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
       const idx = list.findIndex((m) => m.id === `tool-${toolUseId}`);
       if (idx >= 0) {
         list[idx] = { ...list[idx], streaming: false };
       }
-      
+
       return {
-        streamingToolInputs: next,
         messagesByTask: { ...s.messagesByTask, [taskId]: list },
       };
     });
@@ -1448,28 +1461,23 @@ export const useAgent = create((set, get) => ({
   // forever because no `agent-thinking-done`/`agent-task-complete` event ever
   // arrives for the abandoned run. We close every open thinking block and
   // stop every streaming message so the prior turn renders as settled.
-  settleStreamAnimations: (taskId) => {
+  //
+  // `stopped: true` is for a run that was cut short (Stop, a superseding
+  // send, a cancelled/failed status). The backend pairs the abandoned tool
+  // calls with "[interrupted]" results in the persisted history but emits no
+  // result event for them, so their cards would spin until a reload; flag
+  // them (and the open thinking block) as interrupted instead. A real result
+  // arriving afterwards still wins.
+  settleStreamAnimations: (taskId, { stopped = false } = {}) => {
     // Land any buffered deltas before settling so the abandoned turn keeps
     // every token it actually received.
     flushPendingDeltas(taskId);
+    dropToolInputBuffersForTask(taskId);
     set((s) => {
-      const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
-      let touched = false;
-      const nextList = list.map((m) => {
-        const content = m.content || [];
-        let blockTouched = false;
-        const nextContent = content.map((b) =>
-          b && b.type === 'thinking' && !b.done
-            ? ((blockTouched = true), { ...b, done: true })
-            : b,
-        );
-        if (m.streaming || blockTouched) {
-          touched = true;
-          return { ...m, streaming: false, content: nextContent };
-        }
-        return m;
-      });
-      if (!touched) return s;
+      const list = s.messagesByTask[taskId];
+      if (!list) return s;
+      const nextList = settleRunMessages(list, { stopped });
+      if (nextList === list) return s;
       return {
         messagesByTask: { ...s.messagesByTask, [taskId]: nextList },
       };
@@ -1689,9 +1697,10 @@ export const useAgent = create((set, get) => ({
       const taskMap = s.subagentsByTask[taskId] || {};
       const sub = taskMap[agentId];
       if (!sub) return s;
-      const list = (sub.messages || []).map((m) =>
-        m.role === 'assistant' && m.streaming ? { ...m, streaming: false } : m,
-      );
+      // The child is done, so a tool call still without a result will never
+      // get one (a cancelled child reports here as completed) and an open
+      // thinking block will never be closed.
+      const list = [...settleRunMessages(sub.messages || [], { stopped: true })];
       // Append the final summary (or error) as a closing assistant turn so the
       // sub-agent's chat ends with a visible reply, not a half-streamed block.
       if (finalPatch && finalPatch.summary) {
@@ -1723,6 +1732,28 @@ export const useAgent = create((set, get) => ({
           },
         },
       };
+    });
+  },
+
+  /** Stops the live indicators in every running child's transcript; a parent Stop cancels them all, and each child's own status still follows its backend event. */
+  settleRunningSubagents: (taskId) => {
+    const running = Object.values(get().subagentsByTask[taskId] || {}).filter(
+      (sub) => sub && sub.status === 'running',
+    );
+    for (const sub of running) flushSubDeltasFor(taskId, sub.agentId);
+    set((s) => {
+      const taskMap = s.subagentsByTask[taskId];
+      if (!taskMap) return s;
+      let nextMap = null;
+      for (const [agentId, sub] of Object.entries(taskMap)) {
+        if (!sub || sub.status !== 'running') continue;
+        const messages = settleRunMessages(sub.messages || [], { stopped: true });
+        if (messages === sub.messages) continue;
+        nextMap = nextMap || { ...taskMap };
+        nextMap[agentId] = { ...sub, messages };
+      }
+      if (!nextMap) return s;
+      return { subagentsByTask: { ...s.subagentsByTask, [taskId]: nextMap } };
     });
   },
 
@@ -1843,10 +1874,23 @@ export const useAgent = create((set, get) => ({
       }
       return patch;
     });
+    // A run that was stopped or errored leaves tool calls and thinking blocks
+    // that will never get their closing event. Settling here (as well as in
+    // the abort action) also catches deltas that landed after the Stop click.
+    if (['cancelled', 'canceled', 'aborted', 'failed', 'error'].includes(String(status).toLowerCase())) {
+      get().settleStreamAnimations(taskId, { stopped: true });
+    }
     // Only a live run ending counts: re-delivered terminal events (status +
     // agent-task-complete both arrive) see a terminal prevStatus and stay quiet.
     const nextStatus = String(status).toLowerCase();
-    const wasActive = ['preparing', 'running', 'waitingonsubagents', 'waiting'].includes(prevStatus);
+    const ACTIVE = ['preparing', 'running', 'waitingonsubagents', 'waiting'];
+    const wasActive = ACTIVE.includes(prevStatus);
+    // The chat list labels rows by updated_at (time of the last thread entry).
+    // touchTaskActivity is throttled, so a run's start and end stamp
+    // unconditionally to keep the first and final entries exact.
+    if (nextStatus !== prevStatus && (wasActive || ACTIVE.includes(nextStatus))) {
+      get()._patchTaskRecord(taskId, { updated_at: new Date().toISOString() });
+    }
     if (wasActive && nextStatus !== prevStatus) {
       if (nextStatus === 'failed' || nextStatus === 'error') {
         get()._notifyTask(taskId, 'failed');
@@ -2015,7 +2059,7 @@ export const useAgent = create((set, get) => ({
   openPermission: (req) => {
     const allowed =
       req?.task_id &&
-      req?.operation &&
+      canRememberPermission(req?.operation) &&
       get().permissionAllowlistByTask[req.task_id]?.[req.operation];
     if (allowed && isTauriAvailable()) {
       safeInvoke('respond_to_permission', {
@@ -2334,6 +2378,17 @@ export const useAgent = create((set, get) => ({
       await Promise.all(fbConflicts.map((c) => state._abortTaskById(c.id)));
     }
 
+    // A message the user writes ends the /goal loop; only another /goal
+    // starts one again. The kickoff that setGoal sends is exempt, and so is
+    // an answer to a question, live or restored after a restart.
+    if (get().goalByTask[taskId] && !extras?.goalKickoff && !extras?.askAnswer) {
+      const answering =
+        !get().condensingByTask[taskId] &&
+        get()._isTaskRunning(taskId) &&
+        findPendingAskUser(get().messagesByTask[taskId]);
+      if (!answering) await get().clearGoal(taskId);
+    }
+
     // If condensing is active for this task, queue the message instead of
     // sending it. The condense-completed handler will auto-send it.
     if (get().condensingByTask[taskId]) {
@@ -2436,7 +2491,7 @@ export const useAgent = create((set, get) => ({
       },
     }));
     get()._patchTaskRecord(taskId, { goal: trimmed });
-    if (kickoff) await get().sendMessage(kickoff, attachments, extras);
+    if (kickoff) await get().sendMessage(kickoff, attachments, { ...extras, goalKickoff: true });
   },
 
   // Clear the active /goal. Safe mid-run — the executor checks the shared
@@ -2525,6 +2580,10 @@ export const useAgent = create((set, get) => ({
         retryByTask: nextRetry,
       };
     });
+    // Don't wait for the backend's terminal status: it can lag behind a
+    // mid-token model or a slow tool, and the spinners should stop now.
+    get().settleStreamAnimations(taskId, { stopped: true });
+    get().settleRunningSubagents(taskId);
     try {
       await safeInvoke('abort_task', { taskId });
     } catch (e) {}
@@ -2805,7 +2864,17 @@ export const useAgent = create((set, get) => ({
     // turn's animation so the old "Thinking…"/"Preparing…" indicator stops
     // spinning forever instead of hanging.
     if (get().streamingByTask[taskId]) {
-      state.settleStreamAnimations(taskId);
+      state.settleStreamAnimations(taskId, { stopped: true });
+      // A superseded run reports no terminal status (the hosts drop it), so a
+      // condense it was in the middle of would stay flagged for the whole new
+      // run and keep queueing every send.
+      if (get().condensingByTask[taskId]) {
+        set((s) => {
+          const next = { ...s.condensingByTask };
+          delete next[taskId];
+          return { condensingByTask: next };
+        });
+      }
     }
     // Note the model/effort this turn runs with (and drop a divider marker if
     // it changed mid-chat) BEFORE appending the user message, so the marker
@@ -2932,7 +3001,7 @@ export const useAgent = create((set, get) => ({
     const req = get().pendingPermission;
     if (!req) return;
     set({ pendingPermission: null });
-    if (approved && opts.alwaysAllow && req.task_id && req.operation) {
+    if (approved && opts.alwaysAllow && req.task_id && canRememberPermission(req.operation)) {
       set((s) => ({
         permissionAllowlistByTask: {
           ...s.permissionAllowlistByTask,
@@ -3115,7 +3184,12 @@ export const useAgent = create((set, get) => ({
           if (t.goal) {
             const cur = goals[t.id];
             if (!cur || cur.condition !== t.goal) {
-              goals[t.id] = { condition: t.goal, status: 'active', turns: 0, reason: null };
+              goals[t.id] = {
+                condition: t.goal,
+                status: t.goal_status || 'active',
+                turns: t.goal_turns || 0,
+                reason: t.goal_reason || null,
+              };
               goalsTouched = true;
             }
           } else if (goals[t.id]) {
@@ -3336,18 +3410,21 @@ export const useAgent = create((set, get) => ({
     const handlers = {
       'agent-stream': (p) => {
         clearRetry(p.task_id);
+        touchTaskActivity(p.task_id);
         // Batched: buffered and applied on a ~40ms trailing timer instead of
         // one store write per token (see queueStreamDelta at module top).
         queueStreamDelta(p.task_id, 'text', p.text || '');
       },
       'agent-thinking-delta': (p) => {
         clearRetry(p.task_id);
+        touchTaskActivity(p.task_id);
         queueStreamDelta(p.task_id, 'thinking', p.text || '');
       },
       'agent-thinking-done': (p) =>
         get().markThinkingDone(p.task_id, p.duration_secs ?? 0),
       'agent-tool-use-start': (p) => {
         clearRetry(p.task_id);
+        touchTaskActivity(p.task_id);
         // Flush any pending text/thinking buffers before tool use starts
         const { appendToolUse } = get();
         appendToolUse(p.task_id, p.tool_use_id, p.tool_name, {}, /* streaming */ true);
@@ -3360,10 +3437,13 @@ export const useAgent = create((set, get) => ({
       },
       'agent-tool-use': (p) => {
         clearRetry(p.task_id);
+        touchTaskActivity(p.task_id);
+        dropToolInputBuffer(p.tool_use_id);
         get().addToolUse(p.task_id, p.tool_use_id, p.tool_name, p.tool_input);
       },
       'agent-tool-result': (p) => {
         clearRetry(p.task_id);
+        touchTaskActivity(p.task_id);
         get().addToolResult(p.task_id, p.tool_use_id, p.output, p.is_error);
         // Agent changed skills / workflows / rules / MCP servers: let open
         // Settings panels reload their lists (issue #11).
@@ -3412,6 +3492,7 @@ export const useAgent = create((set, get) => ({
       },
       'agent-permission-request': (p) => get().openPermission(p),
       'agent-ask-user-request': (p) => {
+        touchTaskActivity(p?.task_id);
         get().appendAskUserBlock(p?.task_id, p?.request_id, p?.questions);
         const q = Array.isArray(p?.questions) ? p.questions[0]?.text : null;
         get()._notifyTask(p?.task_id, 'input', q || 'The agent has a question for you.');
@@ -3440,6 +3521,9 @@ export const useAgent = create((set, get) => ({
         toast.success('Goal met — the loop has finished.', { duration: 8000 });
         get()._patchTaskRecord(taskId, { goal: null });
         get()._notifyTask(taskId, 'goal', condition || undefined, { inApp: false });
+      } else if (status === 'blocked') {
+        toast.warning(`Goal loop paused: ${reason || 'the agent is blocked'}`, { duration: 15000 });
+        get()._notifyTask(taskId, 'input', reason ? `Goal blocked: ${reason}` : 'Goal blocked', { inApp: false });
       } else if (status === 'error') {
         toast.error(`Goal loop stopped: ${reason || 'evaluator failed'}`, { duration: 8000 });
         get()._notifyTask(taskId, 'failed', reason || 'Goal loop stopped', { inApp: false });
@@ -3488,6 +3572,7 @@ export const useAgent = create((set, get) => ({
       // store keeps an independent live transcript per spawned child so the
       // user can click into a sub-agent and watch it work in real time.
       'agent-subagent-spawned': (p) => {
+        touchTaskActivity(p.task_id);
         get()._ensureSubagent(p.task_id, p.agent_id, {
           model: p.model || '',
           prompt: p.prompt || '',
@@ -3524,14 +3609,17 @@ export const useAgent = create((set, get) => ({
         }
       },
       'agent-subagent-text-delta': (p) => {
+        touchTaskActivity(p.task_id);
         get()._ensureSubagent(p.task_id, p.agent_id);
         queueSubagentDelta(p.task_id, p.agent_id, 'text', p.text || '');
       },
       'agent-subagent-thinking-delta': (p) => {
+        touchTaskActivity(p.task_id);
         get()._ensureSubagent(p.task_id, p.agent_id);
         queueSubagentDelta(p.task_id, p.agent_id, 'thinking', p.text || '');
       },
       'agent-subagent-tool-use': (p) => {
+        touchTaskActivity(p.task_id);
         get()._ensureSubagent(p.task_id, p.agent_id);
         flushSubDeltasFor(p.task_id, p.agent_id);
         get().addSubagentToolUse(
@@ -3543,6 +3631,7 @@ export const useAgent = create((set, get) => ({
         );
       },
       'agent-subagent-tool-result': (p) => {
+        touchTaskActivity(p.task_id);
         get()._ensureSubagent(p.task_id, p.agent_id);
         flushSubDeltasFor(p.task_id, p.agent_id);
         get().addSubagentToolResult(
@@ -3557,6 +3646,8 @@ export const useAgent = create((set, get) => ({
         get()._ensureSubagent(p.task_id, p.agent_id, { cost: p.cost });
       },
       'agent-subagent-completed': (p) => {
+        // A sub-agent's last entry: unthrottled so the row's final time is exact.
+        touchTaskActivity(p.task_id, true);
         flushSubDeltasFor(p.task_id, p.agent_id);
         get()._ensureSubagent(p.task_id, p.agent_id, {
           model: p.model || undefined,
@@ -3567,6 +3658,7 @@ export const useAgent = create((set, get) => ({
         });
       },
       'agent-subagent-failed': (p) => {
+        touchTaskActivity(p.task_id, true);
         flushSubDeltasFor(p.task_id, p.agent_id);
         get()._ensureSubagent(p.task_id, p.agent_id);
         get().finalizeSubagent(p.task_id, p.agent_id, {
@@ -3575,7 +3667,10 @@ export const useAgent = create((set, get) => ({
         });
       },
       'agent-user-messages-injected': (p) => {
-        if (p?.task_id) get()._onUserMessagesInjected(p.task_id, p.ids);
+        if (p?.task_id) {
+          touchTaskActivity(p.task_id);
+          get()._onUserMessagesInjected(p.task_id, p.ids);
+        }
       },
       'agent-provider-error': (p) => {
         // A deterministic 4xx — retrying the same request can't fix it, but

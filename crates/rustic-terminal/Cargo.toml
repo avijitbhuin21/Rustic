@@ -27,5 +27,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
+# Unix-only: getrlimit/setrlimit for `raise_fd_limit`. Already in the lock via
+# portable-pty, so this links nothing new.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

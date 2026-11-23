@@ -93,21 +93,20 @@ pub fn finalize_session_exit(app: &AppHandle, session_id: u64, reason: &str) {
         Ok(mut manager) => manager.take_for_exit(session_id, 4 * 1024),
         Err(_) => None,
     };
-    // [term-diag] TEMP: trace which terminal sessions get finalized (removed
-    // from the list) and why. A finalize emits `terminal-list-changed`, which on
-    // the frontend disposes the xterm instance + its scrollback. Remove once the
-    // "lost terminal history" repro is understood. Grep: term-diag.
-    eprintln!(
-        "[term-diag] finalize_session_exit session={} reason={} actually_removed={}",
-        session_id,
-        reason,
-        snapshot.is_some()
-    );
     // None → the session was already removed (by another finalize, an explicit
     // close_terminal/kill, etc.). Nothing left to do.
     let Some((task_id_opt, label, last_command, tail, cmd_was_in_flight)) = snapshot else {
         return;
     };
+    // Counterpart of the "spawn: agent terminal created" line: without it the
+    // log cannot say when, or why, a terminal went away.
+    tracing::info!(
+        target: "rustic::agent::terminal",
+        session_id,
+        reason,
+        cmd_was_in_flight,
+        "finalize: terminal closed"
+    );
 
     // Agent-owned sessions route an exit notification to their task so the
     // executor can surface "your terminal closed" to the model next turn.
@@ -315,11 +314,23 @@ pub fn spawn_session_monitor(
             // can run commands in the user's terminal); idle auto-close
             // remains agent-only so a user's shell is never reclaimed.
             if let Some(pid) = pid {
-                let marker = {
+                let (marker, completed) = {
                     let state = app.state::<AppState>();
                     let m = state.terminal_manager.lock();
-                    m.ok().and_then(|m| m.command_in_flight_since(session_id))
+                    m.ok()
+                        .map(|m| {
+                            (
+                                m.command_in_flight_since(session_id),
+                                m.command_completed(session_id),
+                            )
+                        })
+                        .unwrap_or((None, false))
                 };
+                // `run_command` finishes a fast command itself, off its end
+                // marker, without this thread ever seeing it run.
+                if completed {
+                    seen_running = true;
+                }
                 if marker != cmd_marker {
                     cmd_marker = marker;
                     cmd_seen_running = false;
@@ -416,7 +427,34 @@ pub fn spawn_session_monitor(
 
             std::thread::sleep(MONITOR_POLL_INTERVAL);
         }
+        // Every way out of the loop means the session is gone. Closing it only
+        // drops our end of the pty; end the shell and collect its status here,
+        // or each closed terminal leaves a zombie (or a live shell) behind.
+        rustic_terminal::reap_shell(&mut child);
     });
+}
+
+/// Close every agent terminal `task_id` started and drop its queued terminal
+/// notices. Called when the task is deleted: nothing is left to read them.
+pub fn close_task_terminals(app: &AppHandle, task_id: &str) {
+    let state = app.state::<AppState>();
+    let closed = state
+        .terminal_manager
+        .lock()
+        .map(|mut m| m.destroy_agent_sessions_for_task(task_id))
+        .unwrap_or_default();
+    if let Ok(mut exits) = state.agent_terminal_exits.lock() {
+        exits.remove(task_id);
+    }
+    if !closed.is_empty() {
+        tracing::info!(
+            target: "rustic::agent::terminal",
+            task_id = %task_id,
+            closed = closed.len(),
+            "task deleted: closed its agent terminals"
+        );
+        emit_terminal_list_changed(app);
+    }
 }
 
 /// Does a session still exist in the manager? Used by the monitor thread to

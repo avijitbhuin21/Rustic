@@ -3,6 +3,8 @@
 @import "./shadcn-tailwind.css";
 @import "@fontsource-variable/geist";
 @import "./recipes.css";
+@import "./ink-layers.css";
+@import "./ink.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -274,6 +276,17 @@ body {
 .search-match-highlight {
   background-color: rgba(234, 179, 8, 0.35) !important;
   border-radius: 2px;
+}
+
+/* Text an open inline chat (Ctrl+I) will replace. */
+.inline-chat-target {
+  background-color: color-mix(in oklab, var(--primary) 16%, transparent);
+}
+
+/* Monaco outlines anything focusable inside `.monaco-editor`; the inline chat
+   widget lives there and uses the app's own focus styling. */
+.monaco-editor [data-inline-chat] :is(textarea, button):focus {
+  outline: none;
 }
 
 /* Monaco renders action-button tooltips (the Ctrl+F find widget's Close /
@@ -603,6 +616,29 @@ body {
 .rustic-markdown th[align="right"],
 .rustic-markdown td[align="right"] { text-align: right; }
 .rustic-markdown img { max-width: 100%; height: auto; border-radius: 4px; }
+
+/* Placeholder that stands in for a remote image in agent output until clicked
+   (see src/lib/sanitize-html.js). */
+.remote-image-blocked {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  color: var(--muted-foreground);
+  font-size: 0.9em;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-image-blocked:hover,
+.remote-image-blocked:focus-visible {
+  color: var(--foreground);
+  background: color-mix(in oklch, var(--muted) 60%, transparent);
+  outline: none;
+}
 .rustic-markdown hr { border: 0; border-top: 1px solid var(--border); margin: 1.5em 0; }
 .rustic-markdown kbd {
   background: var(--muted);

@@ -307,7 +307,7 @@ export function TabBar({ groupId }) {
   };
 
   return (
-    <div className="flex h-8 shrink-0 items-stretch border-b border-border bg-muted/20">
+    <div data-ink-frame="rule-bottom" className="flex h-8 shrink-0 items-stretch border-b border-border bg-muted/20">
       {/* Scrollable tab strip */}
       <div
         ref={scrollRef}

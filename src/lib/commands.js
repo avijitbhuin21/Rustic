@@ -11,6 +11,9 @@
 //   run         — async function executed when the command is invoked.
 //                 Read state lazily inside `run` — the registry is built once
 //                 at module load.
+//   when        — optional predicate. When it returns false the keystroke is
+//                 left alone (not swallowed), so a key that means something
+//                 else in another surface keeps working there.
 
 import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
 import { useExplorer } from '@/state/explorer';
@@ -19,7 +22,13 @@ import { useSettings } from '@/state/settings';
 import { useTerminal } from '@/state/terminal';
 import { openFilePalette } from '@/components/command-palette';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
-import { formatActiveEditor, saveActiveEditor, toggleCommentActiveEditor } from '@/lib/active-editor';
+import {
+  formatActiveEditor,
+  saveActiveEditor,
+  toggleCommentActiveEditor,
+  isActiveEditorFocused,
+  openInlineChatInActiveEditor,
+} from '@/lib/active-editor';
 
 async function newTerminal() {
   const { projects } = useExplorer.getState();
@@ -71,6 +80,8 @@ export const COMMANDS = [
   { id: 'editor.toggleWordWrap',  label: 'Toggle Word Wrap',  group: 'Editor', defaultKey: 'Alt+Z',          run: toggleWordWrap },
   { id: 'editor.formatDocument',  label: 'Format Document',   group: 'Editor', defaultKey: 'Alt+Shift+F',    run: () => formatActiveEditor() },
   { id: 'editor.toggleComment',   label: 'Toggle Comment',    group: 'Editor', defaultKey: 'Ctrl+/',        run: () => toggleCommentActiveEditor() },
+  // Gated on code-editor focus: Ctrl+I is italic in the Word / PowerPoint editors.
+  { id: 'editor.inlineChat',      label: 'Inline Chat',       group: 'Editor', defaultKey: 'Ctrl+I',        when: () => isActiveEditorFocused(), run: () => openInlineChatInActiveEditor() },
 
   // ── EXPLORER ──────────────────────────────────────────────────────────
   { id: 'explorer.copy',           label: 'Copy',             group: 'Explorer', defaultKey: 'Ctrl+C', run: null },

@@ -7,7 +7,7 @@ import { toast } from 'sonner';
 import { copyText } from '@/lib/code-copy';
 import {
   Check, Upload, ClipboardPaste, FolderOpen, MoreHorizontal, Download, Trash2, ShieldCheck, ShieldAlert,
-  FileCode2, FileDown, Copy, Moon, Sun, MonitorSmartphone, Pencil, AlertTriangle, Ban, Globe,
+  FileCode2, FileDown, Copy, Moon, Sun, Pencil, AlertTriangle, Ban, Globe,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -20,7 +20,6 @@ import { InfoTip } from '@/components/ui/info-tip';
 import { cn } from '@/lib/utils';
 import { IS_WEB } from '@/lib/platform';
 import { useThemes } from '@/state/themes';
-import { Slider } from './cloud-machines';
 
 const errText = (e) => String(e?.message || e);
 
@@ -262,7 +261,8 @@ function PasteDialog({ open, onClose, onImported }) {
 const RECIPE_LABELS = {
   surface: { glass: 'Glass' },
   button: { pill: 'Pill buttons', raised: 'Raised buttons', brutal: 'Brutal buttons', glow: 'Glow buttons' },
-  texture: { grain: 'Grain', grid: 'Grid', dots: 'Dots', scanlines: 'Scanlines' },
+  ink: { sketch: 'Hand-drawn' },
+  texture: { grain: 'Grain', grid: 'Grid', dots: 'Dots', scanlines: 'Scanlines', paper: 'Paper' },
   density: { compact: 'Compact', comfortable: 'Airy' },
   shadow: { hard: 'Hard shadows', glow: 'Glow', strong: 'Deep shadows' },
 };
@@ -464,11 +464,12 @@ export function ThemesSection() {
 
   const mode = active?.mode || 'dark';
   const activeId = active?.id;
-  const effectiveMode = mode === 'system'
+  // The theme decides dark or light; only a theme that ships both offers a choice.
+  const variant = mode === 'system'
     ? (window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
     : mode;
   const activeEntry = list.find((t) => t.id === activeId);
-  const missingMode = activeEntry && activeEntry.modes.length && !activeEntry.modes.includes(effectiveMode) ? effectiveMode : null;
+  const hasVariants = (activeEntry?.modes.length || 0) > 1;
   const needsReview = active?.fallback && settingsActive && settingsActive !== activeId
     ? list.find((t) => t.id === settingsActive)
     : null;
@@ -489,27 +490,23 @@ export function ThemesSection() {
       </div>
       <input ref={fileInput} type="file" accept=".json,.toml,application/json" className="hidden" onChange={onBrowserFile} />
 
-      <Slider
-        className="mb-3"
-        value={mode}
-        onChange={(m) => setMode(m).catch((e) => toast.error(errText(e)))}
-        options={[
-          { id: 'dark', label: 'Dark', icon: Moon },
-          { id: 'light', label: 'Light', icon: Sun },
-          { id: 'system', label: 'Match system', icon: MonitorSmartphone },
-        ]}
-      />
-
-      {missingMode && (
-        <p className="-mt-1.5 mb-3 px-1 text-[11px] text-muted-foreground">
-          {activeEntry.name} has no {missingMode} version — showing Rustic's default {missingMode} palette.
-        </p>
-      )}
-
       {activeEntry && (
         <div className="mb-3 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/20 px-3 py-1.5">
           <span className="text-[11px] text-muted-foreground">Active</span>
           <span className="min-w-0 flex-1 truncate text-[12px] font-medium">{activeEntry.name}</span>
+          {hasVariants && [['dark', 'Dark', Moon], ['light', 'Light', Sun]].map(([id, label, Icon]) => (
+            <Button
+              key={id}
+              size="sm"
+              variant={variant === id ? 'secondary' : 'ghost'}
+              className="h-6 gap-1 px-2 text-[11px]"
+              title={`Show this theme's ${id} version`}
+              aria-pressed={variant === id}
+              onClick={() => setMode(id).catch((e) => toast.error(errText(e)))}
+            >
+              <Icon className="size-3" /> {label}
+            </Button>
+          ))}
           <Button size="sm" variant="ghost" className="h-6 gap-1 px-2 text-[11px]" title="Copy the theme file to the clipboard" onClick={() => onCopy(activeEntry)}><Copy className="size-3" /> Copy</Button>
           <Button size="sm" variant="ghost" className="h-6 gap-1 px-2 text-[11px]" title="Download the theme file" onClick={() => onExport(activeEntry)}><Download className="size-3" /> Download</Button>
           <Button size="sm" variant="ghost" className="h-6 gap-1 px-2 text-[11px]" title={activeEntry.builtin ? 'Edit a copy of this built-in theme' : 'Edit this theme'} onClick={() => onEditText(activeEntry)}><Pencil className="size-3" /> Edit</Button>

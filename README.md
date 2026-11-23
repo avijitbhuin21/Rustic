@@ -82,6 +82,7 @@ src/                  React 19 frontend (Vite + Tailwind 4 + Radix UI)
   lib/                Tauri-API wrappers, commands, clipboard, markdown, utils
   styles/             Tailwind layers + global CSS
 vendor/lattice-merge/ Vendored 3-way structural merge used by the concurrent-write guard
+vendor/palimpsest-pdf/ Vendored PDF content-editing engine behind the PDF preview's "Edit page content" tool
 website/              Standalone marketing site (separate Railway service)
 deploy/               Caddyfile + container entrypoint
 ```

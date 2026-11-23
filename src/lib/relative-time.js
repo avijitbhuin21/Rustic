@@ -1,5 +1,17 @@
 import { useEffect, useState } from 'react';
 
+/** Parse a backend timestamp (epoch ms, RFC 3339, or SQLite UTC) to epoch ms; 0 when absent or invalid. */
+export function parseTimestamp(raw) {
+  if (!raw) return 0;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : 0;
+  const s = String(raw).trim();
+  // SQLite's datetime('now') is zone-less UTC (`YYYY-MM-DD HH:MM:SS`), which
+  // `new Date()` reads as local time, skewing the label by the UTC offset.
+  const zoneless = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s);
+  const ms = Date.parse(zoneless ? `${s.replace(' ', 'T')}Z` : s);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
 // Compact "5s ago" / "2m ago" / "3h ago" / "2d ago" formatter for chat
 // timestamps. Returns "just now" for anything under five seconds so freshly
 // arriving tool calls don't flicker between "1s" and "2s" the moment they

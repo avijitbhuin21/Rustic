@@ -38,12 +38,13 @@ import { open as openFolderDialog } from '@tauri-apps/plugin-dialog';
 import { toast } from 'sonner';
 import { exportChatAsJson } from '@/lib/export-chat';
 import { useTurns } from '@/lib/turn-builder';
+import { useSubagentNames } from '@/lib/subagent-names';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExternalAgents, selectActiveCliSession } from '@/state/external-agents';
 import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
-import { ChatTurn, ChatImageGalleryProvider } from './chat-turn';
+import { ChatTurn, ChatImageGalleryProvider, TurnScrollContext, TURN_CHUNK_ATTR } from './chat-turn';
 import { CostIndicator } from './cost-indicator';
 const AgentToolsSheetImpl = React.lazy(() => import('./agent-tools-sheet'));
 
@@ -68,6 +69,7 @@ import { CondenseBanner } from './condense-banner';
 import { ModelChangeDivider } from './model-change-divider';
 import { parseSpawnedAgentIds } from './tool-call-card';
 import { EmptyState } from './empty-state';
+import { Written } from '@/components/ui/ink';
 import { CliChatView } from './cli-chat-view';
 import { AgentMascot } from './agent-mascot';
 
@@ -183,19 +185,29 @@ function ProjectHeaderPicker() {
 }
 
 /** Virtualized transcript: only rows near the viewport are mounted (PERF-01). Rows are absolutely positioned via `top` (not transform) so the sticky user headers inside ChatTurn keep working. */
-function VirtualTurnList({ rows, toolResults, taskId, projectRoot, scrollRef, stickRef }) {
+export function VirtualTurnList({ rows, toolResults, taskId, projectRoot, scrollRef, stickRef }) {
+  const turnScroll = useMemo(() => ({ scrollRef, stickRef }), [scrollRef, stickRef]);
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: (i) => (rows[i].type === 'divider' ? 36 : 160),
     getItemKey: (i) => rows[i].key,
     overscan: 3,
-    // Re-measuring rows above the viewport (as they mount during upward
-    // scrolling) shifts content; compensate so the view doesn't jump. Skip
-    // while pinned to bottom — the snap effect below owns the offset then.
-    shouldAdjustScrollPositionOnItemSizeChange: (item, _delta, instance) =>
-      !stickRef?.current && item.start < (instance.scrollOffset ?? 0),
   });
+  // The library reads this rule from the instance; passed as an option it is
+  // ignored. A turn long enough to window its own blocks spans many screens,
+  // so "starts above the viewport" says nothing about where inside it a size
+  // change happened: its chunks correct the scroll offset themselves (see
+  // BlockChunk) and the list must not correct it a second time. Every other
+  // row keeps the library's default rule.
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
+    const rowEl = scrollRef.current?.querySelector(`[data-index="${item.index}"]`);
+    if (rowEl?.querySelector(`[${TURN_CHUNK_ATTR}]`)) return false;
+    return (
+      item.start < instance.getScrollOffset() + instance.scrollAdjustments &&
+      (!instance.itemSizeCache.has(item.key) || instance.scrollDirection !== 'backward')
+    );
+  };
 
   const totalSize = virtualizer.getTotalSize();
 
@@ -221,6 +233,7 @@ function VirtualTurnList({ rows, toolResults, taskId, projectRoot, scrollRef, st
   }, [rows, virtualizer, stickRef]);
 
   return (
+    <TurnScrollContext.Provider value={turnScroll}>
     <ChatImageGalleryProvider rows={rows} onGoToRow={goToRow}>
     <motion.div
       initial={{ opacity: 0 }}
@@ -256,6 +269,7 @@ function VirtualTurnList({ rows, toolResults, taskId, projectRoot, scrollRef, st
       })}
     </motion.div>
     </ChatImageGalleryProvider>
+    </TurnScrollContext.Provider>
   );
 }
 
@@ -570,29 +584,7 @@ export function ChatView() {
   // model's `agents` input carries the names, the tool output carries the
   // spawned ids in matching positions. The backend doesn't persist the name,
   // so this is the only place it can come from.
-  const subagentNames = useMemo(() => {
-    const map = {};
-    for (const m of messages) {
-      if (m.role !== 'assistant') continue;
-      for (const b of m.content || []) {
-        if (b.type !== 'tool_use' || b.name !== 'spawn_subagent') continue;
-        let agents = b.input?.agents;
-        if (typeof agents === 'string') {
-          try {
-            agents = JSON.parse(agents);
-          } catch {
-            agents = null;
-          }
-        }
-        if (!Array.isArray(agents)) continue;
-        const ids = parseSpawnedAgentIds(toolResults[b.id]?.output);
-        ids.forEach((id, i) => {
-          if (id && agents[i]?.name) map[id] = agents[i].name;
-        });
-      }
-    }
-    return map;
-  }, [messages, toolResults]);
+  const subagentNames = useSubagentNames(messages, toolResults, parseSpawnedAgentIds);
 
   // Data backing the running-status strip: when the current run started (the
   // last user message), how many tool calls it has made, and which tool is
@@ -600,15 +592,21 @@ export function ChatView() {
   const runInfo = useMemo(() => {
     if (!isStreaming) return null;
     let startedAt = null;
+    let startIndex = 0;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === 'user') {
         startedAt = messages[i].timestamp || null;
+        startIndex = i;
         break;
       }
     }
     let toolCount = 0;
     let runningTool = null;
-    for (const m of messages) {
+    // Messages are in arrival order, so the run's own are the ones after its
+    // user message: this is recomputed on every streaming flush and must not
+    // walk the whole chat.
+    for (let i = startIndex; i < messages.length; i++) {
+      const m = messages[i];
       if (m.role !== 'assistant') continue;
       if (startedAt && (m.timestamp || 0) < startedAt) continue;
       for (const b of m.content || []) {
@@ -893,8 +891,8 @@ export function ChatView() {
                   className="flex flex-col items-center gap-4 text-center"
                 >
                   <AgentMascot size="hero" />
-                  <div className="text-lg font-medium tracking-tight text-foreground">
-                    Start a conversation
+                  <div data-ink-title="hero" className="text-lg font-medium tracking-tight text-foreground">
+                    <Written>Start a conversation</Written>
                   </div>
                   <div className="max-w-md text-sm italic text-muted-foreground">
                     {activeProject?.name

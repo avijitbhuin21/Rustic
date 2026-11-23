@@ -1,9 +1,11 @@
 //! rustic-server as a sync peer: the same pairing / sharing / approval / push
 //! and pull logic the desktop runs (`rustic_app::peer`), hosted on the
 //! server's own HTTP(S) address under `/lan/*`. No TLS listener, mDNS or
-//! tunnel — the server is already reachable at its URL. Incoming pushes are
-//! accepted automatically (a headless server may have nobody watching);
-//! pulls still ask in the web UI and only include what's shared.
+//! tunnel — the server is already reachable at its URL. Incoming pushes ask in
+//! the web UI like pulls do: a push can carry metadata (MCP server commands,
+//! provider base URLs), so a paired device's token alone must not be enough.
+//! `RUSTIC_PEER_AUTO_ACCEPT_PUSH=1` restores unattended acceptance for a
+//! headless server whose paired devices are all trusted.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,8 +48,19 @@ impl PeerHost for ServerPeerHost {
     }
 
     fn auto_accept_push(&self) -> bool {
-        true
+        auto_accept_push_enabled(std::env::var(AUTO_ACCEPT_PUSH_ENV).ok().as_deref())
     }
+}
+
+/// Opt-in for approving incoming pushes with nobody at the web UI.
+pub const AUTO_ACCEPT_PUSH_ENV: &str = "RUSTIC_PEER_AUTO_ACCEPT_PUSH";
+
+/// Whether the opt-in variable's value turns push auto-accept on. Off unless set to `1` or `true`.
+fn auto_accept_push_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true")
+    )
 }
 
 /// Peer routes (`/lan/*`) for the public router. They authenticate paired
@@ -69,6 +82,28 @@ pub async fn restore(ctx: &ServerContext) {
         let url = url.trim().trim_end_matches('/').to_string();
         if !url.is_empty() {
             rustic_app::peer::set_public_url(Some(url));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_accept_push_enabled;
+
+    #[test]
+    fn push_auto_accept_is_off_unless_opted_in() {
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("yes"),
+        ] {
+            assert!(!auto_accept_push_enabled(off), "{off:?}");
+        }
+        for on in [Some("1"), Some("true"), Some(" TRUE ")] {
+            assert!(auto_accept_push_enabled(on), "{on:?}");
         }
     }
 }

@@ -22,9 +22,11 @@ import {
   Trash2,
   Undo2,
   Save,
+  Shapes,
   TextCursor,
 } from 'lucide-react';
 import { PanZoomControls, PanZoomSurface, usePanZoom } from './pan-zoom';
+import { PdfObjectLayer, usePdfObjects } from './pdf-objects';
 import { useEditor } from '@/state/editor';
 import { setActiveSaver, clearActiveSaver } from '@/lib/active-editor';
 import { cn } from '@/lib/utils';
@@ -124,6 +126,7 @@ function PdfPageCanvas({
   highlightDefaults,
   onEditChange,
   onPageAction,
+  objects,
 }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
@@ -395,8 +398,17 @@ function PdfPageCanvas({
     return () => document.removeEventListener('mousedown', onDocClick, true);
   }, [editingTextId]);
 
+  // Objects tool: ask for this page's objects once it is near the viewport, and
+  // again whenever an edit has made the previous answer stale.
+  const objectsOn = editMode && tool === 'objects' && !edit?.deleted;
+  const objectState = objects.pages[pageNumber];
+  const requestObjects = objects.requestPage;
+  useEffect(() => {
+    if (objectsOn && visible && !objectState) requestObjects(pageNumber);
+  }, [objectsOn, visible, objectState, requestObjects, pageNumber]);
+
   const baseH = baseViewport?.height || 0;
-  const overlayActive = editMode && tool !== 'select' && !edit?.deleted;
+  const overlayActive = editMode && (tool === 'text' || tool === 'highlight') && !edit?.deleted;
 
   return (
     <div
@@ -414,6 +426,17 @@ function PdfPageCanvas({
           is `pointer-events-none` (default / select tool), text-layer
           spans receive the pointer events and the user can drag-select. */}
       <div ref={textLayerRef} className="rustic-pdf-textlayer" aria-hidden="true" />
+      {objectsOn && (
+        <PdfObjectLayer
+          pageNumber={pageNumber}
+          scale={scale}
+          pageHeight={baseH}
+          state={objectState}
+          busy={objects.busy}
+          onApply={objects.apply}
+          onUndo={objects.undo}
+        />
+      )}
       {!rendered && !canvasRef.current?.width && (
         <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
           <span>{pageNumber}</span>
@@ -662,7 +685,7 @@ export default function PdfPreview({ tab }) {
 
   // Edit-mode state. `edits` is a per-page map keyed by 1-based page number.
   const [editMode, setEditMode] = useState(false);
-  const [tool, setTool] = useState('select'); // 'select' | 'text' | 'highlight'
+  const [tool, setTool] = useState('select'); // 'select' | 'objects' | 'text' | 'highlight'
   const [edits, setEdits] = useState({});
   const [textColor, setTextColor] = useState('#000000');
   const [textSize, setTextSize] = useState(14);
@@ -673,12 +696,27 @@ export default function PdfPreview({ tab }) {
 
   const tabSetDirty = useEditor((s) => s.setDirty);
 
-  const dirty = useMemo(() => {
+  // Object edits (move / delete / retype existing content) are applied by the
+  // backend; after each one pdf.js is handed the edited document to render.
+  const originalBytesRef = useRef(null);
+  originalBytesRef.current = originalBytes;
+  const showBytes = useCallback(async (bytes) => {
+    /** Shows `bytes`, or the file as it is on disk when `bytes` is null. */
+    const pdfjs = await loadPdfJs();
+    const source = bytes ?? originalBytesRef.current ?? (await fetchFileBytes(tab.path));
+    // pdf.js may detach the buffer it is given; keep ours intact for save.
+    setDoc(await pdfjs.getDocument({ data: source.slice() }).promise);
+  }, [tab.path]);
+  const objects = usePdfObjects({ path: tab.path, onDocBytes: showBytes });
+  const resetObjects = objects.reset;
+
+  const overlayDirty = useMemo(() => {
     for (const k of Object.keys(edits)) {
       if (!isPageEmpty(edits[k])) return true;
     }
     return false;
   }, [edits]);
+  const dirty = overlayDirty || objects.count > 0;
 
   // Mirror local dirty state into the editor store so the tab gets a yellow
   // dot. Clear on unmount.
@@ -706,6 +744,7 @@ export default function PdfPreview({ tab }) {
     setPageBaseViewports([]);
     setOriginalBytes(null);
     setEdits({});
+    resetObjects();
     setLoadNote(null);
 
     try {
@@ -780,7 +819,7 @@ export default function PdfPreview({ tab }) {
       if (!signal.cancelled) setError(String(e?.message || e));
       return null;
     }
-  }, [tab.path, reloadVersion]);
+  }, [tab.path, reloadVersion, resetObjects]);
 
   useEffect(() => {
     const signal = { cancelled: false };
@@ -830,10 +869,17 @@ export default function PdfPreview({ tab }) {
 
   const pz = usePanZoom({
     fit: 'width',
+    wheel: 'scroll',
     padding: 0,
     minScale: 0.01,
     maxScale: 200,
-    canPan: () => !textSelect && !(editMode && tool !== 'select'),
+    // With the objects tool, a drag that starts on an object moves it; anywhere
+    // else it pans as usual.
+    canPan: (e) =>
+      !textSelect &&
+      (!editMode ||
+        tool === 'select' ||
+        (tool === 'objects' && !e?.target?.closest?.('[data-pdf-object],[data-pdf-object-editor]'))),
     onSettle: (view) => {
       const r = renderScaleRef.current;
       updateCurrentPage(view, r);
@@ -908,7 +954,13 @@ export default function PdfPreview({ tab }) {
     });
   }, []);
 
-  const undoAll = () => setEdits({});
+  const undoAll = () => {
+    setEdits({});
+    if (objects.count > 0) {
+      resetObjects();
+      showBytes(null).catch((e) => setError(String(e?.message || e)));
+    }
+  };
 
   // --------------------------------------------------------------- save flow
   // We open the *original* bytes through pdf-lib (not the modified pdf.js
@@ -923,9 +975,19 @@ export default function PdfPreview({ tab }) {
     }
     setSaving(true);
     try {
+      // Object edits are already baked into the document the backend returned.
+      // With no overlays on top there is nothing for pdf-lib to add, and the
+      // backend writes the file itself (no size cap, unlike write_file_base64).
+      const edited = objects.bytes();
+      if (edited && !overlayDirty) {
+        await objects.save();
+        toast.success('Saved');
+        await loadDoc();
+        return;
+      }
       const { PDFDocument, StandardFonts, rgb, degrees } = await loadPdfLib();
       // Streamed (large) documents never held their bytes; read them now.
-      const source = originalBytes ?? (await fetchFileBytes(tab.path));
+      const source = edited ?? originalBytes ?? (await fetchFileBytes(tab.path));
       const pdfDoc = await PDFDocument.load(source);
       const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
       const pages = pdfDoc.getPages();
@@ -1008,7 +1070,7 @@ export default function PdfPreview({ tab }) {
     } finally {
       setSaving(false);
     }
-  }, [dirty, doc, edits, originalBytes, saving, tab.path, loadDoc]);
+  }, [dirty, overlayDirty, objects, doc, edits, originalBytes, saving, tab.path, loadDoc]);
 
   // Register Ctrl+S handler while we're the active editor.
   useEffect(() => {
@@ -1079,6 +1141,15 @@ export default function PdfPreview({ tab }) {
               </Button>
               <Button
                 size="icon-xs"
+                variant={tool === 'objects' ? 'default' : 'ghost'}
+                title="Edit page content: drag to move, Delete to remove, double-click text to retype"
+                aria-label="Edit page content"
+                onClick={() => setTool('objects')}
+              >
+                <Shapes />
+              </Button>
+              <Button
+                size="icon-xs"
                 variant={tool === 'text' ? 'default' : 'ghost'}
                 title="Add text"
                 onClick={() => setTool('text')}
@@ -1127,6 +1198,18 @@ export default function PdfPreview({ tab }) {
               </div>
             )}
 
+            {objects.count > 0 && (
+              <Button
+                size="xs"
+                variant="ghost"
+                disabled={objects.busy}
+                onClick={() => objects.undo()}
+                title="Undo the last content edit"
+              >
+                <Undo2 />
+                <span className="ml-1">Undo</span>
+              </Button>
+            )}
             {dirty && (
               <Button size="xs" variant="ghost" onClick={undoAll} title="Discard all edits">
                 <Undo2 />
@@ -1197,6 +1280,7 @@ export default function PdfPreview({ tab }) {
               highlightDefaults={highlightDefaults}
               onEditChange={(next) => onEditChange(pageNumber, next)}
               onPageAction={onPageAction}
+              objects={objects}
             />
           );
         })}

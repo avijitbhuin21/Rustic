@@ -50,9 +50,27 @@ struct ExitedSession {
     exited_at_ms: u64,
 }
 
+/// How many closed agent terminals keep their last output readable.
+const MAX_CLOSED_AGENT_SESSIONS: usize = 32;
+/// Cap on the raw output kept per closed agent terminal (bytes) — the most
+/// one `read_terminal_output` call returns.
+const MAX_CLOSED_AGENT_OUTPUT_BYTES: usize = 32 * 1024;
+
+/// Last output of an agent terminal that has closed. Agent terminals are
+/// reclaimed shortly after their command finishes, often before the agent
+/// reads them; this keeps that read working. Never listed, so the UI and the
+/// `exited` store for the user's own tabs are unaffected.
+struct ClosedAgentSession {
+    output: String,
+    screen: String,
+    order: u64,
+}
+
 pub struct TerminalManager {
     sessions: HashMap<SessionId, PtySession>,
     exited: HashMap<SessionId, ExitedSession>,
+    closed_agent: HashMap<SessionId, ClosedAgentSession>,
+    closed_agent_order: u64,
 }
 
 impl Default for TerminalManager {
@@ -66,7 +84,52 @@ impl TerminalManager {
         Self {
             sessions: HashMap::new(),
             exited: HashMap::new(),
+            closed_agent: HashMap::new(),
+            closed_agent_order: 0,
         }
+    }
+
+    /// Keep the last output of an agent session that is being removed.
+    fn retain_closed_agent(&mut self, session: &PtySession) {
+        let output = read_tail(&session.output_buffer, MAX_CLOSED_AGENT_OUTPUT_BYTES);
+        let screen = session
+            .emulator
+            .lock()
+            .ok()
+            .map(|emu| emu.render_screen())
+            .unwrap_or_default();
+        self.remember_closed_agent(session.id, output, screen);
+    }
+
+    /// Store a closed agent terminal's last output, evicting the oldest entry beyond the cap.
+    fn remember_closed_agent(&mut self, id: SessionId, output: String, screen: String) {
+        self.closed_agent_order += 1;
+        self.closed_agent.insert(
+            id,
+            ClosedAgentSession {
+                output,
+                screen,
+                order: self.closed_agent_order,
+            },
+        );
+        while self.closed_agent.len() > MAX_CLOSED_AGENT_SESSIONS {
+            let oldest = self
+                .closed_agent
+                .iter()
+                .min_by_key(|(_, c)| c.order)
+                .map(|(k, _)| *k);
+            match oldest {
+                Some(k) => {
+                    self.closed_agent.remove(&k);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// True when `id` is an agent terminal that has closed but whose last output is still readable.
+    pub fn is_closed_agent(&self, id: SessionId) -> bool {
+        self.closed_agent.contains_key(&id)
     }
 
     /// Create a new terminal session. Returns the session info, the reader
@@ -100,6 +163,7 @@ impl TerminalManager {
         let emulator = Arc::clone(&session.emulator);
 
         let info = session_info(&session);
+        self.closed_agent.remove(&session.id);
         self.sessions.insert(session.id, session);
         Ok((info, reader, buffer, emulator, child))
     }
@@ -121,8 +185,32 @@ impl TerminalManager {
     }
 
     pub fn destroy_session(&mut self, id: SessionId) {
-        self.sessions.remove(&id);
+        if let Some(session) = self.sessions.remove(&id) {
+            if session.is_agent {
+                self.retain_closed_agent(&session);
+            }
+        }
         self.exited.remove(&id);
+    }
+
+    /// Remove every agent-owned session started by `task_id` and return their
+    /// ids. User terminals a task merely ran a command in are left alone.
+    pub fn destroy_agent_sessions_for_task(&mut self, task_id: &str) -> Vec<SessionId> {
+        let ids: Vec<SessionId> = self
+            .sessions
+            .values()
+            .filter(|s| {
+                s.is_agent
+                    && s.task_id
+                        .lock()
+                        .is_ok_and(|owner| owner.as_deref() == Some(task_id))
+            })
+            .map(|s| s.id)
+            .collect();
+        for id in &ids {
+            self.destroy_session(*id);
+        }
+        ids
     }
 
     pub fn exists(&self, id: SessionId) -> bool {
@@ -138,17 +226,16 @@ impl TerminalManager {
     }
 
     /// Read the tail of a session's output buffer as a lossy UTF-8 string.
+    /// A closed agent terminal answers with its retained last output.
     pub fn read_output_tail(&self, id: SessionId, max_bytes: usize) -> Result<String> {
         if let Some(session) = self.sessions.get(&id) {
             return Ok(read_tail(&session.output_buffer, max_bytes));
         }
         if let Some(retired) = self.exited.get(&id) {
-            let s = &retired.scrollback_ansi;
-            let start = s.len().saturating_sub(max_bytes);
-            let start = (start..s.len())
-                .find(|i| s.is_char_boundary(*i))
-                .unwrap_or(s.len());
-            return Ok(s[start..].to_string());
+            return Ok(str_tail(&retired.scrollback_ansi, max_bytes).to_string());
+        }
+        if let Some(closed) = self.closed_agent.get(&id) {
+            return Ok(str_tail(&closed.output, max_bytes).to_string());
         }
         Err(anyhow::anyhow!("Session not found: {}", id))
     }
@@ -156,12 +243,15 @@ impl TerminalManager {
     /// Render the *current visible screen* of a session as plain text, with all
     /// escape sequences resolved by the headless emulator. This is what the
     /// agent should read when it wants "what's on screen now" (e.g. a TUI),
-    /// versus `read_output_tail` which returns the raw byte scrollback.
+    /// versus `read_output_tail` which returns the raw byte scrollback. A
+    /// closed agent terminal answers with the screen it had when it closed.
     pub fn render_screen(&self, id: SessionId) -> Result<String> {
-        let session = self
-            .sessions
-            .get(&id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+        let Some(session) = self.sessions.get(&id) else {
+            return match self.closed_agent.get(&id) {
+                Some(closed) => Ok(closed.screen.clone()),
+                None => Err(anyhow::anyhow!("Session not found: {}", id)),
+            };
+        };
         let emu = session
             .emulator
             .lock()
@@ -219,12 +309,24 @@ impl TerminalManager {
     pub fn clear_command_in_flight(&self, id: SessionId) {
         if let Some(session) = self.sessions.get(&id) {
             if let Ok(mut slot) = session.command_in_flight.lock() {
-                *slot = None;
+                if slot.take().is_some() {
+                    session
+                        .command_completed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             if let Ok(mut slot) = session.expected_end.lock() {
                 *slot = None;
             }
         }
+    }
+
+    /// True once an agent command sent to this session has been marked finished.
+    pub fn command_completed(&self, id: SessionId) -> bool {
+        self.sessions.get(&id).is_some_and(|s| {
+            s.command_completed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
     }
 
     /// Record the end marker the next agent command will print on completion.
@@ -318,8 +420,11 @@ impl TerminalManager {
             .unwrap_or(false);
         // Retire (rather than forget) user-owned sessions so the UI can keep
         // the tab visible with an "exited" marker + frozen scrollback. Agent
-        // sessions route their exit to the owning task instead and vanish.
-        if !session.is_agent {
+        // sessions route their exit to the owning task instead and vanish
+        // from the list, but their last output stays readable.
+        if session.is_agent {
+            self.retain_closed_agent(&session);
+        } else {
             let mut scrollback_ansi = session
                 .emulator
                 .lock()
@@ -365,6 +470,15 @@ impl TerminalManager {
         }
         Some((task_id, label, last_command, tail, command_was_in_flight))
     }
+}
+
+/// The last `max_bytes` of `s`, moved forward to a char boundary.
+fn str_tail(s: &str, max_bytes: usize) -> &str {
+    let start = s.len().saturating_sub(max_bytes);
+    let start = (start..s.len())
+        .find(|i| s.is_char_boundary(*i))
+        .unwrap_or(s.len());
+    &s[start..]
 }
 
 fn session_info(s: &PtySession) -> SessionInfo {
@@ -456,5 +570,302 @@ mod expected_end_tests {
         m.clear_command_in_flight(id);
         assert!(!m.expected_end_seen(id));
         m.destroy_session(id);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn test_shell() -> Option<&'static str> {
+        ["/bin/zsh", "/bin/bash", "/bin/sh"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file())
+    }
+
+    /// Whether `pid` still has a process-table entry (running or zombie).
+    fn pid_exists(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks that the pid can be signalled.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    fn spawn(m: &mut TerminalManager, is_agent: bool) -> Option<(SessionInfo, crate::BoxedChild)> {
+        let shell = test_shell()?;
+        let Ok((info, mut reader, _buffer, _emu, child)) = m.create_session(
+            std::env::temp_dir(),
+            "t".into(),
+            is_agent,
+            Some(shell.into()),
+            None,
+            &[],
+        ) else {
+            panic!("could not spawn {shell}");
+        };
+        // Drain the pty so the shell never blocks on a full output buffer.
+        std::thread::spawn(move || {
+            let mut b = [0u8; 4096];
+            while matches!(std::io::Read::read(&mut reader, &mut b), Ok(n) if n > 0) {}
+        });
+        Some((info, child))
+    }
+
+    /// Tracker issue #19: closing a terminal must end its shell and collect
+    /// the exit status, even while a command is still running in it.
+    #[test]
+    fn a_closed_terminal_leaves_no_shell_and_no_zombie() {
+        let mut m = TerminalManager::new();
+        let Some((info, mut child)) = spawn(&mut m, true) else {
+            return;
+        };
+        let pid = info.pid.expect("shell pid");
+        m.write_session(info.id, b" sleep 300\r").expect("write");
+        let start = Instant::now();
+        while crate::process_has_children(pid) != Some(true) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "sleep never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        m.destroy_session(info.id);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            pid_exists(pid),
+            "closing the session alone neither stops nor collects the shell"
+        );
+
+        let start = Instant::now();
+        crate::reap_shell(&mut child);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(!pid_exists(pid), "shell {pid} is still running or a zombie");
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+        // Reaping twice is harmless.
+        crate::reap_shell(&mut child);
+    }
+
+    #[test]
+    fn an_idle_shell_that_already_left_is_collected_without_a_signal() {
+        let mut m = TerminalManager::new();
+        let Some((info, mut child)) = spawn(&mut m, true) else {
+            return;
+        };
+        let pid = info.pid.expect("shell pid");
+        m.write_session(info.id, b" exit\r").expect("write");
+        let start = Instant::now();
+        while crate::process_has_children(pid).is_some() && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+            if !matches!(child.try_wait(), Ok(None)) {
+                break;
+            }
+        }
+        m.destroy_session(info.id);
+        crate::reap_shell(&mut child);
+        assert!(!pid_exists(pid));
+    }
+
+    #[test]
+    fn deleting_a_task_closes_only_the_agent_terminals_it_started() {
+        let mut m = TerminalManager::new();
+        let Some((mine, mut c1)) = spawn(&mut m, true) else {
+            return;
+        };
+        let (other, mut c2) = spawn(&mut m, true).expect("spawn");
+        let (user, mut c3) = spawn(&mut m, false).expect("spawn");
+        m.set_task_id(mine.id, "task-a").expect("tag");
+        m.set_task_id(other.id, "task-b").expect("tag");
+        // The agent of task-a ran a command in the user's own terminal.
+        m.set_task_id(user.id, "task-a").expect("tag");
+
+        assert_eq!(m.destroy_agent_sessions_for_task("task-a"), vec![mine.id]);
+        assert!(!m.exists(mine.id));
+        assert!(m.exists(other.id) && m.exists(user.id));
+        assert!(m.destroy_agent_sessions_for_task("task-a").is_empty());
+
+        m.destroy_session(other.id);
+        m.destroy_session(user.id);
+        for child in [&mut c1, &mut c2, &mut c3] {
+            crate::reap_shell(child);
+        }
+    }
+
+    #[test]
+    // `rlim_t` is u64 on macOS and Linux but not on every Unix.
+    #[allow(clippy::unnecessary_cast)]
+    fn the_descriptor_limit_is_raised_and_never_lowered() {
+        let (before, after) = crate::raise_fd_limit().expect("limit readable");
+        assert!(after >= before, "{before} -> {after}");
+        let mut now = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `now` is a valid, writable rlimit.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut now) }, 0);
+        assert_eq!(now.rlim_cur as u64, after);
+        assert!(
+            after >= 1024 || now.rlim_max < 1024,
+            "soft limit {after} with hard limit {}",
+            now.rlim_max
+        );
+        // A second call has nothing left to do.
+        assert_eq!(crate::raise_fd_limit(), Some((after, after)));
+    }
+}
+
+#[cfg(test)]
+mod closed_agent_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn test_shell() -> Option<&'static str> {
+        if cfg!(windows) {
+            ["C:\\Program Files\\Git\\bin\\bash.exe"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).is_file())
+        } else {
+            ["/bin/zsh", "/bin/bash", "/bin/sh"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).is_file())
+        }
+    }
+
+    /// Spawn a session, print a marker, and wait until it is in the buffer.
+    fn session_with_output(m: &mut TerminalManager, is_agent: bool, marker: &str) -> Option<u64> {
+        let shell = test_shell()?;
+        let (info, mut reader, buffer, _emu, _child) = m
+            .create_session(
+                std::env::temp_dir(),
+                "t".into(),
+                is_agent,
+                Some(shell.into()),
+                None,
+                &[],
+            )
+            .expect("spawn");
+        std::thread::spawn(move || {
+            let mut b = [0u8; 4096];
+            while let Ok(n) = std::io::Read::read(&mut reader, &mut b) {
+                if n == 0 {
+                    break;
+                }
+                append_output(&buffer, &b[..n]);
+            }
+        });
+        // Octal escape so the typed command line does not contain the marker.
+        let line = format!(" printf '\\137{marker}\\n'\r");
+        m.write_session(info.id, line.as_bytes()).expect("write");
+        let want = format!("_{marker}");
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if m.read_output_tail(info.id, 16 * 1024)
+                .is_ok_and(|s| s.contains(&want))
+            {
+                return Some(info.id);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("marker never reached the output buffer");
+    }
+
+    /// Tracker issue #14: an agent terminal reclaimed after its command
+    /// finished must still answer a read with its last output.
+    #[test]
+    fn closed_agent_terminal_keeps_its_last_output_readable() {
+        let mut m = TerminalManager::new();
+        let Some(id) = session_with_output(&mut m, true, "CLOSEDOUT") else {
+            return;
+        };
+
+        assert!(m.take_for_exit(id, 4 * 1024).is_some());
+
+        assert!(!m.exists(id));
+        assert!(m.is_closed_agent(id));
+        assert!(
+            m.list_sessions().iter().all(|s| s.id != id),
+            "a closed agent terminal must not be listed"
+        );
+        let out = m.read_output_tail(id, 32 * 1024).expect("retained output");
+        assert!(out.contains("_CLOSEDOUT"), "{out:?}");
+        assert!(m.read_output_tail(id, 4).expect("tail").len() <= 4);
+        assert!(m.render_screen(id).is_ok());
+        assert!(
+            m.write_session(id, b"x").is_err(),
+            "a closed terminal accepts no input"
+        );
+    }
+
+    #[test]
+    fn explicitly_destroyed_agent_terminal_keeps_its_last_output() {
+        let mut m = TerminalManager::new();
+        let Some(id) = session_with_output(&mut m, true, "KILLEDOUT") else {
+            return;
+        };
+        m.destroy_session(id);
+        let out = m.read_output_tail(id, 32 * 1024).expect("retained output");
+        assert!(out.contains("_KILLEDOUT"), "{out:?}");
+    }
+
+    #[test]
+    fn destroyed_user_terminal_is_forgotten() {
+        let mut m = TerminalManager::new();
+        let Some(id) = session_with_output(&mut m, false, "USEROUT") else {
+            return;
+        };
+        m.destroy_session(id);
+        assert!(!m.is_closed_agent(id));
+        assert!(m.read_output_tail(id, 1024).is_err());
+    }
+
+    #[test]
+    fn unknown_terminal_still_reports_not_found() {
+        let m = TerminalManager::new();
+        let err = m.read_output_tail(999, 1024).unwrap_err().to_string();
+        assert!(err.contains("Session not found"), "{err}");
+        assert!(m.render_screen(999).is_err());
+    }
+
+    /// The idle auto-close is armed by a finished command, whoever finished
+    /// it — not by a session that was merely created.
+    #[test]
+    fn finishing_an_in_flight_command_marks_the_session_completed() {
+        let mut m = TerminalManager::new();
+        let Some(id) = session_with_output(&mut m, true, "ARMOUT") else {
+            return;
+        };
+        assert!(!m.command_completed(id));
+        m.clear_command_in_flight(id);
+        assert!(
+            !m.command_completed(id),
+            "clearing with nothing in flight is not a completed command"
+        );
+
+        m.mark_command_in_flight(id).expect("mark");
+        assert!(!m.command_completed(id), "still running");
+        m.clear_command_in_flight(id);
+        assert!(m.command_completed(id));
+        assert!(!m.command_completed(999));
+        m.destroy_session(id);
+    }
+
+    #[test]
+    fn oldest_closed_agent_terminal_is_evicted_beyond_the_cap() {
+        let mut m = TerminalManager::new();
+        for id in 0..=(MAX_CLOSED_AGENT_SESSIONS as u64) {
+            m.remember_closed_agent(id, format!("out-{id}"), String::new());
+        }
+        assert_eq!(m.closed_agent.len(), MAX_CLOSED_AGENT_SESSIONS);
+        assert!(m.read_output_tail(0, 1024).is_err(), "oldest is gone");
+        assert_eq!(m.read_output_tail(1, 1024).unwrap(), "out-1");
+        let newest = MAX_CLOSED_AGENT_SESSIONS as u64;
+        assert_eq!(
+            m.read_output_tail(newest, 1024).unwrap(),
+            format!("out-{newest}")
+        );
     }
 }

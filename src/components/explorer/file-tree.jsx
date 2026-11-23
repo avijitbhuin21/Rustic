@@ -8,16 +8,16 @@ import { contextMenuState } from './context-menu-state';
 import { createFile, createFolder, readDir, renameEntry, moveEntry, deleteEntry, useExplorer } from '@/state/explorer';
 import { confirm } from '@/components/confirm-dialog';
 import { useActiveFilePath, isInside, pathKey } from '@/lib/active-file';
+import { useCoarsePointer } from '@/lib/use-coarse-pointer';
+import { useSpacingUnit } from '@/lib/use-spacing-unit';
 
-const ROW_HEIGHT = 24;
 const SKELETON_WIDTHS = [62, 45, 78, 53];
-const SKELETON_HEIGHT = SKELETON_WIDTHS.length * ROW_HEIGHT;
 
-function SkeletonRows() {
+function SkeletonRows({ rowHeight }) {
   return (
     <div className="w-full">
       {SKELETON_WIDTHS.map((w, i) => (
-        <div key={i} className="flex h-6 items-center gap-1 px-1">
+        <div key={i} className="flex items-center gap-1 px-1" style={{ height: rowHeight }}>
           <div className="size-3 rounded-sm bg-muted/50 animate-pulse" />
           <div className="h-2.5 rounded bg-muted/50 animate-pulse" style={{ width: `${w}%` }} />
         </div>
@@ -532,7 +532,13 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
   }, [selectionRoot, rootPath]);
 
   const visibleCount = useMemo(() => countVisible(data, openIds), [data, openIds]);
-  const treeHeight = loading ? SKELETON_HEIGHT : Math.max(ROW_HEIGHT, visibleCount * ROW_HEIGHT);
+  // The list reserves exactly this many px per row and rows fill their slot.
+  // It follows the theme's spacing (and the taller touch rows): a fixed 24
+  // made rows overflow their slots under roomier themes, which turned every
+  // project's list into a second, tiny scroll area.
+  const coarse = useCoarsePointer();
+  const rowHeight = Math.round((coarse ? 8 : 6) * useSpacingUnit());
+  const treeHeight = loading ? SKELETON_WIDTHS.length * rowHeight : Math.max(rowHeight, visibleCount * rowHeight);
 
   // Follow the active editor file (VS Code "autoReveal"): open each ancestor
   // folder top-down, select the row, scroll it into view. Folders the user
@@ -616,7 +622,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
       style={{ height: treeHeight, transition: 'height 200ms ease' }}
     >
       {loading ? (
-        <SkeletonRows />
+        <SkeletonRows rowHeight={rowHeight} />
       ) : (
         <Tree
           ref={treeRef}
@@ -625,7 +631,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
           width="100%"
           height={treeHeight}
           indent={12}
-          rowHeight={ROW_HEIGHT}
+          rowHeight={rowHeight}
           onToggle={onToggle}
           onActivate={handleActivate}
           onSelect={handleSelect}

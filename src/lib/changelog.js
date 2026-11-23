@@ -2,6 +2,31 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.8.6',
+    date: 'November 2026',
+    entries: [
+      { tag: 'new', text: 'Film view for HTML pages that draw a film in code (a page that sets `window.DUR` and `window.render(t)`, as Lemo-Opuscar films do). Open the page and choose Film beside Edit and Preview: drag the slider to scrub, play at real speed with the sound mix, step one frame at a time, jump to the page\'s cue markers, and pin notes to a timestamp that are placed in the chat box for you to send. The view reloads when the page\'s files change. The page\'s scripts run in a sandbox that cannot reach Rustic, hidden files or anything outside the film\'s folder. Rustic asks once per project before running them, because a page could still send that folder\'s files out over WebRTC. Not available in the Windows desktop app yet.' },
+      { tag: 'new', text: 'Edit what is already on a PDF page. In the PDF preview, choose Edit, then the new "Edit page content" tool: drag an image or a line of text to move it, press Delete to remove it, or double-click a line to retype it. Undo steps back one edit at a time, and Save writes the result. Scanned pages and pages whose text is drawn as outlines have no text to edit, and the page says so.' },
+      { tag: 'new', text: 'Inline chat in the code editor: select some code, or just place the cursor, and press Ctrl/Cmd+I. Ask for a change and the rewrite appears as a diff you Accept (Ctrl/Cmd+Enter) or Discard (Esc); nothing is written until you accept, and one undo reverts it. Ask a question and the answer appears in the box without touching the file. It has its own model picker, remembered separately from the agent panel.' },
+      { tag: 'improved', text: 'Word (.docx) editor redesign: the toolbar is one slim row that follows your theme, with File / Format / Insert / Help behind a single menu button and a chevron for tools that do not fit. Zoom moved to a small control in the bottom-right corner, a table-of-contents button in the bottom-left lists the headings and jumps to the one you pick (the list stays open until you close it), and a page wider than the pane opens fitted to its width.' },
+      { tag: 'improved', text: 'Word and PDF files now scroll with the mouse wheel or a two-finger swipe. Zoom with Ctrl/Cmd + scroll or the zoom buttons. Image and HTML previews still zoom on scroll.' },
+      { tag: 'fixed', text: 'Word (.docx) editor: an image copied to the clipboard is now inserted when you paste from the right-click menu, not only with the keyboard shortcut.' },
+      { tag: 'new', text: 'Sketchbook — a new built-in theme drawn by hand: warm paper, pencil outlines on buttons, fields, popups and panels, marker fills, highlighter hovers, a handwritten typeface and small doodles. Themes can turn this on with the new `ink: "sketch"` style and the `paper` texture. Hand-drawn ink and the Kevin Sans typeface are by Looseleaf (MIT).' },
+      { tag: 'new', text: 'PowerPoint (.pptx) files now open in an editor instead of a read-only viewer: edit text, shapes and slides, with the slide strip along the bottom, and save with Ctrl/Cmd+S. When the agent changes the file, the open deck updates in place; if you have unsaved edits you are asked before they are replaced. Editor by EigenPal PPTX Editor (Apache-2.0).' },
+      { tag: 'improved', text: 'Rustic now ships two themes: Obsidian (dark) and Sketchbook (light). Basalt, Hearth, Petal, Midnight, Onyx, Neo Brutal, Grove and Neon Grid are no longer built in; if you were using one of them you are moved to Obsidian. Themes you installed yourself are untouched.' },
+      { tag: 'improved', text: 'The Dark / Light / Match system switch is gone: a theme now decides whether it is dark or light. Themes that include both get a Dark / Light choice next to their name.' },
+      { tag: 'improved', text: 'A question from the agent survives a restart. If you quit while one is open, reopening the chat shows the question form again, and answering it continues the chat. Expanding an `ask_user` row now shows the questions, the options and what you chose instead of raw JSON.' },
+      { tag: 'improved', text: '/goal: a message you type while a goal is set ends the goal, whether it is running or blocked; only a new /goal starts the loop again. Answering a question from the agent does not end it. A goal now keeps its turn count across a restart, a blocked goal stays blocked with its reason, and nothing starts running until you send something.' },
+      { tag: 'improved', text: 'Security: MCP tools that are not marked read-only now ask before they run in Ask and Auto-edit modes and are refused in Chat mode. Agent search no longer reads paths outside the project unless "Grant access to all files" is on. Remote images in agent replies load only when you click them, and a diagram the agent writes that points at a remote resource is shown as code.' },
+      { tag: 'improved', text: 'Remote backends and device sync: a remote backend on a public host must use https://. rustic-server asks before accepting a push from a paired device (set RUSTIC_PEER_AUTO_ACCEPT_PUSH=1 for a headless server). Pairing a device again clears what was shared with it. The GitHub issue fixer ignores comments from accounts that are not the owner, a member or a collaborator.' },
+      { tag: 'improved', text: 'Self-hosting: docker-compose.yml now sets RUSTIC_TRUSTED_PROXIES for the bundled Caddy. Remove it if you publish the server port directly.' },
+      { tag: 'fixed', text: 'The agent can read the last output of a terminal that has already closed, and no longer sees another chat\'s file edits listed as its own.' },
+      { tag: 'fixed', text: 'Agent search: `include` and `exclude` patterns with `{a,b}` alternatives and folder prefixes now match. Theme tools the agent loads on demand no longer fail with "unknown tool".' },
+      { tag: 'fixed', text: 'Pasting a screenshot into the chat box works again after a PowerPoint file has been opened.' },
+      { tag: 'fixed', text: 'Agent terminal output no longer shows part of Rustic\'s own command wrapper after a long command line.' },
+    ],
+  },
+  {
     version: '0.8.5',
     date: 'November 2026',
     entries: [

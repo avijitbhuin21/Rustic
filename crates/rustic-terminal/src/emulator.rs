@@ -55,16 +55,37 @@ pub struct TerminalEmulator {
     rows: usize,
 }
 
+/// Scrollback lines kept for a terminal the user works in; matches the
+/// frontend's own scrollback, which a reopened pane is refilled from.
+pub const USER_SCROLLBACK_LINES: usize = 10_000;
+
+/// Scrollback lines kept for an agent terminal. Nobody scrolls these by hand:
+/// the agent reads the screen and the raw output tail, and a pane opened late
+/// only needs recent context. A full history costs up to ~29 MB per terminal
+/// at 120 columns.
+pub const AGENT_SCROLLBACK_LINES: usize = 2_000;
+
+const _: () = assert!(AGENT_SCROLLBACK_LINES < USER_SCROLLBACK_LINES);
+
 impl TerminalEmulator {
     /// Create an emulator sized to the session's initial PTY dimensions.
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::with_scrollback(cols, rows, USER_SCROLLBACK_LINES)
+    }
+
+    /// Create an emulator that keeps at most `scrollback` lines above the screen.
+    pub fn with_scrollback(cols: u16, rows: u16, scrollback: usize) -> Self {
         let cols = (cols as usize).max(1);
         let rows = (rows as usize).max(1);
         let size = GridSize {
             columns: cols,
             screen_lines: rows,
         };
-        let term = Term::new(Config::default(), &size, VoidListener);
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Config::default()
+        };
+        let term = Term::new(config, &size, VoidListener);
         Self {
             term,
             parser: Processor::new(),
@@ -530,6 +551,26 @@ mod tests {
             text
         );
         assert!(text.contains("Progress: 100%"), "final frame not preserved");
+    }
+
+    #[test]
+    fn scrollback_is_bounded_by_the_requested_history() {
+        let feed = |emu: &mut TerminalEmulator| {
+            for n in 0..300 {
+                emu.advance(format!("row {n:04}\r\n").as_bytes());
+            }
+        };
+        let mut small = TerminalEmulator::with_scrollback(40, 5, 50);
+        feed(&mut small);
+        let text = strip_ansi(&small.render_scrollback_ansi());
+        assert!(text.contains("row 0299"), "newest output is kept");
+        assert!(text.contains("row 0250"));
+        assert!(!text.contains("row 0200"), "older than the cap is dropped");
+        assert!(text.lines().count() <= 50 + 5, "{}", text.lines().count());
+
+        let mut full = TerminalEmulator::new(40, 5);
+        feed(&mut full);
+        assert!(strip_ansi(&full.render_scrollback_ansi()).contains("row 0000"));
     }
 
     #[test]

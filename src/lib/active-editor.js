@@ -59,6 +59,31 @@ export function getActiveTab() {
   return activeTab;
 }
 
+/** True when keyboard focus is inside the registered code editor or one of its widgets. */
+export function isActiveEditorFocused() {
+  try {
+    // DOM containment, not Monaco's focus tracker: the tracker updates a tick
+    // after focus moves, so a key pressed right after would still pass.
+    const node = activeEditor?.getDomNode?.();
+    const focused = typeof document !== 'undefined' ? document.activeElement : null;
+    return !!node && !!focused && node.contains(focused);
+  } catch {
+    return false;
+  }
+}
+
+let activeInlineChat = null;
+
+// monaco-editor.jsx registers its inline chat opener here (same lifecycle as
+// the saver) so the `editor.inlineChat` command can reach the focused editor.
+export function setActiveInlineChat(fn) { activeInlineChat = fn; }
+export function clearActiveInlineChat(fn) { if (activeInlineChat === fn) activeInlineChat = null; }
+
+/** Open the inline chat (Ctrl+I) at the selection or cursor of the focused editor. */
+export function openInlineChatInActiveEditor() {
+  if (activeInlineChat) activeInlineChat();
+}
+
 // Apply formatted content via executeEdits so Monaco records the change as an
 // undoable operation. Plain editor.setValue() *replaces the model* and wipes
 // the undo stack, which means Ctrl+Z after format-on-save can't restore the

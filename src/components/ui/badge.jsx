@@ -3,6 +3,9 @@ import { cva } from "class-variance-authority";
 import { Slot } from "radix-ui"
 
 import { cn } from "@/lib/utils"
+import { InkLayer, useInkKit } from "@/components/ui/ink"
+
+const INKED_VARIANTS = new Set(["default", "secondary", "destructive", "outline"])
 
 const badgeVariants = cva(
   "group/badge inline-flex h-5 w-fit shrink-0 items-center justify-center gap-1 overflow-hidden rounded-4xl border border-transparent px-2 py-0.5 text-xs font-medium whitespace-nowrap transition-all focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&>svg]:pointer-events-none [&>svg]:size-3!",
@@ -31,16 +34,28 @@ function Badge({
   className,
   variant = "default",
   asChild = false,
+  children,
   ...props
 }) {
   const Comp = asChild ? Slot.Root : "span"
+  const inked = useInkKit() !== null && INKED_VARIANTS.has(variant)
+  // The badge sizes its direct <svg> children with !important, so the drawing
+  // sits in a wrapper instead of directly inside it.
+  const ink = inked ? (
+    <span data-ink-wrap="" aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10">
+      <InkLayer recipe="badge" params={{ variant, size: "default" }} />
+    </span>
+  ) : null
 
   return (
     <Comp
       data-slot="badge"
       data-variant={variant}
       className={cn(badgeVariants({ variant }), className)}
-      {...props} />
+      {...props}>
+      {inked && asChild ? <Slot.Slottable>{children}</Slot.Slottable> : children}
+      {ink}
+    </Comp>
   );
 }
 

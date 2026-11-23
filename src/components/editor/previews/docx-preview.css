@@ -1,197 +1,346 @@
-/* ── eigenpal docx-editor dark-theme overrides ────────────────────────
-   The editor scopes its own CSS variables under `.ep-root` (HSL triples
-   like "0 0% 100%") and pulls them through `hsl(var(--…))`. We can't
-   share our IDE's `--background` etc. because ours are in `oklch()`
-   format — wrapping that in `hsl(...)` produces invalid CSS.
+/* ── @eigenpal/docx-editor theme + layout ─────────────────────────────
+   The editor scopes its own tokens under `.ep-root` as HSL triplets
+   (`--background: 0 0% 100%`) read through `hsl(var(--…))`, plus a set of
+   `--doc-*` colours. The IDE's tokens are complete oklch colours, so the
+   two cannot share names: inside `.ep-root`, `var(--border)` is a triplet.
 
-   Instead, re-declare every relevant variable in HSL with dark-theme
-   values when `.dark` is set on any ancestor. Tailwind classes like
-   `.ep-root .bg-popover`, `.bg-background`, `.bg-accent` automatically
-   pick the new values up through CSS variables.
-
-   Hardcoded utility classes (`bg-white`, `bg-slate-100`, `text-slate-700`)
-   don't go through variables — they're explicit overrides below. */
-.dark .ep-root {
-  --background: 222 14% 11%;
-  --foreground: 0 0% 95%;
-  --card: 222 14% 13%;
-  --card-foreground: 0 0% 95%;
-  --popover: 222 14% 14%;
-  --popover-foreground: 0 0% 95%;
-  --primary: 217 91% 60%;
-  --primary-foreground: 0 0% 100%;
-  --secondary: 222 14% 18%;
-  --secondary-foreground: 0 0% 95%;
-  --muted: 222 14% 18%;
-  --muted-foreground: 0 0% 70%;
-  --accent: 222 14% 22%;
-  --accent-foreground: 0 0% 95%;
-  --destructive: 0 70% 50%;
-  --destructive-foreground: 0 0% 98%;
-  --border: 222 14% 22%;
-  --input: 222 14% 22%;
-  --ring: 217 91% 60%;
+   So the IDE tokens are aliased once on the root (where they are still
+   real colours) as `--docx-*`, and everything below reads the aliases.
+   Nothing here redeclares an IDE token, so no rule can leak into the rest
+   of the app; every selector is scoped to `.ep-root` or the host. */
+:root {
+  --docx-background: var(--background);
+  --docx-foreground: var(--foreground);
+  --docx-card: var(--card);
+  --docx-popover: var(--popover);
+  --docx-popover-foreground: var(--popover-foreground);
+  --docx-primary: var(--primary);
+  --docx-primary-foreground: var(--primary-foreground);
+  --docx-secondary: var(--secondary);
+  --docx-secondary-foreground: var(--secondary-foreground);
+  --docx-muted: var(--muted);
+  --docx-muted-foreground: var(--muted-foreground);
+  --docx-accent: var(--accent);
+  --docx-accent-foreground: var(--accent-foreground);
+  --docx-destructive: var(--destructive);
+  --docx-destructive-foreground: var(--destructive-foreground, #fff);
+  --docx-border: var(--border);
+  --docx-input: var(--input);
+  --docx-ring: var(--ring);
+  /* The area around the pages, same tone as the PDF preview. */
+  --docx-desk: color-mix(in oklab, var(--muted) 30%, var(--background));
 }
 
-/* Hardcoded slate / white classes — these don't pull from CSS variables
-   so the override block above can't reach them. Remap each onto our
-   theme tokens when in dark mode. */
-.dark .ep-root .bg-white,
-.dark .ep-root .bg-slate-100,
-.dark .ep-root .bg-slate-200,
-.dark .ep-root .bg-\[\#f1f5f9\] {
-  background-color: hsl(var(--background)) !important;
-}
-.dark .ep-root .bg-slate-900 {
-  background-color: hsl(var(--card)) !important;
-}
-.dark .ep-root .text-slate-700,
-.dark .ep-root .text-slate-800,
-.dark .ep-root .text-white {
-  color: hsl(var(--foreground)) !important;
-}
-.dark .ep-root .text-slate-400,
-.dark .ep-root .text-slate-500 {
-  color: hsl(var(--muted-foreground)) !important;
-}
-.dark .ep-root .border-slate-200,
-.dark .ep-root .border-slate-300,
-.dark .ep-root .border-slate-200\/50 {
-  border-color: hsl(var(--border)) !important;
-}
-.dark .ep-root .hover\:bg-slate-50:hover,
-.dark .ep-root .hover\:bg-slate-100:hover,
-.dark .ep-root .hover\:bg-slate-100\/80:hover {
-  background-color: hsl(var(--accent)) !important;
-}
-.dark .ep-root .hover\:bg-slate-800:hover {
-  background-color: hsl(var(--accent)) !important;
-}
-.dark .ep-root .focus\:bg-slate-100:focus,
-.dark .ep-root .focus\:bg-slate-100\/80:focus,
-.dark .ep-root .focus\:bg-white:focus {
-  background-color: hsl(var(--accent)) !important;
-}
-.dark .ep-root .hover\:text-slate-900:hover {
-  color: hsl(var(--foreground)) !important;
-}
-.dark .ep-root .hover\:border-slate-300:hover {
-  border-color: hsl(var(--border)) !important;
-}
-
-/* ── Radix Select portal ─────────────────────────────────────────────
-   Radix portals the SelectContent dropdown to `document.body`, so the
-   above `.dark .ep-root …` rules don't reach it. Target the Radix popper
-   wrapper instead.
-
-   CRITICAL: this must stay scoped to the docx editor's OWN portals. These
-   rules re-declare `--background`, `--foreground` etc. as HSL triples for
-   the third-party editor, but the IDE's tokens are `oklch()` values used
-   as bare `var(--token)`. An unscoped `[data-radix-popper-content-wrapper]`
-   selector leaked the HSL triples into every tooltip / popover / dropdown
-   in the app, making `background-color: var(--foreground)` invalid — the
-   browser dropped it and every portal rendered fully transparent (the
-   see-through context-usage tooltip over the chat input).
-
-   `:has([class*="slate-"])` restricts the block to portals whose content
-   carries the editor's hardcoded slate utilities. Nothing in the IDE's own
-   UI uses those, so our portals keep their oklch tokens untouched. */
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) {
-  --background: 222 14% 11%;
-  --foreground: 0 0% 95%;
-  --popover: 222 14% 14%;
-  --popover-foreground: 0 0% 95%;
-  --muted: 222 14% 18%;
-  --muted-foreground: 0 0% 70%;
-  --accent: 222 14% 22%;
-  --accent-foreground: 0 0% 95%;
-  --border: 222 14% 22%;
-  --primary: 217 91% 60%;
-  --primary-foreground: 0 0% 100%;
-  color: hsl(var(--popover-foreground));
-}
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .bg-white,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .bg-slate-100,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .bg-slate-200,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) [class*="bg-popover"] {
-  background-color: hsl(var(--popover)) !important;
-}
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-slate-700,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-slate-800,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-white,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) [class*="text-popover-foreground"] {
-  color: hsl(var(--popover-foreground)) !important;
-}
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-slate-400,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-slate-500 {
-  color: hsl(var(--muted-foreground)) !important;
-}
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .border-slate-200,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .border-slate-300,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .border-input {
-  border-color: hsl(var(--border)) !important;
-}
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .hover\:bg-slate-100:hover,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .hover\:bg-slate-50:hover,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .focus\:bg-slate-100:focus,
-.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) [data-highlighted] {
-  background-color: hsl(var(--accent)) !important;
-  color: hsl(var(--accent-foreground)) !important;
-}
-
-/* ── Document paper area ─────────────────────────────────────────────
-   The page itself (the actual Word document) stays light. That's
-   intentional — when authoring a document the page should look like
-   white paper (matches Word / Google Docs convention). Dark mode is
-   about the chrome (toolbar + dropdowns + sidebar), not the content.
-
-   But the surrounding gutter (between the page edge and the editor
-   pane edge) was rendering with eigenpal's `--doc-bg: #f8f9fa` which
-   is a light gray — visible as a thin bright strip around the page.
-   Re-paint that gutter in our IDE background. */
-.dark .ep-root .bg-doc-bg {
-  background-color: hsl(var(--background)) !important;
-}
-
-/* ── Wrapper ─────────────────────────────────────────────────────────
-   The host div fills the editor pane and inherits IDE chrome colours
-   so the small strip between the editor toolbar and the page reads as
-   part of the IDE rather than a foreign element. */
 .rustic-docx-host {
   position: relative;
   height: 100%;
   width: 100%;
-  background: hsl(var(--background));
-  color: hsl(var(--foreground));
+  background: var(--docx-desk);
+  color: var(--foreground);
 }
 
-/* ── Hand-rolled popups (FontSizePicker, etc.) ───────────────────────
-   eigenpal's font-size dropdown isn't a Radix Select — it's a custom
-   `<div role="listbox">` with inline styles (white background, light
-   border). Inline styles win over class CSS unless we use !important.
-   These rules force the popup into dark mode whenever the IDE is dark.
-
-   We deliberately use `:where(.dark)` rather than `.dark .ep-root` for
-   the selector base because this popup is rendered with `position:
-   fixed` against `<body>` (via the `ve` hook returning fixed coords),
-   so it visually escapes the editor container — but the DOM tree still
-   nests it under `.ep-root`. The `[role="listbox"]` is unambiguous
-   enough that we don't need ep-root in the selector. */
-.dark [role="listbox"] {
-  background-color: hsl(var(--popover)) !important;
-  border-color: hsl(var(--border)) !important;
-  color: hsl(var(--popover-foreground)) !important;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45) !important;
+/* ── Chrome colours (toolbar, menus, dialogs, sidebars) ────────────── */
+body .ep-root {
+  --doc-surface: var(--docx-popover);
+  --doc-card: var(--docx-card);
+  --doc-bg: var(--docx-desk);
+  --doc-bg-subtle: var(--docx-muted);
+  --doc-bg-hover: var(--docx-accent);
+  --doc-bg-input: var(--docx-background);
+  --doc-primary: var(--docx-primary);
+  --doc-primary-hover: color-mix(in oklab, var(--docx-primary) 85%, var(--docx-background));
+  --doc-primary-light: color-mix(in oklab, var(--docx-primary) 16%, transparent);
+  --doc-on-primary: var(--docx-primary-foreground);
+  --doc-toggle-active-bg: var(--docx-accent);
+  --doc-toggle-active-fg: var(--docx-accent-foreground);
+  --doc-text: var(--docx-foreground);
+  --doc-text-muted: var(--docx-muted-foreground);
+  --doc-text-subtle: color-mix(in oklab, var(--docx-muted-foreground) 70%, transparent);
+  --doc-text-placeholder: color-mix(in oklab, var(--docx-muted-foreground) 70%, transparent);
+  --doc-border: var(--docx-border);
+  --doc-border-light: var(--docx-border);
+  --doc-border-dark: var(--docx-input);
+  --doc-border-input: var(--docx-input);
+  --doc-error: var(--docx-destructive);
+  --doc-error-bg: color-mix(in oklab, var(--docx-destructive) 14%, transparent);
+  --doc-focus-ring: color-mix(in oklab, var(--docx-ring) 45%, transparent);
 }
-.dark [role="listbox"] > button,
-.dark [role="listbox"] [role="option"] {
-  color: hsl(var(--popover-foreground)) !important;
+
+/* ── Paper ─────────────────────────────────────────────────────────
+   The pages stay white paper in every theme (Word / Google Docs
+   convention), so anything the editor draws on top of them (selection
+   handles, resize guides, header labels, the drop cursor) keeps the
+   editor's own light palette. Theme colours here would turn near-white
+   in a dark theme and vanish against the page. Only the desk follows
+   the theme. */
+body .ep-root.paged-editor {
+  --doc-surface: #fff;
+  --doc-card: #f8fbff;
+  --doc-bg-subtle: #f5f5f5;
+  --doc-bg-hover: #f1f3f4;
+  --doc-bg-input: #f8f9fa;
+  --doc-primary: #1a73e8;
+  --doc-primary-hover: #1557b0;
+  --doc-primary-light: #e8f0fe;
+  --doc-on-primary: #fff;
+  --doc-toggle-active-bg: #202124;
+  --doc-toggle-active-fg: #fff;
+  --doc-text: #202124;
+  --doc-text-muted: #5f6368;
+  --doc-text-subtle: #9aa0a6;
+  --doc-text-placeholder: #999;
+  --doc-border: #e0e0e0;
+  --doc-border-light: #dadce0;
+  --doc-border-dark: #d0d0d0;
+  --doc-border-input: #ccc;
+  --doc-error: #c5221f;
+  --doc-error-bg: #fce8e6;
+  --doc-focus-ring: rgba(26, 115, 232, 0.4);
+}
+
+/* ── Utility classes ───────────────────────────────────────────────
+   One override per editor rule that reads `hsl(var(--token))`, in the
+   editor's own order (styles.css of @eigenpal/docx-editor-react 1.8.3).
+   A class the editor adds later simply keeps its built-in colour. */
+body .ep-root .border-border { border-color: var(--docx-border); }
+body .ep-root .border-border\/50 { border-color: color-mix(in oklab, var(--docx-border) 50%, transparent); }
+body .ep-root .border-input { border-color: var(--docx-input); }
+body .ep-root .bg-background { background-color: var(--docx-background); }
+body .ep-root .bg-border { background-color: var(--docx-border); }
+body .ep-root .bg-destructive { background-color: var(--docx-destructive); }
+body .ep-root .bg-foreground { background-color: var(--docx-foreground); }
+body .ep-root .bg-muted { background-color: var(--docx-muted); }
+body .ep-root .bg-popover { background-color: var(--docx-popover); }
+body .ep-root .bg-primary { background-color: var(--docx-primary); }
+body .ep-root .bg-secondary { background-color: var(--docx-secondary); }
+body .ep-root .text-destructive { color: var(--docx-destructive); }
+body .ep-root .text-destructive-foreground { color: var(--docx-destructive-foreground); }
+body .ep-root .text-foreground { color: var(--docx-foreground); }
+body .ep-root .text-muted-foreground { color: var(--docx-muted-foreground); }
+body .ep-root .text-popover-foreground { color: var(--docx-popover-foreground); }
+body .ep-root .text-primary { color: var(--docx-primary); }
+body .ep-root .text-primary-foreground { color: var(--docx-primary-foreground); }
+body .ep-root .text-secondary-foreground { color: var(--docx-secondary-foreground); }
+/* Only used for the tooltip label, which sits on `bg-foreground`. */
+body .ep-root .text-white { color: var(--docx-background); }
+body .ep-root .ring-offset-background { --tw-ring-offset-color: var(--docx-background); }
+body .ep-root .hover\:border-input:hover { border-color: var(--docx-input); }
+body .ep-root .hover\:bg-accent:hover { background-color: var(--docx-accent); }
+body .ep-root .hover\:bg-destructive\/90:hover { background-color: color-mix(in oklab, var(--docx-destructive) 90%, transparent); }
+body .ep-root .hover\:bg-muted:hover { background-color: var(--docx-muted); }
+body .ep-root .hover\:bg-muted\/80:hover { background-color: color-mix(in oklab, var(--docx-muted) 80%, transparent); }
+body .ep-root .hover\:bg-primary\/90:hover { background-color: color-mix(in oklab, var(--docx-primary) 90%, transparent); }
+body .ep-root .hover\:bg-secondary\/80:hover { background-color: color-mix(in oklab, var(--docx-secondary) 80%, transparent); }
+body .ep-root .hover\:text-accent-foreground:hover { color: var(--docx-accent-foreground); }
+body .ep-root .hover\:text-foreground:hover { color: var(--docx-foreground); }
+body .ep-root .focus\:bg-muted:focus { background-color: var(--docx-muted); }
+body .ep-root .focus\:bg-muted\/80:focus { background-color: color-mix(in oklab, var(--docx-muted) 80%, transparent); }
+body .ep-root .focus\:ring-ring:focus { --tw-ring-color: var(--docx-ring); }
+body .ep-root .focus-visible\:ring-ring:focus-visible { --tw-ring-color: var(--docx-ring); }
+body .ep-root .dark\:bg-muted:is(.dark *) { background-color: var(--docx-muted); }
+body .ep-root .dark\:text-foreground:is(.dark *) { color: var(--docx-foreground); }
+
+/* Hand-rolled pickers (font size) draw a `role="listbox"` with inline colours. */
+body .ep-root [role="listbox"] {
+  background-color: var(--docx-popover) !important;
+  border-color: var(--docx-border) !important;
+  color: var(--docx-popover-foreground) !important;
+}
+body .ep-root [role="listbox"] > button,
+body .ep-root [role="listbox"] [role="option"] {
+  color: var(--docx-popover-foreground) !important;
   background-color: transparent !important;
 }
-.dark [role="listbox"] > button:hover,
-.dark [role="listbox"] [role="option"]:hover,
-.dark [role="listbox"] > button[aria-selected="true"],
-.dark [role="listbox"] [role="option"][aria-selected="true"] {
-  background-color: hsl(var(--accent)) !important;
-  color: hsl(var(--accent-foreground)) !important;
+body .ep-root [role="listbox"] > button:hover,
+body .ep-root [role="listbox"] [role="option"]:hover,
+body .ep-root [role="listbox"] > button[aria-selected="true"],
+body .ep-root [role="listbox"] [role="option"][aria-selected="true"] {
+  background-color: var(--docx-accent) !important;
+  color: var(--docx-accent-foreground) !important;
 }
+/* The paragraph-style list previews each style in the document's own text
+   colour, which is picked for white paper. On a dark popup those go
+   unreadable, so dark themes show the names in the popup's text colour. */
+.dark body .ep-root [role="option"] * {
+  color: inherit !important;
+}
+
+/* ── Toolbar: one slim row ─────────────────────────────────────────
+   The editor ships a title bar (logo + File / Format / Insert / Help)
+   stacked over a pill of formatting controls. Here the two sit side by
+   side: the logo slot holds one menu button, the menu names drop down
+   from it only while it is open, and the controls are 24px tall. In a
+   narrow pane the control groups wrap onto a second row instead of
+   scrolling out of reach. */
+.rustic-docx-host .ep-root [data-testid="editor-toolbar"] {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 3px 6px;
+  background: color-mix(in oklab, var(--docx-muted) 20%, var(--docx-background));
+  border-bottom: 1px solid var(--docx-border);
+  box-shadow: none;
+  color: var(--docx-foreground);
+}
+.rustic-docx-host .ep-root [data-testid="title-bar"] {
+  flex: none;
+  align-items: center;
+  padding: 0;
+  background: transparent;
+}
+.rustic-docx-host .ep-root [data-testid="title-bar"] > div {
+  flex: none;
+  padding: 0;
+}
+.rustic-docx-host .ep-root [data-testid="title-bar"] > div > div {
+  padding: 0;
+}
+
+.rustic-docx-host .rustic-docx-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--docx-muted-foreground);
+}
+.rustic-docx-host .rustic-docx-menu-btn:hover,
+.rustic-docx-host .rustic-docx-menu-btn[aria-expanded="true"] {
+  background: var(--docx-accent);
+  color: var(--docx-accent-foreground);
+}
+.rustic-docx-host .rustic-docx-menu-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.rustic-docx-host .ep-root [data-testid="title-bar"] [role="menubar"] {
+  display: none;
+}
+.rustic-docx-host[data-menu-open] .ep-root [data-testid="title-bar"] [role="menubar"] {
+  display: flex;
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 6px;
+  z-index: 5;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--docx-border);
+  border-radius: 8px;
+  background: var(--docx-popover);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.25);
+}
+.rustic-docx-host .ep-root [data-testid="title-bar"] [role="menubar"] button {
+  font-size: 12px !important;
+}
+
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] {
+  flex: 1 1 0;
+  flex-wrap: wrap;
+  row-gap: 2px;
+  min-width: 0;
+  min-height: 0;
+  max-height: 24px;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border-radius: 0;
+  background: transparent;
+  font-size: 12px;
+}
+/* Groups that do not fit wrap below the first row and stay clipped until
+   the chevron at the right edge expands the bar. */
+.rustic-docx-host[data-toolbar-expanded] .ep-root [data-testid="formatting-bar"] {
+  max-height: none;
+  overflow: visible;
+}
+.rustic-docx-host[data-toolbar-overflow] .ep-root [data-testid="editor-toolbar"] {
+  padding-right: 34px;
+}
+.rustic-docx-host .rustic-docx-more-btn {
+  position: absolute;
+  top: 3px;
+  right: 6px;
+  z-index: 110;
+}
+.rustic-docx-host .rustic-docx-more-btn[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] > [role="group"] {
+  min-height: 24px;
+  padding: 0 4px;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] button {
+  height: 24px !important;
+  border-radius: 5px;
+  font-size: 12px !important;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] button span {
+  font-size: 12px !important;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] button.inline-flex.justify-center {
+  flex: none;
+  width: 24px;
+  padding: 0;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] button[data-testid="toolbar-alignment"] {
+  width: 30px;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] button[role="combobox"] {
+  padding: 0 6px;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] button[aria-label="Select paragraph style"] {
+  width: 108px !important;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] [data-testid="font-size-display"],
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] [data-testid="font-size-input"] {
+  width: 30px;
+  height: 22px !important;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] .docx-color-picker-split {
+  height: 24px !important;
+  gap: 0 !important;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] .docx-color-picker-apply {
+  width: 22px !important;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] .docx-color-picker-arrow {
+  width: 14px !important;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] .docx-list-button {
+  width: 24px !important;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] [role="separator"] {
+  height: 16px !important;
+  margin: 0 4px !important;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] svg {
+  width: 15px;
+  height: 15px;
+}
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] svg.h-4,
+.rustic-docx-host .ep-root [data-testid="formatting-bar"] svg.-ml-1 {
+  width: 12px;
+  height: 12px;
+}
+
+/* ── Floating controls on the page area ────────────────────────────── */
+/* Layout width follows the zoom (set by useDocxLayoutWidth); 922px is the
+   editor's own value for an A4 page at 100%. */
+.rustic-docx-host .docx-editor__scroll-container > div {
+  min-width: var(--docx-layout-min, 922px) !important;
+  /* The editor scales this frame about its centre; without the clip its
+     empty margins add blank scroll to the right of a zoomed-in page. */
+  overflow-x: clip;
+}
+/* The size list's options are inline by default, which makes the list as
+   wide as all of them side by side. */
+.rustic-docx-host .ep-root [role="listbox"] > button[role="option"] {
+  display: block;
+  width: 100% !important;
+}
+

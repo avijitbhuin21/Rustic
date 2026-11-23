@@ -188,6 +188,52 @@ struct FileResult {
 enum GrepMsg {
     File(FileResult),
     Oversized(String),
+    /// A key or secrets file that was left unsearched.
+    Sensitive(String),
+    /// A file or directory that could not be opened, with the OS error.
+    Unreadable(String),
+}
+
+/// Whether grep must leave `path` unsearched: key and credential files always,
+/// secrets files (`.env` and the like) unless the user allowed them.
+fn is_withheld_from_grep(
+    path: &std::path::Path,
+    project_rel: &str,
+    skip_secret_files: bool,
+    allowed_paths: &[String],
+) -> bool {
+    if crate::tools::file_ops::tier1_block_reason(project_rel, path).is_some() {
+        return true;
+    }
+    if !skip_secret_files || project_rel.starts_with(".rustic/") {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    crate::tools::file_ops::is_tier2_secret_name(&name)
+        && !allowed_paths.iter().any(|p| p.trim() == project_rel)
+}
+
+/// Append a "Note: <count> <what>: a, b ... and N more" paragraph listing up to ten `items`.
+fn push_list_note(content: &mut String, items: &[String], what: &str) {
+    if items.is_empty() {
+        return;
+    }
+    let shown: Vec<&str> = items.iter().take(10).map(String::as_str).collect();
+    let more = items.len() - shown.len();
+    content.push_str(&format!(
+        "\n\nNote: {} {}: {}{}",
+        items.len(),
+        what,
+        shown.join(", "),
+        if more > 0 {
+            format!(" ... and {} more", more)
+        } else {
+            String::new()
+        }
+    ));
 }
 
 /// grep-searcher Sink that renders matches into the tool's output format:
@@ -295,7 +341,12 @@ async fn execute_grep_one(
         });
     };
 
-    let search_path = context.project_root.join(path_param);
+    // Same rule as the other file tools: inside the project, unless the user
+    // has granted the task access to all files.
+    let search_path = match crate::tools::file_ops::resolve_with_scope(context, path_param) {
+        Ok(p) => p,
+        Err(out) => return Ok(out),
+    };
     if !search_path.exists() {
         return Ok(ToolOutput {
             content: format!(
@@ -355,19 +406,35 @@ async fn execute_grep_one(
         ctx_before,
         ctx_after,
         respect_gitignore: !show_all,
+        skip_secret_files: !show_all,
+        allowed_paths: context.allowed_paths.clone(),
         max_file_size: MAX_GREP_FILE_SIZE,
         timeout: GREP_TIMEOUT,
     };
-    let content = run_grep(run, &|matches, files| {
-        context.emit_progress(
-            tool_use_id,
-            &format!("{} matches in {} files...", matches, files),
-        );
+    // The search is disk- and CPU-bound for up to a minute. On an async worker
+    // it stalled every other tool call and event of the run for that long, so
+    // it runs on a blocking thread and reports progress back over a channel.
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, u32)>();
+    let mut search = tokio::task::spawn_blocking(move || {
+        run_grep(run, &|matches, files| {
+            let _ = progress_tx.send((matches, files));
+        })
     });
+    let content = loop {
+        tokio::select! {
+            Some((matches, files)) = progress_rx.recv() => context.emit_progress(
+                tool_use_id,
+                &format!("{} matches in {} files...", matches, files),
+            ),
+            done = &mut search => {
+                break done.map_err(|e| anyhow::anyhow!("grep_search worker failed: {e}"))?;
+            }
+        }
+    };
 
     Ok(ToolOutput {
+        is_error: content.starts_with("GREP_ERROR"),
         content,
-        is_error: false,
         attachments: Vec::new(),
     })
 }
@@ -423,7 +490,8 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 }
 
 /// A glob that also understands `{a,b}` alternatives, which the `glob` crate treats as literal text.
-struct BraceGlob(Vec<glob::Pattern>);
+/// Each alternative remembers whether it names a directory (contains `/`).
+struct BraceGlob(Vec<(glob::Pattern, bool)>);
 
 impl BraceGlob {
     /// Compile `pattern`, expanding brace alternatives first.
@@ -436,19 +504,35 @@ impl BraceGlob {
         }
         expanded
             .iter()
-            .map(|p| glob::Pattern::new(p).map_err(|e| e.to_string()))
+            .map(|p| {
+                glob::Pattern::new(p)
+                    .map(|compiled| (compiled, p.contains('/')))
+                    .map_err(|e| e.to_string())
+            })
             .collect::<std::result::Result<Vec<_>, _>>()
             .map(Self)
     }
 
-    /// True when any alternative matches `path`.
-    fn matches_path(&self, path: &std::path::Path) -> bool {
-        self.0.iter().any(|p| p.matches_path(path))
-    }
-
     /// True when any alternative matches `text`.
     fn matches(&self, text: &str) -> bool {
-        self.0.iter().any(|p| p.matches(text))
+        self.0.iter().any(|(p, _)| p.matches(text))
+    }
+
+    /// True when any alternative matches a searched file, given its
+    /// forward-slash path relative to the project root and to the search
+    /// directory. An alternative without `/` also matches the bare file name,
+    /// so `foo.rs` and `{a.rs,b.rs}` find those files at any depth. The
+    /// project-relative path is also tried with a leading `/`, so `*/dir/*`
+    /// covers a top-level `dir` too.
+    fn matches_file(&self, project_rel: &str, search_rel: &str) -> bool {
+        let name = project_rel.rsplit('/').next().unwrap_or(project_rel);
+        let rooted = format!("/{project_rel}");
+        self.0.iter().any(|(p, has_dir)| {
+            p.matches(project_rel)
+                || p.matches(&rooted)
+                || (!search_rel.is_empty() && p.matches(search_rel))
+                || (!has_dir && p.matches(name))
+        })
     }
 }
 
@@ -462,6 +546,10 @@ struct GrepRun {
     ctx_before: usize,
     ctx_after: usize,
     respect_gitignore: bool,
+    /// Leave `.env`-style secrets files unsearched (key files always are).
+    skip_secret_files: bool,
+    /// Project-relative paths the user pre-approved in `.rustic/allowed-files.txt`.
+    allowed_paths: Vec<String>,
     max_file_size: u64,
     timeout: std::time::Duration,
 }
@@ -493,6 +581,8 @@ fn run_grep(run: GrepRun, progress: &dyn Fn(usize, u32)) -> String {
 
     let mut kept: Vec<FileResult> = Vec::new();
     let mut oversized: Vec<String> = Vec::new();
+    let mut withheld: Vec<String> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
     let mut match_count = 0usize;
     let mut truncated = false;
 
@@ -504,6 +594,9 @@ fn run_grep(run: GrepRun, progress: &dyn Fn(usize, u32)) -> String {
         let exclude_glob = &run.exclude_glob;
         let matcher = &run.matcher;
         let project_root = &run.project_root;
+        let search_path = &run.search_path;
+        let skip_secret_files = run.skip_secret_files;
+        let allowed_paths = &run.allowed_paths;
 
         scope.spawn(move || {
             walker.run(|| {
@@ -522,30 +615,56 @@ fn run_grep(run: GrepRun, progress: &dyn Fn(usize, u32)) -> String {
                         timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
                         return ignore::WalkState::Quit;
                     }
-                    let Ok(entry) = entry else {
-                        return ignore::WalkState::Continue;
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(e) => {
+                            // A directory that could not be listed hides every
+                            // file under it; say so instead of "No matches".
+                            let _ = tx.send(GrepMsg::Unreadable(e.to_string()));
+                            return ignore::WalkState::Continue;
+                        }
                     };
                     if !entry.file_type().is_some_and(|t| t.is_file()) {
                         return ignore::WalkState::Continue;
                     }
                     let path = entry.path();
 
-                    if let Some(include) = include_glob {
-                        if !include.matches_path(path) {
-                            return ignore::WalkState::Continue;
-                        }
-                    }
-                    if let Some(exclude) = exclude_glob {
-                        if exclude.matches_path(path) {
-                            return ignore::WalkState::Continue;
-                        }
-                    }
-
                     let rel_path = path
                         .strip_prefix(project_root)
                         .unwrap_or(path)
                         .to_string_lossy()
                         .into_owned();
+
+                    // Filters see relative paths, never the absolute one: a
+                    // pattern must not depend on (or be defeated by) the
+                    // directories above the project.
+                    if include_glob.is_some() || exclude_glob.is_some() {
+                        let project_rel = rel_path.replace('\\', "/");
+                        let search_rel = path
+                            .strip_prefix(search_path)
+                            .map(|p| p.to_string_lossy().replace('\\', "/"))
+                            .unwrap_or_default();
+                        if let Some(include) = include_glob {
+                            if !include.matches_file(&project_rel, &search_rel) {
+                                return ignore::WalkState::Continue;
+                            }
+                        }
+                        if let Some(exclude) = exclude_glob {
+                            if exclude.matches_file(&project_rel, &search_rel) {
+                                return ignore::WalkState::Continue;
+                            }
+                        }
+                    }
+
+                    if is_withheld_from_grep(
+                        path,
+                        &rel_path.replace('\\', "/"),
+                        skip_secret_files,
+                        allowed_paths,
+                    ) {
+                        let _ = tx.send(GrepMsg::Sensitive(rel_path));
+                        return ignore::WalkState::Continue;
+                    }
 
                     if let Ok(md) = entry.metadata() {
                         if md.len() > max_file_size {
@@ -562,7 +681,8 @@ fn run_grep(run: GrepRun, progress: &dyn Fn(usize, u32)) -> String {
                             cur: String::new(),
                             cur_matches: 0,
                         };
-                        if searcher.search_path(matcher, path, &mut sink).is_err() {
+                        if let Err(e) = searcher.search_path(matcher, path, &mut sink) {
+                            let _ = tx.send(GrepMsg::Unreadable(format!("{rel_path} ({e})")));
                             return ignore::WalkState::Continue;
                         }
                         sink.groups
@@ -581,6 +701,8 @@ fn run_grep(run: GrepRun, progress: &dyn Fn(usize, u32)) -> String {
         for msg in rx {
             match msg {
                 GrepMsg::Oversized(p) => oversized.push(p),
+                GrepMsg::Sensitive(p) => withheld.push(p),
+                GrepMsg::Unreadable(p) => unreadable.push(p),
                 GrepMsg::File(fr) => {
                     if truncated {
                         continue;
@@ -614,8 +736,24 @@ fn run_grep(run: GrepRun, progress: &dyn Fn(usize, u32)) -> String {
 
     kept.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     oversized.sort();
+    withheld.sort();
+    unreadable.sort();
 
-    let mut content = if kept.is_empty() {
+    // Nothing could be opened at all: that is a failed search, not an empty one.
+    if kept.is_empty()
+        && !unreadable.is_empty()
+        && files_searched.load(std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        let mut content = String::from(
+            "GREP_ERROR: the search could not read any file, so this is NOT a 'no matches' result.",
+        );
+        push_list_note(&mut content, &unreadable, "path(s) could not be read");
+        return content;
+    }
+
+    let mut content = if kept.is_empty() && !unreadable.is_empty() {
+        String::from("No matches found in the files that could be read (results are incomplete)")
+    } else if kept.is_empty() {
         String::from("No matches found")
     } else if !use_context {
         let mut lines: Vec<String> = kept
@@ -663,6 +801,17 @@ fn run_grep(run: GrepRun, progress: &dyn Fn(usize, u32)) -> String {
         ));
     }
 
+    push_list_note(
+        &mut content,
+        &unreadable,
+        "path(s) could not be read and were not searched, so results are incomplete",
+    );
+    push_list_note(
+        &mut content,
+        &withheld,
+        "key or secrets file(s) were not searched (read_file asks the user for access)",
+    );
+
     content
 }
 
@@ -686,11 +835,13 @@ async fn execute_glob_one(params: Value, context: &ToolContext) -> Result<ToolOu
         });
     }
 
-    let search_root = params["path"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(|p| context.project_root.join(p))
-        .unwrap_or_else(|| context.project_root.clone());
+    let search_root = match params["path"].as_str().filter(|s| !s.is_empty()) {
+        Some(p) => match crate::tools::file_ops::resolve_with_scope(context, p) {
+            Ok(root) => root,
+            Err(out) => return Ok(out),
+        },
+        None => context.project_root.clone(),
+    };
 
     let compiled = match BraceGlob::new(pattern) {
         Ok(p) => p,
@@ -718,9 +869,15 @@ async fn execute_glob_one(params: Value, context: &ToolContext) -> Result<ToolOu
         if !path.is_file() {
             continue;
         }
-        let rel = match path.strip_prefix(&context.project_root) {
-            Ok(r) => r,
-            Err(_) => continue,
+        // Outside the project (only reachable with access to all files
+        // granted): match against the path under the search root and list
+        // the absolute path.
+        let (rel, shown) = match path.strip_prefix(&context.project_root) {
+            Ok(r) => (r, r.to_path_buf()),
+            Err(_) => match path.strip_prefix(&search_root) {
+                Ok(r) => (r, path.to_path_buf()),
+                Err(_) => continue,
+            },
         };
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if !compiled.matches(&rel_str) {
@@ -729,7 +886,7 @@ async fn execute_glob_one(params: Value, context: &ToolContext) -> Result<ToolOu
         let mtime = std::fs::metadata(path)
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        hits.push((rel.to_path_buf(), mtime));
+        hits.push((shown, mtime));
     }
 
     hits.sort_by(|a, b| b.1.cmp(&a.1));
@@ -828,9 +985,176 @@ mod tests {
             ctx_before: ctx.0,
             ctx_after: ctx.1,
             respect_gitignore: true,
+            skip_secret_files: true,
+            allowed_paths: Vec::new(),
             max_file_size: MAX_GREP_FILE_SIZE,
             timeout: GREP_TIMEOUT,
         }
+    }
+
+    #[test]
+    fn key_and_secrets_files_are_not_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle public\n").unwrap();
+        std::fs::write(dir.path().join(".env"), "TOKEN=needle\n").unwrap();
+        std::fs::write(dir.path().join("server.pem"), "needle key\n").unwrap();
+        std::fs::write(dir.path().join("id_rsa"), "needle key\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("conf")).unwrap();
+        std::fs::write(dir.path().join("conf/prod.env"), "needle\n").unwrap();
+
+        let out = run_grep(mk_run(dir.path(), "needle", (0, 0)), &|_, _| {}).replace('\\', "/");
+        assert!(out.starts_with("a.txt:1: needle public"), "{out}");
+        assert!(!out.contains("TOKEN="), "{out}");
+        assert!(!out.contains("needle key"), "{out}");
+        assert!(
+            out.contains("4 key or secrets file(s) were not searched"),
+            "{out}"
+        );
+        assert!(
+            out.contains(".env") && out.contains("conf/prod.env"),
+            "{out}"
+        );
+
+        // Granting access to all files opens secrets files, never key files.
+        let mut run = mk_run(dir.path(), "needle", (0, 0));
+        run.skip_secret_files = false;
+        let out = run_grep(run, &|_, _| {}).replace('\\', "/");
+        assert!(out.contains(".env:1: TOKEN=needle"), "{out}");
+        assert!(!out.contains("needle key"), "{out}");
+        assert!(
+            out.contains("2 key or secrets file(s) were not searched"),
+            "{out}"
+        );
+
+        // A path pre-approved by the user is searched.
+        let mut run = mk_run(dir.path(), "needle", (0, 0));
+        run.allowed_paths = vec!["conf/prod.env".into()];
+        let out = run_grep(run, &|_, _| {}).replace('\\', "/");
+        assert!(out.contains("conf/prod.env:1: needle"), "{out}");
+        assert!(!out.contains("TOKEN="), "{out}");
+    }
+
+    #[tokio::test]
+    async fn grep_and_glob_stay_inside_the_project() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("notes.txt"), "needle outside\n").unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("src/a.txt"), "needle inside\n").unwrap();
+        let (ctx, rx) = ToolContext::new_test(project.path().to_path_buf());
+        std::mem::forget(rx);
+        // The test context starts with "access to all files" granted.
+        ctx.shared_permissions.set_sensitive_files_allowed(false);
+        let abs = outside.path().to_string_lossy().into_owned();
+
+        for path in [abs.as_str(), "..", "src/../.."] {
+            let out = execute(
+                "grep_search",
+                "t",
+                json!({ "query": "needle", "path": path }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(out.is_error, "grep {path}: {}", out.content);
+            assert!(
+                out.content.starts_with("PATH_SCOPE_VIOLATION"),
+                "grep {path}: {}",
+                out.content
+            );
+            let out = execute(
+                "glob",
+                "t",
+                json!({ "pattern": "**/*.txt", "path": path }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(out.is_error, "glob {path}: {}", out.content);
+            assert!(
+                out.content.starts_with("PATH_SCOPE_VIOLATION"),
+                "glob {path}: {}",
+                out.content
+            );
+        }
+
+        let out = execute(
+            "grep_search",
+            "t",
+            json!({ "query": "needle", "path": "src" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content.replace('\\', "/"), "src/a.txt:1: needle inside");
+        let out = execute(
+            "glob",
+            "t",
+            json!({ "pattern": "**/*.txt", "path": "src" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.content.replace('\\', "/"), "src/a.txt");
+
+        // With access to all files granted, the same outside path is searchable.
+        ctx.shared_permissions.set_sensitive_files_allowed(true);
+        let out = execute(
+            "grep_search",
+            "t",
+            json!({ "query": "needle", "path": abs }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.content.ends_with("notes.txt:1: needle outside"),
+            "{}",
+            out.content
+        );
+        let out = execute(
+            "glob",
+            "t",
+            json!({ "pattern": "*.txt", "path": abs }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(out.content.ends_with("notes.txt"), "{}", out.content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_files_are_reported_not_hidden() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked.txt");
+        std::fs::write(&locked, "needle\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&locked).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+
+        // Nothing readable at all is an error, not an empty result.
+        let out = run_grep(mk_run(dir.path(), "needle", (0, 0)), &|_, _| {});
+        assert!(out.starts_with("GREP_ERROR"), "{out}");
+        assert!(out.contains("locked.txt"), "{out}");
+
+        // Some files readable: results are flagged as incomplete.
+        std::fs::write(dir.path().join("open.txt"), "nothing here\n").unwrap();
+        let out = run_grep(mk_run(dir.path(), "needle", (0, 0)), &|_, _| {});
+        assert!(
+            out.starts_with("No matches found in the files that could be read"),
+            "{out}"
+        );
+        assert!(out.contains("1 path(s) could not be read"), "{out}");
+
+        std::fs::write(dir.path().join("hit.txt"), "needle\n").unwrap();
+        let out = run_grep(mk_run(dir.path(), "needle", (0, 0)), &|_, _| {});
+        assert!(out.starts_with("hit.txt:1: needle"), "{out}");
+        assert!(out.contains("results are incomplete"), "{out}");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
@@ -948,6 +1272,103 @@ mod tests {
         run.exclude_glob = Some(BraceGlob::new("*.{js,jsx,ts}").unwrap());
         let out = run_grep(run, &|_, _| {});
         assert_eq!(out, "d.rs:1: needle");
+    }
+
+    /// Tracker issue #15: filters were matched against the absolute path, so
+    /// only patterns starting with a wildcard could match anything.
+    #[test]
+    fn test_run_grep_include_file_names_and_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/ui")).unwrap();
+        for name in [
+            "src/ui/prompt-box.jsx",
+            "src/ui/tool-call-card.jsx",
+            "src/ui/other.jsx",
+            "src/main.rs",
+        ] {
+            std::fs::write(dir.path().join(name), "needle\n").unwrap();
+        }
+        let files = |include: &str, search: &str| -> Vec<String> {
+            let mut run = mk_run(dir.path(), "needle", (0, 0));
+            run.search_path = dir.path().join(search);
+            run.include_glob = Some(BraceGlob::new(include).unwrap());
+            let out = run_grep(run, &|_, _| {}).replace('\\', "/");
+            let mut found: Vec<String> = out
+                .lines()
+                .filter_map(|l| l.split(':').next())
+                .filter(|p| p.contains('.'))
+                .map(str::to_string)
+                .collect();
+            found.sort();
+            found
+        };
+        let both = vec![
+            "src/ui/prompt-box.jsx".to_string(),
+            "src/ui/tool-call-card.jsx".to_string(),
+        ];
+
+        // A brace list of whole file names, from a sub-directory and from the root.
+        assert_eq!(files("{prompt-box.jsx,tool-call-card.jsx}", "src/ui"), both);
+        assert_eq!(files("{prompt-box.jsx,tool-call-card.jsx}", ""), both);
+        // A single plain file name.
+        assert_eq!(files("prompt-box.jsx", ""), both[..1].to_vec());
+        // A path relative to the project root, and one relative to the search directory.
+        assert_eq!(files("src/ui/prompt-*.jsx", ""), both[..1].to_vec());
+        assert_eq!(files("ui/tool-*.jsx", "src"), both[1..].to_vec());
+        // A name that is only part of a file name must not match.
+        assert!(files("box.jsx", "").is_empty());
+    }
+
+    #[test]
+    fn test_run_grep_exclude_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["vendor/a.rs", "references/deep/b.rs", "src/c.rs", "d.rs"] {
+            let p = dir.path().join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "needle\n").unwrap();
+        }
+        let kept = |exclude: &str| -> String {
+            let mut run = mk_run(dir.path(), "needle", (0, 0));
+            run.exclude_glob = Some(BraceGlob::new(exclude).unwrap());
+            run_grep(run, &|_, _| {}).replace('\\', "/")
+        };
+
+        let out = kept("{vendor,references}/**");
+        assert!(
+            out.contains("src/c.rs:1:") && out.contains("d.rs:1:"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("vendor") && !out.contains("references"),
+            "{out}"
+        );
+
+        // `*/dir/*` also covers a top-level directory.
+        let out = kept("*/vendor/*");
+        assert!(!out.contains("vendor/a.rs"), "{out}");
+        assert!(out.contains("references/deep/b.rs:1:"), "{out}");
+
+        // A bare file name is excluded at any depth.
+        let out = kept("c.rs");
+        assert!(!out.contains("src/c.rs"), "{out}");
+        assert!(out.contains("d.rs:1:"), "{out}");
+    }
+
+    /// The directories above the project must not take part in matching.
+    #[test]
+    fn test_run_grep_filters_ignore_directories_above_the_project() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("zzparentzz");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "needle\n").unwrap();
+
+        let mut run = mk_run(&root, "needle", (0, 0));
+        run.exclude_glob = Some(BraceGlob::new("*zzparentzz*").unwrap());
+        assert_eq!(run_grep(run, &|_, _| {}), "a.rs:1: needle");
+
+        let mut run = mk_run(&root, "needle", (0, 0));
+        run.include_glob = Some(BraceGlob::new("*zzparentzz*").unwrap());
+        assert_eq!(run_grep(run, &|_, _| {}), "No matches found");
     }
 
     #[test]

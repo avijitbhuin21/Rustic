@@ -1,10 +1,10 @@
 // Shared markdown → sanitized HTML renderer (editor .md preview, skill bodies).
 // One configured `marked` instance with highlight.js for fenced code; output is
-// always run through DOMPurify. Style the result with the `rustic-markdown` class.
+// always run through the shared policy in sanitize-html.js. Style the result with the `rustic-markdown` class.
 import { Marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js/lib/common';
-import DOMPurify from 'dompurify';
+import { sanitizeHtml } from '@/lib/sanitize-html';
 import 'highlight.js/styles/github-dark.css';
 
 // Created once at module load so the lexer + hooks aren't rebuilt per render.
@@ -29,8 +29,5 @@ const md = new Marked(
 export function renderMarkdown(text) {
   if (!text) return '';
   const raw = md.parse(text);
-  return DOMPurify.sanitize(raw, {
-    ADD_TAGS: ['input'],
-    ADD_ATTR: ['type', 'checked', 'disabled', 'class'],
-  });
+  return sanitizeHtml(raw);
 }

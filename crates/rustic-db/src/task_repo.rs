@@ -7,7 +7,22 @@ use crate::models::{MessageRow, SubagentRecord, TaskRow};
 const TASK_COLUMNS: &str =
     "id, project_id, title, status, provider_type, model, created_at, updated_at, \
      total_input_tokens, total_output_tokens, total_cache_read_tokens, estimated_cost_usd, turn_count, \
-     harness_session_id, cost_json, thinking_tier, pinned, goal";
+     harness_session_id, cost_json, thinking_tier, pinned, goal, \
+     goal_turns, goal_status, goal_reason";
+
+/// `TASK_COLUMNS` for reads: `updated_at` is the later of the task's own stamp
+/// and its newest sub-agent record, so sub-agent activity counts as activity in
+/// the thread. Derived at read time because sub-agent text is appended per
+/// streamed delta, and stamping the task row on each one would double that
+/// write path.
+const TASK_SELECT: &str =
+    "id, project_id, title, status, provider_type, model, created_at, \
+     COALESCE((SELECT MAX(s.updated_at) FROM subagent_records s \
+               WHERE s.task_id = tasks.id AND s.updated_at > datetime(tasks.updated_at)), \
+              tasks.updated_at) AS updated_at, \
+     total_input_tokens, total_output_tokens, total_cache_read_tokens, estimated_cost_usd, turn_count, \
+     harness_session_id, cost_json, thinking_tier, pinned, goal, \
+     goal_turns, goal_status, goal_reason";
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
@@ -29,6 +44,9 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         thinking_tier: row.get(15)?,
         pinned: row.get(16)?,
         goal: row.get(17)?,
+        goal_turns: row.get(18)?,
+        goal_status: row.get(19)?,
+        goal_reason: row.get(20)?,
     })
 }
 
@@ -37,14 +55,15 @@ impl Database {
         self.conn().execute(
             &format!(
                 "INSERT OR IGNORE INTO tasks ({TASK_COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
             ),
             params![
                 task.id, task.project_id, task.title, task.status,
                 task.provider_type, task.model, task.created_at, task.updated_at,
                 task.total_input_tokens, task.total_output_tokens, task.total_cache_read_tokens,
                 task.estimated_cost_usd, task.turn_count, task.harness_session_id, task.cost_json,
-                task.thinking_tier, task.pinned, task.goal
+                task.thinking_tier, task.pinned, task.goal,
+                task.goal_turns, task.goal_status, task.goal_reason
             ],
         )?;
         Ok(())
@@ -64,7 +83,7 @@ impl Database {
     pub fn get_task(&self, id: &str) -> Result<Option<TaskRow>> {
         let mut stmt = self
             .conn()
-            .prepare_cached(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))?;
+            .prepare_cached(&format!("SELECT {TASK_SELECT} FROM tasks WHERE id = ?1"))?;
         let mut rows = stmt.query_map(params![id], row_to_task)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -74,7 +93,7 @@ impl Database {
 
     pub fn list_tasks_for_project(&self, project_id: &str) -> Result<Vec<TaskRow>> {
         let mut stmt = self.conn().prepare_cached(&format!(
-            "SELECT {TASK_COLUMNS} FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC"
+            "SELECT {TASK_SELECT} FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC"
         ))?;
         let rows = stmt.query_map(params![project_id], row_to_task)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -84,7 +103,7 @@ impl Database {
     /// orchestrator's `list_tasks_across_projects` tool.
     pub fn list_all_tasks(&self) -> Result<Vec<TaskRow>> {
         let mut stmt = self.conn().prepare_cached(&format!(
-            "SELECT {TASK_COLUMNS} FROM tasks ORDER BY updated_at DESC"
+            "SELECT {TASK_SELECT} FROM tasks ORDER BY updated_at DESC"
         ))?;
         let rows = stmt.query_map([], row_to_task)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -98,9 +117,20 @@ impl Database {
         Ok(())
     }
 
+    /// Correct a status left behind by a crashed session without moving `updated_at` (nothing happened in the thread).
+    pub fn reset_stale_task_status(&self, id: &str, status: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET status = ?1 WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+
+    // Rename and model switch leave updated_at alone: the chat list shows it
+    // as the time of the last entry in the thread, and neither is one.
     pub fn update_task_title(&self, id: &str, title: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE tasks SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
+            "UPDATE tasks SET title = ?1 WHERE id = ?2",
             params![title, id],
         )?;
         Ok(())
@@ -108,7 +138,7 @@ impl Database {
 
     pub fn update_task_model(&self, id: &str, provider_type: &str, model: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE tasks SET provider_type = ?1, model = ?2, updated_at = datetime('now') WHERE id = ?3",
+            "UPDATE tasks SET provider_type = ?1, model = ?2 WHERE id = ?3",
             params![provider_type, model, id],
         )?;
         Ok(())
@@ -132,11 +162,30 @@ impl Database {
         Ok(())
     }
 
-    /// Persist or clear a task's /goal completion condition.
+    /// Persist or clear a task's /goal completion condition. Either way the
+    /// loop's progress starts over.
     pub fn update_task_goal(&self, id: &str, goal: Option<&str>) -> Result<()> {
         self.conn().execute(
-            "UPDATE tasks SET goal = ?1 WHERE id = ?2",
+            "UPDATE tasks SET goal = ?1, goal_turns = 0, goal_status = NULL, goal_reason = NULL \
+             WHERE id = ?2",
             params![goal, id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist where a task's /goal loop stands: its forced-turn count and,
+    /// while it is blocked, the status and reason. No-op once the goal is gone.
+    pub fn update_task_goal_progress(
+        &self,
+        id: &str,
+        turns: u32,
+        status: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET goal_turns = ?1, goal_status = ?2, goal_reason = ?3 \
+             WHERE id = ?4 AND goal IS NOT NULL",
+            params![turns, status, reason, id],
         )?;
         Ok(())
     }
@@ -269,9 +318,10 @@ impl Database {
         Ok(())
     }
 
-    /// Incremental persist: upserts rows by id, rewriting only those whose role/content changed, and deletes trailing rows past the new length (history shrank after condense). Preserves first-seen `created_at` and any existing `turn_usage_json`.
+    /// Incremental persist: upserts rows by id, rewriting only those whose role/content changed, and deletes trailing rows past the new length (history shrank after condense). Preserves first-seen `created_at` and any existing `turn_usage_json`. When anything was written, stamps `tasks.updated_at` — the chat list's "last entry in the thread" time.
     pub fn upsert_messages_for_task(&self, task_id: &str, messages: &[MessageRow]) -> Result<()> {
         let tx = self.conn().unchecked_transaction()?;
+        let mut written = 0usize;
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO messages (id, task_id, role, content_json, created_at, sort_order, turn_usage_json)
@@ -288,7 +338,7 @@ impl Database {
                         AND messages.turn_usage_json IS NOT excluded.turn_usage_json)",
             )?;
             for msg in messages {
-                stmt.execute(params![
+                written += stmt.execute(params![
                     msg.id,
                     msg.task_id,
                     msg.role,
@@ -299,10 +349,16 @@ impl Database {
                 ])?;
             }
         }
-        tx.execute(
+        written += tx.execute(
             "DELETE FROM messages WHERE task_id = ?1 AND sort_order >= ?2",
             params![task_id, messages.len() as i64],
         )?;
+        if written > 0 {
+            tx.execute(
+                "UPDATE tasks SET updated_at = datetime('now') WHERE id = ?1",
+                params![task_id],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -574,5 +630,245 @@ impl Database {
             Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::connection::Database;
+    use crate::models::{MessageRow, ProjectRow, TaskRow};
+
+    const STARTED: &str = "2020-01-01 00:00:00";
+
+    fn db_with_task() -> Database {
+        let db = Database::in_memory().expect("init");
+        db.insert_project(&ProjectRow {
+            id: "p".into(),
+            name: "p".into(),
+            root_path: "/tmp/p".into(),
+            created_at: STARTED.into(),
+            settings_json: None,
+            sort_order: 0,
+        })
+        .expect("project");
+        db.insert_task(&TaskRow {
+            id: "t".into(),
+            project_id: "p".into(),
+            title: "old".into(),
+            status: "Completed".into(),
+            provider_type: "Claude".into(),
+            model: "m".into(),
+            created_at: STARTED.into(),
+            updated_at: STARTED.into(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            estimated_cost_usd: 0.0,
+            turn_count: 0,
+            harness_session_id: None,
+            cost_json: None,
+            thinking_tier: None,
+            pinned: false,
+            goal: None,
+            goal_turns: 0,
+            goal_status: None,
+            goal_reason: None,
+        })
+        .expect("task");
+        db
+    }
+
+    fn updated_at(db: &Database) -> String {
+        db.get_task("t").expect("get").expect("row").updated_at
+    }
+
+    fn rewind(db: &Database) {
+        db.conn()
+            .execute("UPDATE tasks SET updated_at = ?1 WHERE id = 't'", [STARTED])
+            .expect("reset");
+    }
+
+    fn msg(i: i64, role: &str, content: &str) -> MessageRow {
+        MessageRow {
+            id: format!("t-{i}"),
+            task_id: "t".into(),
+            role: role.into(),
+            content_json: content.into(),
+            created_at: "2026-01-01 00:00:00".into(),
+            sort_order: i,
+            turn_usage_json: None,
+        }
+    }
+
+    #[test]
+    fn goal_progress_survives_a_reload_and_resets_with_the_goal() {
+        let db = db_with_task();
+        let goal = |db: &Database| {
+            let t = db.get_task("t").expect("get").expect("row");
+            (t.goal, t.goal_turns, t.goal_status, t.goal_reason)
+        };
+
+        // No goal: progress is not recorded.
+        db.update_task_goal_progress("t", 3, Some("blocked"), Some("x"))
+            .expect("progress");
+        assert_eq!(goal(&db), (None, 0, None, None));
+
+        db.update_task_goal("t", Some("ship it")).expect("set");
+        db.update_task_goal_progress("t", 4, None, None)
+            .expect("continuing");
+        assert_eq!(goal(&db), (Some("ship it".into()), 4, None, None));
+
+        db.update_task_goal_progress("t", 4, Some("blocked"), Some("needs a key"))
+            .expect("blocked");
+        assert_eq!(
+            goal(&db),
+            (
+                Some("ship it".into()),
+                4,
+                Some("blocked".into()),
+                Some("needs a key".into())
+            )
+        );
+        assert_eq!(
+            updated_at(&db),
+            STARTED,
+            "goal bookkeeping is not a thread entry"
+        );
+
+        // The loop moving again clears the block and keeps counting.
+        db.update_task_goal_progress("t", 5, None, None)
+            .expect("resumed");
+        assert_eq!(goal(&db), (Some("ship it".into()), 5, None, None));
+
+        // A new /goal and a clear both start over.
+        db.update_task_goal_progress("t", 5, Some("blocked"), Some("again"))
+            .expect("blocked again");
+        db.update_task_goal("t", Some("other")).expect("replace");
+        assert_eq!(goal(&db), (Some("other".into()), 0, None, None));
+        db.update_task_goal_progress("t", 2, None, None)
+            .expect("progress");
+        db.update_task_goal("t", None).expect("clear");
+        assert_eq!(goal(&db), (None, 0, None, None));
+    }
+
+    #[test]
+    fn updated_at_follows_the_last_thread_entry() {
+        let db = db_with_task();
+        let user = msg(0, "user", "[\"hi\"]");
+        let tool_call = msg(1, "assistant", "[\"tool_use\"]");
+        let tool_result = msg(2, "user", "[\"tool_result\"]");
+
+        db.upsert_messages_for_task("t", std::slice::from_ref(&user))
+            .expect("user");
+        assert!(updated_at(&db).as_str() > STARTED, "user message");
+
+        rewind(&db);
+        db.upsert_messages_for_task("t", &[user.clone(), tool_call.clone()])
+            .expect("tool call");
+        assert!(updated_at(&db).as_str() > STARTED, "tool call");
+
+        rewind(&db);
+        let thread = [user.clone(), tool_call.clone(), tool_result];
+        db.upsert_messages_for_task("t", &thread)
+            .expect("tool result");
+        assert!(updated_at(&db).as_str() > STARTED, "tool result");
+
+        rewind(&db);
+        db.upsert_messages_for_task("t", &thread).expect("no-op");
+        assert_eq!(updated_at(&db), STARTED, "re-saving an unchanged thread");
+
+        db.reset_stale_task_status("t", "Completed").expect("stale");
+        assert_eq!(updated_at(&db), STARTED, "crash-leftover status reset");
+
+        db.upsert_messages_for_task("t", &[user, tool_call])
+            .expect("shrink");
+        assert!(updated_at(&db).as_str() > STARTED, "thread shrank");
+    }
+
+    fn set_subagent_time(db: &Database, at: &str) {
+        db.conn()
+            .execute(
+                "UPDATE subagent_records SET updated_at = ?1 WHERE task_id = 't'",
+                [at],
+            )
+            .expect("subagent time");
+    }
+
+    #[test]
+    fn updated_at_includes_subagent_activity() {
+        let db = db_with_task();
+        db.upsert_subagent_spawn("t", "a1", "m", "do it", "worker")
+            .expect("spawn");
+        db.upsert_subagent_spawn("t", "a2", "m", "do it", "worker")
+            .expect("spawn");
+        db.append_subagent_output("t", "a2", "hello")
+            .expect("output");
+
+        let listed = db.list_tasks_for_project("p").expect("list");
+        assert!(
+            listed[0].updated_at.as_str() > STARTED,
+            "list sees sub-agent activity"
+        );
+        assert_eq!(listed[0].updated_at, updated_at(&db), "list and get agree");
+        assert_eq!(
+            db.list_all_tasks().expect("all")[0].updated_at,
+            listed[0].updated_at
+        );
+        let raw: String = db
+            .conn()
+            .query_row("SELECT updated_at FROM tasks WHERE id = 't'", [], |r| {
+                r.get(0)
+            })
+            .expect("raw");
+        assert_eq!(raw, STARTED, "sub-agent writes do not touch the task row");
+
+        set_subagent_time(&db, "2019-06-01 00:00:00");
+        assert_eq!(updated_at(&db), STARTED, "the task's own later stamp wins");
+
+        // In-memory stamps are RFC 3339; they must compare by instant, not text.
+        db.conn()
+            .execute(
+                "UPDATE tasks SET updated_at = '2020-01-01T05:30:00+05:30' WHERE id = 't'",
+                [],
+            )
+            .expect("rfc3339");
+        set_subagent_time(&db, "2020-01-01 00:00:00");
+        assert_eq!(
+            updated_at(&db),
+            "2020-01-01T05:30:00+05:30",
+            "same instant keeps the task stamp"
+        );
+        set_subagent_time(&db, "2020-01-01 00:00:01");
+        assert_eq!(
+            updated_at(&db),
+            "2020-01-01 00:00:01",
+            "one second later wins"
+        );
+    }
+
+    #[test]
+    fn updated_at_tracks_conversation_activity_only() {
+        let db = db_with_task();
+
+        db.update_task_title("t", "renamed").expect("title");
+        db.update_task_model("t", "OpenAI", "gpt").expect("model");
+        db.update_task_pinned("t", true).expect("pin");
+        let row = db.get_task("t").expect("get").expect("row");
+        assert_eq!(row.title, "renamed");
+        assert_eq!(row.model, "gpt");
+        assert_eq!(row.updated_at, STARTED, "metadata edits are not activity");
+
+        db.update_task_cost("t", 1, 1, 0, 0.01, 1).expect("cost");
+        let after_turn = updated_at(&db);
+        assert!(after_turn.as_str() > STARTED, "a turn moves updated_at");
+
+        db.conn()
+            .execute("UPDATE tasks SET updated_at = ?1 WHERE id = 't'", [STARTED])
+            .expect("reset");
+        db.update_task_status("t", "Completed").expect("status");
+        assert!(
+            updated_at(&db).as_str() > STARTED,
+            "a run ending moves updated_at"
+        );
     }
 }

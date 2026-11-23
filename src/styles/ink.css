@@ -1,0 +1,340 @@
+/* Hand-drawn outlines (theme pack `style.ink: "sketch"`). The drawing engine is
+   Looseleaf (MIT, vendored in src/lib/ink); this file maps its `--ll-*` tokens
+   onto Rustic's theme tokens and hides the native chrome a drawing replaces.
+   Everything is scoped to :root[data-rt-ink="sketch"], so other themes are
+   untouched. Layer visibility rules live in ink-layers.css. */
+
+/* Kevin Sans (MIT, from Looseleaf). Fetched only when a theme uses it. */
+@font-face {
+  font-family: "Kevin Sans";
+  src: url('/assets/fonts/KevinSans-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Kevin Sans";
+  src: url('/assets/fonts/KevinSans-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Kevin Sans Hand";
+  src: url('/assets/fonts/KevinSans-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  size-adjust: 88%;
+  ascent-override: 120.45%;
+  descent-override: 60.23%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: "Kevin Sans Hand";
+  src: url('/assets/fonts/KevinSans-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+  size-adjust: 88%;
+  ascent-override: 120.45%;
+  descent-override: 60.23%;
+  line-gap-override: 0%;
+}
+/* Rustic's interface text is 10-12px, below the 14px floor Looseleaf sets for
+   its 88% "Hand" cut: there it is thin and reads as a plain sans. This cut is
+   the same drawing set larger, so 11px text lands on that floor and 14px text
+   on Looseleaf's body size. Line metrics match the Hand cut. */
+@font-face {
+  font-family: "Kevin Sans UI";
+  src: url('/assets/fonts/KevinSans-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  size-adjust: 112%;
+  ascent-override: 94.6%;
+  descent-override: 47.3%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: "Kevin Sans UI";
+  src: url('/assets/fonts/KevinSans-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+  size-adjust: 112%;
+  ascent-override: 94.6%;
+  descent-override: 47.3%;
+  line-gap-override: 0%;
+}
+
+/* ── Tokens: Looseleaf's pens and papers, coloured by the active theme ── */
+:root[data-rt-ink="sketch"] {
+  --ll-ink: var(--foreground);
+  --ll-ink-soft: var(--theme-fg2, var(--foreground));
+  --ll-ink-muted: var(--theme-fg2, var(--foreground));
+  --ll-ink-you: var(--ring);
+  --ll-focus: var(--ring);
+  --ll-pencil: var(--muted-foreground);
+  --ll-pencil-text: var(--muted-foreground);
+  --ll-pencil-mark: var(--theme-fg4, var(--muted-foreground));
+  --ll-red: var(--destructive);
+  --ll-green: var(--success);
+  --ll-marker: var(--primary);
+  --ll-orange-text: var(--highlight);
+  --ll-hi: #f8dc4c;
+  --ll-hi-deep: #a87f0c;
+  --ll-paper: var(--background);
+  --ll-paper-shade: var(--muted);
+  --ll-slip: var(--card);
+  --ll-card: var(--card);
+  --ll-photo: var(--card);
+  --ll-graph: var(--card);
+  --ll-pad: var(--card);
+  --ll-check: var(--muted);
+  --ll-kraft: var(--theme-bg3, var(--muted));
+  --ll-desk: var(--muted);
+  --ll-desk-deep: var(--theme-bg3, var(--muted));
+  --ll-rule-blue: #8fb0d4;
+  --ll-rule-red: #d9776a;
+  --ll-pad-rule: #b2c3dc;
+  --ll-check-rule: #7fa37c;
+  --ll-tomato: #e8483a;
+  --ll-tangerine: #f59a2f;
+  --ll-lemon: #fbd63a;
+  --ll-grass: #5db85c;
+  --ll-teal: #2fb1a3;
+  --ll-sky: #4aa8e8;
+  --ll-grape: #8f6fd6;
+  --ll-bubblegum: #f38bb8;
+  --ll-sticky-yellow: #f7e38a;
+  --ll-sticky-green: #cfe6a8;
+  --ll-sticky-orange: #f7c08e;
+  --ll-sticky-pink: #f6b8b0;
+  --ll-sticky-blue: #bcd8f0;
+  --ll-tape: rgb(246 244 236 / 0.5);
+  --ll-tape-edge: rgb(140 135 120 / 0.35);
+  --ll-shade: 58 44 30;
+  --ll-blend: multiply;
+
+  --ll-wobble: 1;
+  --ll-stroke-fine: 1.7;
+  --ll-bleed: 6;
+  --ll-misreg-k: 1;
+  --ll-tilt-max: 2deg;
+  --ll-hover-tilt: -0.9deg;
+  --ll-hover-misreg: 0.35;
+  --ll-press-misreg: -0.78;
+  --ll-press-sink: 1px;
+
+  --ll-ease-out: ease-out;
+  --ll-ease-settle: cubic-bezier(0.2, 0.9, 0.25, 1.12);
+  --ll-ease-pop: cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  --ll-ease-dialog: cubic-bezier(0.2, 0.85, 0.25, 1.08);
+  --ll-motion: 1;
+  --ll-dur-press: calc(0.09s * var(--ll-motion));
+  --ll-dur-hover: calc(0.12s * var(--ll-motion));
+  --ll-dur-fade: calc(0.15s * var(--ll-motion));
+  --ll-dur-pop: calc(0.18s * var(--ll-motion));
+  --ll-dur-sheet: calc(0.3s * var(--ll-motion));
+}
+/* On dark paper, multiply would swallow the ink and yellow would glare. */
+:root.dark[data-rt-ink="sketch"] {
+  --ll-blend: normal;
+  --ll-hi: color-mix(in oklab, var(--primary) 34%, var(--background));
+  --ll-shade: 0 0 0;
+}
+
+/* Hosts take a position only when nothing else gave them one. */
+@layer components {
+  :root[data-rt-ink="sketch"] [data-slot="badge"]:has(> [data-ink-wrap]) {
+    position: relative;
+    isolation: isolate;
+  }
+  :root[data-rt-ink="sketch"] [data-ink-backdrop="over"] {
+    position: relative;
+    isolation: isolate;
+  }
+}
+
+/* Outlines drawn over a panel's content (see ink-painter.js). */
+:root[data-rt-ink="sketch"] [data-ink-backdrop="over"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  background: var(--ink-img) var(--ink-pos) / var(--ink-size) no-repeat;
+}
+:root[data-rt-ink="sketch"] :is([data-slot="dropdown-menu-separator"], [data-slot="context-menu-separator"], [data-slot="select-separator"]) {
+  margin-inline: 5px;
+}
+
+/* ── Native chrome a drawing replaces. Unlayered on purpose: it has to win
+   over Tailwind's utility classes without !important. ── */
+:root[data-rt-ink="sketch"] [data-ink-host][data-ink-ready] {
+  background-color: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+:root[data-rt-ink="sketch"] [data-slot="badge"]:has(> [data-ink-wrap][data-ink-ready]) {
+  background-color: transparent;
+  border-color: transparent;
+  overflow: visible;
+}
+:root[data-rt-ink="sketch"] [data-ink-backdrop] {
+  border-color: transparent;
+}
+:root[data-rt-ink="sketch"] :is([data-slot="input"], [data-slot="textarea"], [data-slot="select-trigger"])[data-ink-backdrop] {
+  box-shadow: none;
+  background-color: transparent;
+}
+:root[data-rt-ink="sketch"] :is(
+  [data-slot="dialog-content"], [data-slot="popover-content"], [data-slot="dropdown-menu-content"],
+  [data-slot="dropdown-menu-sub-content"], [data-slot="context-menu-content"], [data-slot="context-menu-sub-content"],
+  [data-slot="select-content"], [data-slot="sheet-content"]
+)[data-ink-backdrop],
+:root[data-rt-ink="sketch"] [data-ink-frame="prompt"][data-ink-backdrop] {
+  /* A sheet on a desk: a hair of contact shadow and a short soft one, in umber. */
+  box-shadow:
+    0 1px 1.5px rgb(var(--ll-shade) / 0.2),
+    0 2px 5px -1px rgb(var(--ll-shade) / 0.1),
+    0 12px 22px -8px rgb(var(--ll-shade) / 0.2);
+}
+:root[data-rt-ink="sketch"] [data-slot="button"][data-variant="destructive"][data-ink-ready],
+:root[data-rt-ink="sketch"] [data-slot="badge"][data-variant="destructive"]:has(> [data-ink-wrap][data-ink-ready]) {
+  color: var(--card);
+}
+:root[data-rt-ink="sketch"] [data-slot="checkbox"][data-ink-ready] [data-slot="checkbox-indicator"] {
+  display: none;
+}
+:root[data-rt-ink="sketch"] [data-slot="checkbox"][data-ink-ready] {
+  color: var(--foreground);
+}
+:root[data-rt-ink="sketch"] [data-slot="tabs-list"] {
+  background-color: transparent;
+}
+:root[data-rt-ink="sketch"] [data-slot="tabs-trigger"][data-ink-ready]::after {
+  display: none;
+}
+
+/* ── Controls without a drawing: a highlighter swipe instead of a grey fill ── */
+:root[data-rt-ink="sketch"] [data-slot="button"]:is([data-variant="ghost"], [data-variant="link"]):is(:hover, [aria-expanded="true"]):not(:disabled),
+:root[data-rt-ink="sketch"] :is(
+  [data-slot="dropdown-menu-item"], [data-slot="dropdown-menu-checkbox-item"], [data-slot="dropdown-menu-radio-item"],
+  [data-slot="dropdown-menu-sub-trigger"], [data-slot="context-menu-item"], [data-slot="context-menu-sub-trigger"],
+  [data-slot="select-item"], [data-slot="command-item"]
+):is(:focus, [data-highlighted], [data-selected="true"]) {
+  background-color: color-mix(in oklab, var(--ll-hi) 62%, transparent);
+  border-radius: 255px 14px 225px 14px / 14px 225px 14px 255px;
+  color: var(--foreground);
+}
+:root[data-rt-ink="sketch"] [data-slot="button"]:is([data-variant="ghost"], [data-variant="link"]) {
+  transition: background-color var(--ll-dur-hover) var(--ll-ease-out);
+}
+
+/* ── Handwriting. Controls are written in bold; titles are larger and bold,
+   each word a hair off the baseline; what you type and what you can follow is
+   in blue felt; code stays in the mono face. ── */
+:root[data-rt-ink="sketch"] :is(
+  [data-slot="button"], [data-slot="badge"], [data-slot="tabs-trigger"], [data-slot="toggle"], [data-slot="label"]
+) {
+  font-weight: 700;
+}
+:root[data-rt-ink="sketch"] :is([data-slot="dialog-title"], [data-slot="sheet-title"], [data-ink-title]) {
+  font-size: 1.125rem;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+:root[data-rt-ink="sketch"] [data-ink-title="hero"] {
+  font-size: 1.75rem;
+}
+:root[data-rt-ink="sketch"] [data-ink-title="hero"] [data-ink-written] {
+  position: relative;
+  isolation: isolate;
+}
+/* A highlighter swipe behind the words: the swipe leans, the words stay level. */
+:root[data-rt-ink="sketch"] [data-ink-title="hero"] [data-ink-written]::before {
+  content: "";
+  position: absolute;
+  inset: 46% -0.35em 2% -0.35em;
+  z-index: -1;
+  rotate: -0.7deg;
+  border-radius: 255px 18px 225px 22px / 14px 225px 18px 255px;
+  background-color: color-mix(in oklab, var(--ll-hi) 78%, transparent);
+}
+:root[data-rt-ink="sketch"] [data-ink-word] {
+  display: inline-block;
+  translate: 0 var(--jy, 0px);
+  rotate: var(--jr, 0deg);
+}
+:root[data-rt-ink="sketch"] .uppercase {
+  letter-spacing: 0.08em;
+}
+/* The hand runs wider than the default face: a row of buttons may wrap. */
+:root[data-rt-ink="sketch"] :is([data-slot="dialog-footer"], [data-slot="sheet-footer"]) {
+  flex-wrap: wrap;
+}
+:root[data-rt-ink="sketch"] :is([data-slot="input"], [data-slot="textarea"], [data-ink-frame="prompt"] textarea) {
+  color: var(--ll-ink-you);
+  caret-color: var(--ll-ink-you);
+}
+:root[data-rt-ink="sketch"] :is(.prose-chat, .rustic-markdown) a {
+  color: var(--ll-ink-you);
+}
+:root[data-rt-ink="sketch"] [data-slot="tooltip-content"] {
+  border-radius: 255px 12px 225px 12px / 12px 225px 12px 255px;
+}
+:root[data-rt-ink="sketch"] ::selection {
+  background-color: color-mix(in oklab, var(--ll-hi) 70%, transparent);
+  color: var(--foreground);
+}
+
+/* ── Motion: sheets drop onto the desk, popups pop, doodles boil ── */
+@keyframes rt-ink-sheet-drop {
+  0% { opacity: 0; transform: translateY(-14px) rotate(-1.2deg) scale(1.02); }
+  70% { opacity: 1; transform: translateY(1px) rotate(0.15deg) scale(0.998); }
+  100% { transform: none; }
+}
+@keyframes rt-ink-pop {
+  0% { opacity: 0; transform: scale(0.86) rotate(-2.5deg); }
+  60% { opacity: 1; transform: scale(1.03) rotate(0.6deg); }
+  100% { transform: none; }
+}
+@keyframes rt-ink-boil {
+  0%, 100% { transform: rotate(-1.6deg) translateY(0); }
+  50% { transform: rotate(1.4deg) translateY(-1px); }
+}
+:root[data-rt-ink="sketch"] :is([data-slot="dialog-content"], [data-slot="sheet-content"])[data-state="open"] {
+  animation: rt-ink-sheet-drop var(--ll-dur-sheet) var(--ll-ease-dialog) both;
+}
+:root[data-rt-ink="sketch"] :is(
+  [data-slot="popover-content"], [data-slot="dropdown-menu-content"], [data-slot="context-menu-content"],
+  [data-slot="select-content"], [data-slot="tooltip-content"]
+)[data-state]:not([data-state="closed"]) {
+  animation: rt-ink-pop var(--ll-dur-pop) var(--ll-ease-pop) both;
+}
+:root[data-rt-ink="sketch"] [data-ink-doodle] {
+  animation: rt-ink-boil 1.1s steps(2, jump-none) infinite;
+  transform-origin: 50% 60%;
+}
+:root[data-rt-ink="sketch"] [data-ink-doodle] svg,
+:root[data-rt-ink="sketch"] [data-ink-doodle] {
+  overflow: visible;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root[data-rt-ink="sketch"] {
+    --ll-motion: 0;
+    --ll-hover-tilt: 0deg;
+  }
+  :root[data-rt-ink="sketch"] [data-ink-doodle],
+  :root[data-rt-ink="sketch"] [data-slot][data-state] {
+    animation: none;
+  }
+  :root[data-rt-ink="sketch"] [data-ink-word] {
+    translate: none;
+    rotate: none;
+  }
+}

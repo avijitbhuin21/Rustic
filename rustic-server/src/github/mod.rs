@@ -44,11 +44,18 @@ pub struct GithubAutoConfig {
     /// Only issues carrying this label are auto-processed.
     #[serde(default = "default_label")]
     pub label: String,
+    /// GitHub logins whose comments and issue edits may steer a fixer task.
+    /// Empty = anyone GitHub reports as owner, member or collaborator of the repo.
+    #[serde(default)]
+    pub allowed_logins: Vec<String>,
 }
 
 fn default_label() -> String {
     "rustic".to_string()
 }
+
+/// `author_association` values trusted when no login allowlist is configured.
+const TRUSTED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
 
 impl Default for GithubAutoConfig {
     fn default() -> Self {
@@ -56,8 +63,37 @@ impl Default for GithubAutoConfig {
             enabled: false,
             public_base_url: String::new(),
             label: default_label(),
+            allowed_logins: Vec::new(),
         }
     }
+}
+
+impl GithubAutoConfig {
+    /// Whether activity by `login`, with GitHub's `author_association` for the repo, may steer a fixer task.
+    pub fn trusts(&self, login: &str, association: &str) -> bool {
+        if self.allowed_logins.is_empty() {
+            return TRUSTED_ASSOCIATIONS
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(association));
+        }
+        !login.is_empty()
+            && self
+                .allowed_logins
+                .iter()
+                .any(|l| l.eq_ignore_ascii_case(login))
+    }
+}
+
+/// Normalise a user-entered login list: trimmed, without a leading `@`, no blanks or duplicates.
+pub fn normalize_logins(logins: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in logins {
+        let login = raw.trim().trim_start_matches('@');
+        if !login.is_empty() && !out.iter().any(|l| l.eq_ignore_ascii_case(login)) {
+            out.push(login.to_string());
+        }
+    }
+    out
 }
 
 /// Per-project config (settings key `github_auto_project:<project_id>`).

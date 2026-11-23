@@ -84,6 +84,9 @@ fn signature_for_op(op: &PermissionOp) -> Option<String> {
         // "allow for session" on one skill install must not silently approve
         // the next MCP server.
         PermissionOp::ExtensionChange { .. } => None,
+        // Per tool: approving one tool for the session says nothing about
+        // the others the same server offers.
+        PermissionOp::McpTool { tool, .. } => Some(format!("mcp:{tool}")),
     }
 }
 

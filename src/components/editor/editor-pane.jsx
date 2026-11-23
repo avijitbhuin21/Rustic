@@ -1,5 +1,5 @@
 import React, { Suspense, useEffect, useMemo, useState } from 'react';
-import { Eye, Code2, Loader2 } from 'lucide-react';
+import { Eye, Code2, Loader2, Clapperboard } from 'lucide-react';
 import { TabBar } from '@/components/editor/tab-bar';
 import { Breadcrumb } from '@/components/editor/breadcrumb';
 import { UnsupportedFileView } from '@/components/editor/unsupported-file-view';
@@ -10,6 +10,7 @@ import { COMMAND_BY_ID, effectiveKey, displayKey } from '@/lib/commands';
 import { Skeleton } from '@/components/ui/skeleton';
 import { TerminalPane } from '@/components/terminal/lazy-terminal-pane';
 import { Logo } from '@/components/logo';
+import { Doodle } from '@/components/ui/ink';
 import { cn } from '@/lib/utils';
 
 const _monacoImport = import('@/components/editor/monaco-editor');
@@ -113,12 +114,41 @@ const ArchivePreview  = React.lazy(() => import('@/components/editor/previews/ar
 const SqlitePreview   = React.lazy(() => import('@/components/editor/previews/sqlite-preview'));
 const PptxPreview     = React.lazy(() => import('@/components/editor/previews/pptx-preview'));
 const ModelPreview    = React.lazy(() => import('@/components/editor/previews/model-preview'));
+const FilmPreview     = React.lazy(() => import('@/components/editor/previews/film-preview'));
 const DiffView        = React.lazy(() => import('@/components/scm/diff-view'));
 
-/** Edit ⇄ Preview toggle for markdown/svg/html tabs, shown in the breadcrumb bar beside Reveal. */
+const HTML_VIEW_MODES = [
+  { id: 'edit', label: 'Edit', title: 'Edit source', Icon: Code2 },
+  { id: 'preview', label: 'Preview', title: 'Open preview (scripts do not run)', Icon: Eye },
+  { id: 'film', label: 'Film', title: 'Film view: runs this page\'s own scripts in a sandbox and scrubs window.render(t)', Icon: Clapperboard },
+];
+
+/** Edit ⇄ Preview toggle for markdown/svg/html tabs, shown in the breadcrumb bar beside Reveal. HTML tabs also get Film. */
 function ViewModeToggle({ tab, groupId }) {
   const setTabViewMode = useEditor((s) => s.setTabViewMode);
-  const isPreview = (tab.viewMode ?? 'edit') === 'preview';
+  const mode = tab.viewMode ?? 'edit';
+  if (tab.kind === 'html') {
+    return (
+      <div className="flex items-center gap-0.5" role="group" aria-label="View mode">
+        {HTML_VIEW_MODES.map(({ id, label, title, Icon }) => (
+          <button
+            key={id}
+            onClick={() => setTabViewMode(tab.id, groupId, id)}
+            aria-pressed={mode === id}
+            title={title}
+            className={cn(
+              'flex h-6 items-center gap-1 rounded px-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground',
+              mode === id && 'bg-muted text-foreground',
+            )}
+          >
+            <Icon className="size-3.5" />
+            {label}
+          </button>
+        ))}
+      </div>
+    );
+  }
+  const isPreview = mode === 'preview';
   const next = isPreview ? 'edit' : 'preview';
   return (
     <button
@@ -174,7 +204,11 @@ function EmptyState() {
   }
   return (
     <div className="flex h-full w-full flex-1 flex-col items-center justify-center gap-8">
-      <Logo className="pointer-events-none size-48 opacity-20 select-none" />
+      <div className="relative">
+        <Logo className="pointer-events-none size-48 opacity-20 select-none" />
+        <Doodle name="paper-plane" size={56} className="pointer-events-none absolute -right-10 -top-4" />
+        <Doodle name="sparkle" size={30} className="pointer-events-none absolute -left-6 bottom-2" />
+      </div>
       <div className="flex flex-col gap-1">
         {hints.map((h) => (
           <button
@@ -198,6 +232,9 @@ function ActiveView({ tab }) {
   // editor and only render their preview when the user flips viewMode.
   if (TOGGLEABLE_PREVIEW_KINDS.has(tab.kind) && (tab.viewMode ?? 'edit') === 'edit') {
     return <MonacoEditor tab={tab} />;
+  }
+  if (tab.kind === 'html' && tab.viewMode === 'film') {
+    return <FilmPreview tab={tab} />;
   }
   switch (tab.kind) {
     case 'markdown': return <MarkdownPreview tab={tab} />;

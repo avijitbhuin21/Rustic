@@ -72,3 +72,11 @@ plan.md
 .gemini/
 # Per-project MCP config written for external CLI agents
 .codex/
+
+# Personal documents and scratch files kept in the project root
+/Tapas-Bhuin-CV-english.pdf
+/EZPZ-Pitch-Deck-EN.pptx
+/General_Traders_Additional_Modules.docx
+/Pasted *.png
+/pasted-image*.png
+/sample.html

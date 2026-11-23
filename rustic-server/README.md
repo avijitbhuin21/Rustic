@@ -82,6 +82,18 @@ See [`.env.example`](../.env.example) for every variable. Required:
 `RUSTIC_AUTH_PASSWORD`. Recommended: `RUSTIC_SESSION_SECRET` (stable, so sessions
 survive restarts) and a mounted volume at `RUSTIC_DATA_DIR`.
 
+Two variables change what the server trusts, and both are off unless set:
+
+* `RUSTIC_TRUSTED_PROXIES` — comma-separated IPs or CIDRs of reverse proxies
+  whose `X-Forwarded-For` is believed for the login rate limit. Unset, the
+  header is ignored and the socket peer is used, so behind a proxy every visitor
+  shares one address. `docker-compose.yml` sets it for the bundled Caddy; remove
+  it if you publish the server port directly, or a visitor can send the header
+  themselves and dodge the limit.
+* `RUSTIC_PEER_AUTO_ACCEPT_PUSH` — `1` or `true` accepts a paired device's push
+  with nobody at the web UI. By default a push waits for approval, because it
+  can carry MCP server commands and provider base URLs.
+
 ## The two open decisions
 
 ### TLS strategy — **required, not optional**

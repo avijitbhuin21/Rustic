@@ -405,6 +405,9 @@ mod tests {
             thinking_tier: None,
             pinned: false,
             goal: None,
+            goal_turns: 0,
+            goal_status: None,
+            goal_reason: None,
         }
     }
 

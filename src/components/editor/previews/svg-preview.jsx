@@ -2,7 +2,7 @@ import React, { useEffect, useLayoutEffect, useMemo, useState, useRef } from 're
 import { invoke } from '@tauri-apps/api/core';
 import { useFileReloadVersion } from '@/lib/use-file-change';
 import { dirname, handleMarkdownLinkClick } from '@/lib/markdown-assets';
-import DOMPurify from 'dompurify';
+import { sanitizeSvgFile } from '@/lib/sanitize-html';
 import { Skeleton } from '@/components/ui/skeleton';
 import { basename } from '@/state/editor';
 import { CanvasControls, PreviewCanvas, useCanvasView } from './preview-canvas';
@@ -68,11 +68,7 @@ export default function SvgPreview({ tab }) {
     };
   }, [tab.path, reloadVersion]);
 
-  const safe = useMemo(
-    () =>
-      DOMPurify.sanitize(text ?? '', { USE_PROFILES: { svg: true, svgFilters: true } }),
-    [text],
-  );
+  const safe = useMemo(() => sanitizeSvgFile(text ?? ''), [text]);
 
   // Measure the artwork once it's in the DOM. Driving the layout box off the
   // intrinsic size (rather than letting the SVG size itself) is what lets the

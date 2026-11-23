@@ -88,7 +88,8 @@ function snapshot() {
   const fileGroups = (groups ?? []).map((g) => {
     const tabs = g.tabs
       .filter((t) => t.id?.startsWith('f:') && t.path)
-      .map((t) => ({ path: t.path, viewMode: t.viewMode }));
+      // Film view runs the page's scripts, so it is never reopened without a click.
+      .map((t) => ({ path: t.path, viewMode: t.viewMode === 'film' ? 'edit' : t.viewMode }));
     const active = g.tabs.find((t) => t.id === g.activeId);
     return { tabs, activePath: active?.id?.startsWith('f:') ? active.path : null };
   });

@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { decodeCssEscapes, sanitizeDiagramSvg } from '@/lib/sanitize-html';
 
 let mermaidPromise = null;
 let appliedTheme = null;
@@ -70,12 +71,38 @@ function fixLabelContrast(root) {
 
 let renderSeq = 0;
 
-/** Renders mermaid `source` to SVG markup, rethrowing mermaid's parse error. */
-async function renderToSvg(mermaid, source) {
+// Mermaid inserts labels into the page to measure them, so an image in a label
+// or an image-shape node (`A@{ img: "https://..." }`) is fetched during
+// layout, before any output exists to sanitize. Model-written diagrams that
+// carry either are not drawn: the code fence stays.
+const REMOTE_IMAGE_SHAPE = /\bimg\s*:\s*["']?\s*(?:[a-z][a-z0-9+.-]*:)?\/\//i;
+const TAG_WITH_REMOTE_URL = /<[a-z!/][^>]*\/\//i;
+const MARKDOWN_IMAGE = /!\[[^\]]*\]\(/;
+// A `themeCSS` directive is put in a live <style> during layout too.
+const CSS_FETCH = /url\s*\(|@import|image-set\s*\(/i;
+
+/** True when drawing `source` could make the browser fetch a remote URL. */
+export function diagramFetchesRemote(source) {
+  return (
+    REMOTE_IMAGE_SHAPE.test(source) ||
+    TAG_WITH_REMOTE_URL.test(source) ||
+    MARKDOWN_IMAGE.test(source) ||
+    CSS_FETCH.test(decodeCssEscapes(source))
+  );
+}
+
+/**
+ * Renders mermaid `source` to sanitized SVG markup, rethrowing mermaid's parse
+ * error. `agent` marks model output: nothing remote may load on render.
+ */
+async function renderToSvg(mermaid, source, agent = false) {
+  if (agent && diagramFetchesRemote(source)) {
+    throw new Error('diagram references a remote resource');
+  }
   const id = `mermaid-chat-${++renderSeq}`;
   try {
     const { svg } = await mermaid.render(id, source);
-    return svg;
+    return sanitizeDiagramSvg(svg, { agent });
   } catch (e) {
     // mermaid.render leaves a stray error element behind on failure — remove
     // it so it doesn't pile up at the document bottom.
@@ -89,10 +116,10 @@ async function renderToSvg(mermaid, source) {
  * Renders a whole mermaid document (a `.mmd` file) to themed SVG markup plus
  * its intrinsic viewBox size. Rejects with mermaid's parse error.
  */
-export async function renderMermaidDiagram(source) {
+export async function renderMermaidDiagram(source, { agent = false } = {}) {
   const mermaid = await loadMermaid();
   const host = document.createElement('div');
-  host.innerHTML = await renderToSvg(mermaid, source);
+  host.innerHTML = await renderToSvg(mermaid, source, agent);
   fixLabelContrast(host);
   const vb = host.querySelector('svg')?.viewBox?.baseVal;
   return { svg: host.innerHTML, width: vb?.width || 0, height: vb?.height || 0 };
@@ -224,9 +251,10 @@ function isMermaidBlock(code) {
 /**
  * Renders ```mermaid fenced code blocks inside `ref`'s injected markdown HTML
  * as inline SVG diagrams. Blocks that fail to parse (e.g. still streaming)
- * are left as plain code and retried on the next content change.
+ * are left as plain code and retried on the next content change. Pass
+ * `{ agent: true }` when the markdown is model output.
  */
-export function useMermaidBlocks(ref, deps) {
+export function useMermaidBlocks(ref, deps, { agent = false } = {}) {
   useEffect(() => {
     const el = ref.current;
     if (!el) return undefined;
@@ -248,7 +276,7 @@ export function useMermaidBlocks(ref, deps) {
         const source = code.textContent || '';
         if (!source.trim()) continue;
         try {
-          const svg = await renderToSvg(mermaid, source);
+          const svg = await renderToSvg(mermaid, source, agent);
           if (cancelled || !pre.isConnected) return;
           const wrap = document.createElement('div');
           wrap.className = 'mermaid-diagram relative my-2 flex justify-center overflow-x-auto rounded-md bg-muted/40 p-2';

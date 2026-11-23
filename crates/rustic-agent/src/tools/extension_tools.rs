@@ -323,12 +323,24 @@ async fn install_extension(params: Value, context: &ToolContext) -> Result<ToolO
     let url = str_param(&params, "url");
     let (content, source) = match (inline, url) {
         (Some(c), None) => (c, "inline".to_string()),
-        (None, Some(u)) => match fetch_text(&u).await {
-            Ok(c) => (c, u),
-            Err(e) => {
-                return Ok(ToolOutput::text(format!("FETCH_FAILED: {}", e), true));
+        (None, Some(u)) => {
+            // Asked before anything is requested: the URL comes from the
+            // model, and the request itself can carry data out in its path
+            // or query. The content gets its own prompt once it is fetched.
+            let notice = format!(
+                "Rustic will request this URL to show you its content before installing:\n{}",
+                u
+            );
+            if let Some(denied) = request_consent(context, "download", &kind, &name, notice).await {
+                return Ok(denied);
             }
-        },
+            match fetch_text(&u).await {
+                Ok(c) => (c, u),
+                Err(e) => {
+                    return Ok(ToolOutput::text(format!("FETCH_FAILED: {}", e), true));
+                }
+            }
+        }
         (Some(_), Some(_)) => {
             return Ok(ToolOutput::text(
                 "INVALID_PARAMS: provide either `content` or `url`, not both",

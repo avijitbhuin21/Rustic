@@ -186,6 +186,12 @@ export function LanPairPrompt() {
           </DialogDescription>
         </DialogHeader>
         <div className="py-2 text-center font-mono text-3xl tracking-[0.35em]">{current?.code}</div>
+        {current?.replaces && (
+          <p className="text-[11.5px] text-warning">
+            This machine is already paired with a device using the same id ({current.replaces}). Accepting
+            replaces that pairing and clears everything you share with it.
+          </p>
+        )}
         <DialogFooter>
           <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => respond(false)}>Decline</Button>
           <Button size="sm" className="h-7 text-xs" onClick={() => respond(true)}>Accept</Button>

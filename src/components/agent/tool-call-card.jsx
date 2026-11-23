@@ -4,6 +4,7 @@ import {
   ChevronRight,
   Circle,
   CircleDotDashed,
+  CircleSlash,
   CircleX,
   Eye,
   HelpCircle,
@@ -16,6 +17,8 @@ import { useAgent, fetchMessageBlock } from '@/state/agent';
 import { useRelativeTime } from '@/lib/relative-time';
 import { MediaGallery, parseMediaOutput, stripMediaBlock } from './media-gallery';
 import { activeChatRoot, findPathsInText, joinPath, openFileLink, parsePathCandidate } from '@/lib/file-links';
+import { askUserMarkdown, parseAskOutcome, parseAskQuestions } from '@/lib/ask-user-format';
+import { MarkdownBlock } from './markdown-block';
 
 const MEDIA_TOOLS = new Set(['image_create', 'video_create', 'animate']);
 
@@ -119,8 +122,15 @@ function formatValue(v) {
   }
 }
 
-function deriveStatus({ hasResult, isError }) {
-  if (!hasResult) return 'in-progress';
+// Result text the backend persists for a tool call the user stopped before it
+// ran (close_dangling_tool_uses in crates/rustic-agent/src/task/executor.rs).
+const INTERRUPTED_RESULT_PREFIX = '[interrupted';
+
+function deriveStatus({ hasResult, isError, interrupted, output }) {
+  if (!hasResult) return interrupted ? 'stopped' : 'in-progress';
+  if (isError && typeof output === 'string' && output.startsWith(INTERRUPTED_RESULT_PREFIX)) {
+    return 'stopped';
+  }
   if (isError) return 'failed';
   return 'completed';
 }
@@ -129,6 +139,7 @@ const STATUS_LABEL = {
   'in-progress': 'running',
   completed: 'done',
   failed: 'failed',
+  stopped: 'stopped',
   pending: 'pending',
 };
 
@@ -160,6 +171,7 @@ const STATUS_BADGE = {
   completed: 'bg-success/15 text-success',
   'in-progress': 'bg-info/15 text-info',
   failed: 'bg-danger/15 text-danger',
+  stopped: 'bg-danger/15 text-danger',
   pending: 'bg-muted text-muted-foreground',
 };
 
@@ -486,6 +498,8 @@ function StatusIcon({ status, toolName }) {
           )
         ) : status === 'failed' ? (
           <CircleX className="size-4 text-danger" />
+        ) : status === 'stopped' ? (
+          <CircleSlash className="size-4 text-danger" />
         ) : (
           <Circle className="size-4 text-muted-foreground" />
         )}
@@ -598,6 +612,7 @@ function ToolCallCardInner({
   input,
   output: outputProp,
   isError,
+  interrupted = false,
   defaultOpen = false,
   timestamp,
   truncated,
@@ -633,7 +648,7 @@ function ToolCallCardInner({
     });
   }, [open, canLoadFull, fullState, truncatedTaskId, truncatedSortOrder, blockIndex]);
 
-  const status = deriveStatus({ hasResult, isError });
+  const status = deriveStatus({ hasResult, isError, interrupted, output });
   const badgeClass = STATUS_BADGE[status];
   const outcome = useMemo(() => writeOutcome(output), [output]);
   const relative = useRelativeTime(timestamp);
@@ -721,6 +736,10 @@ function ToolCallCardInner({
     const { description, ...rest } = input;
     return rest;
   }, [input]);
+  const askQuestions = useMemo(
+    () => (name === 'ask_user' ? parseAskQuestions(input) : []),
+    [name, input],
+  );
   const primaryPath = useMemo(() => primaryPathOf(name, input), [name, input]);
   const linkBase = open ? linkBaseFor(name, input) : null;
   const allowBare = DIR_LISTING_TOOLS.has(name);
@@ -828,7 +847,15 @@ function ToolCallCardInner({
               {name === 'spawn_subagent' && !isBatch && (
                 <SpawnedSubagentList output={output} />
               )}
-              {isBatch ? (
+              {name === 'ask_user' && askQuestions.length > 0 ? (
+                <MarkdownBlock
+                  text={askUserMarkdown(
+                    askQuestions,
+                    parseAskOutcome(output, { isError, interrupted }),
+                  )}
+                  className="break-words [overflow-wrap:anywhere]"
+                />
+              ) : isBatch ? (
                 <>
                   <div className="space-y-0.5">
                     {batchEntries.map((entry, i) =>

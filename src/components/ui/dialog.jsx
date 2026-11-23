@@ -3,6 +3,7 @@ import { Dialog as DialogPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { Written } from "@/components/ui/ink"
 import { XIcon } from "lucide-react"
 
 function Dialog({
@@ -112,13 +113,16 @@ function DialogFooter({
 
 function DialogTitle({
   className,
+  children,
   ...props
 }) {
   return (
     <DialogPrimitive.Title
       data-slot="dialog-title"
       className={cn("font-heading text-base leading-none font-medium", className)}
-      {...props} />
+      {...props}>
+      <Written>{children}</Written>
+    </DialogPrimitive.Title>
   );
 }
 

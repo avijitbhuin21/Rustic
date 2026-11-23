@@ -23,6 +23,40 @@ use super::walk::{join_rel, normalize_rel};
 /// Plan-locked in `docs/file_tracking_decision.md` §0.
 const GC_PRUNE_HORIZON: Duration = Duration::from_secs(7 * 24 * 3600);
 
+/// How long a foreign edit-tool write stays subtractable after the event for
+/// it should have arrived. Covers the watcher debounce plus the gap between
+/// an edit tool's `capture` and its actual write.
+const FOREIGN_WRITE_GRACE: Duration = Duration::from_secs(5);
+/// Tasks tracked for foreign-write subtraction; the one that opened a
+/// snapshot longest ago is dropped beyond this.
+const MAX_FOREIGN_TASKS: usize = 64;
+/// Marks one task may hold before stale ones are pruned.
+const MAX_FOREIGN_MARKS: usize = 512;
+
+/// One task's view of edit-tool writes made by OTHER tasks.
+#[derive(Default)]
+struct ForeignMarks {
+    /// Bumped on every `open_snapshot`; the lowest value is evicted first.
+    last_opened: u64,
+    /// Project-relative path → when the other task's edit tool captured it.
+    paths: std::collections::HashMap<String, std::time::Instant>,
+}
+
+impl ForeignMarks {
+    /// Drop marks old enough that their filesystem event has certainly been delivered.
+    fn prune_stale(&mut self) {
+        let now = std::time::Instant::now();
+        self.paths
+            .retain(|_, at| now.duration_since(*at) < FOREIGN_WRITE_GRACE);
+    }
+}
+
+#[derive(Default)]
+struct ForeignWrites {
+    opened: u64,
+    tasks: std::collections::HashMap<String, ForeignMarks>,
+}
+
 #[derive(Debug, Error)]
 pub enum FileHistoryError {
     #[error("shadow: {0}")]
@@ -157,6 +191,9 @@ struct FileHistoryInner {
     accumulator: Option<Arc<DirtyPathAccumulator>>,
     /// Per-message pre-bash tree checkpoints — see `checkpoint_pre_bash`.
     pre_bash_trees: Mutex<std::collections::HashMap<String, Oid>>,
+    /// Edit-tool writes by other tasks, subtracted from a task's command
+    /// sweeps — see `note_foreign_write`.
+    foreign_writes: Mutex<ForeignWrites>,
 }
 
 impl FileHistory {
@@ -186,6 +223,7 @@ impl FileHistory {
                 max_snapshots: 100,
                 accumulator,
                 pre_bash_trees: Mutex::new(std::collections::HashMap::new()),
+                foreign_writes: Mutex::new(ForeignWrites::default()),
             }),
         })
     }
@@ -213,12 +251,11 @@ impl FileHistory {
     /// runs `shadow.track()`, persists the resulting tree oid in
     /// metadata, and applies the per-task retention cap.
     ///
-    /// When an FS-watcher accumulator is attached, this also re-routes
-    /// future events to `(task_id, message_id)` and clears the previously
-    /// pending dirty set for that key. The active-key change is atomic
-    /// w.r.t. the snapshot row insert so events landing during the gap
-    /// either accumulate against the new key or are dropped (no risk of
-    /// being attributed to the wrong key).
+    /// When an FS-watcher accumulator is attached, this also starts
+    /// recording events for `(task_id, message_id)`, replacing the task's
+    /// previous message key. Other tasks keep receiving events too — an
+    /// event does not say who caused it, so attribution is decided at sweep
+    /// time (see `record_post_bash_state`), not by routing.
     ///
     /// ### Restart correctness
     /// When the snapshot row ALREADY exists (re-open mid-session, or the
@@ -230,12 +267,12 @@ impl FileHistory {
     /// fallback, which re-reads the worktree and catches whatever the
     /// watcher missed.
     pub fn open_snapshot(&self, message_id: &str, task_id: &str) -> Result<()> {
-        // Route subsequent FS events to this (task, message) pair. Done
-        // before the row check so a re-open of the same key (e.g. on a
-        // retry path) still re-arms the active routing.
+        // Done before the row check so a re-open of the same key (e.g. on a
+        // retry path) still re-arms the routing.
         if let Some(acc) = &self.inner.accumulator {
             acc.set_active(task_id, message_id);
         }
+        self.register_foreign_task(task_id);
 
         // Idempotent: if a row exists, don't re-track (we'd clobber the
         // pre-message state with the post-tool state).
@@ -248,7 +285,7 @@ impl FileHistory {
             if db.fh_get_snapshot(message_id)?.is_some() {
                 // Pre-existing snapshot — see "Restart correctness" above.
                 if let Some(acc) = &self.inner.accumulator {
-                    acc.mark_lost();
+                    acc.mark_key_lost(task_id, message_id);
                 }
                 return Ok(());
             }
@@ -295,19 +332,28 @@ impl FileHistory {
     ///
     /// Side effect: the path is recorded as a write attributed to the
     /// snapshot's task (edit tools call this right before mutating the
-    /// file), which is what scopes revert to "files THIS task wrote".
+    /// file), which is what scopes revert to "files THIS task wrote". Every
+    /// other task is told the write is not theirs, so a command sweep of
+    /// theirs that sees the change on disk does not claim it.
     pub fn capture(&self, message_id: &str, abs_path: &Path) -> Result<CaptureOutcome> {
         let rel_path = self.relativize(abs_path)?;
 
-        {
+        let writer = {
             let db = self
                 .inner
                 .db
                 .lock()
                 .map_err(|_| FileHistoryError::Poisoned)?;
-            if let Some(row) = db.fh_get_snapshot(message_id)? {
-                db.fh_record_task_writes(&row.task_id, std::slice::from_ref(&rel_path))?;
+            match db.fh_get_snapshot(message_id)? {
+                Some(row) => {
+                    db.fh_record_task_writes(&row.task_id, std::slice::from_ref(&rel_path))?;
+                    Some(row.task_id)
+                }
+                None => None,
             }
+        };
+        if let Some(writer) = &writer {
+            self.note_foreign_write(writer, &rel_path);
         }
 
         // Size cap surfaced to the UI: if the on-disk file exceeds the
@@ -930,6 +976,14 @@ impl FileHistory {
     /// O(worktree). On lost-event or absent accumulator, falls back to the
     /// full walk (`shadow.track`) for correctness.
     ///
+    /// ### Attribution
+    /// Both paths see every change that landed on disk during the command
+    /// window, whoever made it. Paths another task's edit tool wrote are
+    /// removed before anything is recorded (see `note_foreign_write`): those
+    /// writes have a known author. What remains is credited to this task.
+    /// Two tasks whose commands overlap are therefore both credited with the
+    /// changes made while both ran — the writer cannot be told apart.
+    ///
     /// The snapshot row's tree_oid is intentionally NOT updated here so
     /// `list_task_net_changes` retains a stable pre-turn baseline.
     pub fn record_post_bash_state(&self, message_id: &str) -> Result<Vec<String>> {
@@ -967,8 +1021,8 @@ impl FileHistory {
                     if next == base {
                         return Ok(Vec::new());
                     }
-                    let mut changed = self.inner.shadow.diff_paths(base, next)?;
-                    changed.sort();
+                    let changed = self.inner.shadow.diff_paths(base, next)?;
+                    let changed = self.without_foreign_writes(task_id, changed);
                     self.record_task_writes(task_id, &changed)?;
                     return Ok(changed);
                 }
@@ -984,9 +1038,12 @@ impl FileHistory {
             return Ok(Vec::new());
         }
         let mut changed = self.inner.shadow.diff_paths(base, next)?;
-        changed.sort();
-        if let Some(task_id) = &task_id {
-            self.record_task_writes(task_id, &changed)?;
+        match &task_id {
+            Some(task_id) => {
+                changed = self.without_foreign_writes(task_id, changed);
+                self.record_task_writes(task_id, &changed)?;
+            }
+            None => changed.sort(),
         }
         Ok(changed)
     }
@@ -995,9 +1052,10 @@ impl FileHistory {
     /// The following sweep diffs from this checkpoint, so only paths that
     /// changed while the command ran are attributed to the task — not
     /// everything since the message opened (foreign writes landing before the
-    /// bash call no longer get absorbed). No-op (legacy wide-window sweep)
-    /// when no accumulator is attached, the snapshot row is missing, or
-    /// watcher events were lost.
+    /// bash call no longer get absorbed). When watcher events were lost the
+    /// checkpoint is taken with a full walk instead, so the window still
+    /// starts at the command. No-op (legacy wide-window sweep) when no
+    /// accumulator is attached or the snapshot row is missing.
     pub fn checkpoint_pre_bash(&self, message_id: &str) -> Result<()> {
         let Some(acc) = &self.inner.accumulator else {
             return Ok(());
@@ -1017,27 +1075,89 @@ impl FileHistory {
             }
         };
         let set = acc.drain(&task_id, message_id);
-        if set.lost {
-            self.pre_bash_map().remove(message_id);
-            return Ok(());
-        }
-        let base = self
-            .pre_bash_map()
-            .get(message_id)
-            .copied()
-            .unwrap_or(msg_tree);
-        let pre = if set.is_empty() {
-            base
+        let pre = if set.lost {
+            self.inner.shadow.track()?.tree_oid
         } else {
-            let modified: Vec<String> = set.modified.into_iter().collect();
-            let removed: Vec<String> = set.removed.into_iter().collect();
-            self.inner
-                .shadow
-                .track_paths(base, &modified, &removed)?
-                .tree_oid
+            let base = self
+                .pre_bash_map()
+                .get(message_id)
+                .copied()
+                .unwrap_or(msg_tree);
+            if set.is_empty() {
+                base
+            } else {
+                let modified: Vec<String> = set.modified.into_iter().collect();
+                let removed: Vec<String> = set.removed.into_iter().collect();
+                self.inner
+                    .shadow
+                    .track_paths(base, &modified, &removed)?
+                    .tree_oid
+            }
         };
         self.store_pre_bash_tree(message_id, pre);
+        // Older foreign writes are part of the checkpoint now. Recent ones
+        // stay marked: their event may not have been delivered yet.
+        if let Some(marks) = self.foreign_map().tasks.get_mut(&task_id) {
+            marks.prune_stale();
+        }
         Ok(())
+    }
+
+    /// Poison-tolerant accessor for the foreign-write marks.
+    fn foreign_map(&self) -> std::sync::MutexGuard<'_, ForeignWrites> {
+        match self.inner.foreign_writes.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Start (or keep) tracking other tasks' edit-tool writes on behalf of `task_id`.
+    fn register_foreign_task(&self, task_id: &str) {
+        let mut map = self.foreign_map();
+        map.opened += 1;
+        let opened = map.opened;
+        map.tasks
+            .entry(task_id.to_string())
+            .or_default()
+            .last_opened = opened;
+        while map.tasks.len() > MAX_FOREIGN_TASKS {
+            let oldest = map
+                .tasks
+                .iter()
+                .min_by_key(|(_, m)| m.last_opened)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    map.tasks.remove(&k);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Tell every other tracked task that `writer`'s edit tool is writing `rel_path`, so their command sweeps do not claim it.
+    fn note_foreign_write(&self, writer: &str, rel_path: &str) {
+        let now = std::time::Instant::now();
+        let mut map = self.foreign_map();
+        for (task, marks) in map.tasks.iter_mut() {
+            if task == writer {
+                continue;
+            }
+            if marks.paths.len() >= MAX_FOREIGN_MARKS {
+                marks.prune_stale();
+            }
+            marks.paths.insert(rel_path.to_string(), now);
+        }
+    }
+
+    /// Remove paths another task's edit tool wrote from a sweep's change list (sorted), then expire the marks that were due.
+    fn without_foreign_writes(&self, task_id: &str, mut changed: Vec<String>) -> Vec<String> {
+        if let Some(marks) = self.foreign_map().tasks.get_mut(task_id) {
+            changed.retain(|p| !marks.paths.contains_key(p));
+            marks.prune_stale();
+        }
+        changed.sort();
+        changed
     }
 
     /// Poison-tolerant accessor for the pre-bash checkpoint map.
@@ -2083,6 +2203,142 @@ mod tests {
 
         let changed = f.history.record_post_bash_state("msg").unwrap();
         assert_eq!(changed, vec!["x.txt".to_string()]);
+    }
+
+    /// Second task in the same project, for the concurrent-attribution tests.
+    fn add_task(f: &Fixture, task_id: &str) {
+        let db = f.history.db();
+        let g = db.lock().unwrap();
+        g.conn()
+            .execute(
+                "INSERT INTO tasks (id, project_id, title, status, provider_type, model)
+                 VALUES (?1, 'p', 'title', 'created', 'native', 'm')",
+                [task_id],
+            )
+            .unwrap();
+    }
+
+    fn task_writes(f: &Fixture, task_id: &str) -> Vec<String> {
+        let db = f.history.db();
+        let g = db.lock().unwrap();
+        let mut writes = g.fh_list_task_writes(task_id).unwrap();
+        writes.sort();
+        writes
+    }
+
+    /// Tracker issue #13: task `t2` opened its snapshot last and is running a
+    /// command while task `t` edits a file with an edit tool. The edit has a
+    /// known author, so `t2`'s sweep must not claim it.
+    #[test]
+    fn peer_edit_tool_write_is_not_credited_to_a_running_command() {
+        let (f, acc) = fixture_with_accumulator();
+        add_task(&f, "t2");
+        write(&f.project_root.join("base.txt"), b"x");
+        f.history.open_snapshot("m1", "t").unwrap();
+        f.history.open_snapshot("m2", "t2").unwrap();
+
+        f.history.checkpoint_pre_bash("m2").unwrap();
+
+        let by_t = f.project_root.join("a_by_t.txt");
+        f.history.capture("m1", &by_t).unwrap();
+        write(&by_t, b"written by t");
+        acc.record_modified(&by_t);
+
+        let own = f.project_root.join("by_t2_command.txt");
+        write(&own, b"written by t2's command");
+        acc.record_modified(&own);
+
+        let changed = f.history.record_post_bash_state("m2").unwrap();
+        assert_eq!(changed, vec!["by_t2_command.txt".to_string()]);
+        assert_eq!(task_writes(&f, "t"), vec!["a_by_t.txt".to_string()]);
+        assert_eq!(task_writes(&f, "t2"), vec!["by_t2_command.txt".to_string()]);
+    }
+
+    /// Same scenario when the watcher has not delivered anything yet (or is
+    /// absent): the full-walk fallback sees the peer's edit on disk and must
+    /// leave it out as well.
+    #[test]
+    fn peer_edit_tool_write_is_not_credited_by_the_full_walk_fallback() {
+        let (f, _acc) = fixture_with_accumulator();
+        add_task(&f, "t2");
+        f.history.open_snapshot("m1", "t").unwrap();
+        f.history.open_snapshot("m2", "t2").unwrap();
+        f.history.checkpoint_pre_bash("m2").unwrap();
+
+        let by_t = f.project_root.join("a_by_t.txt");
+        f.history.capture("m1", &by_t).unwrap();
+        write(&by_t, b"written by t");
+        write(&f.project_root.join("by_t2_command.txt"), b"t2");
+
+        let changed = f.history.record_post_bash_state("m2").unwrap();
+        assert_eq!(changed, vec!["by_t2_command.txt".to_string()]);
+        assert_eq!(task_writes(&f, "t2"), vec!["by_t2_command.txt".to_string()]);
+    }
+
+    /// The task that did NOT open its snapshot last still sees the events for
+    /// its own command — routing used to hand them all to the latest task.
+    #[test]
+    fn earlier_task_still_gets_its_own_command_writes() {
+        let (f, acc) = fixture_with_accumulator();
+        add_task(&f, "t2");
+        f.history.open_snapshot("m1", "t").unwrap();
+        f.history.open_snapshot("m2", "t2").unwrap();
+
+        f.history.checkpoint_pre_bash("m1").unwrap();
+        let out = f.project_root.join("built.txt");
+        write(&out, b"output of t's command");
+        acc.record_modified(&out);
+
+        let changed = f.history.record_post_bash_state("m1").unwrap();
+        assert_eq!(changed, vec!["built.txt".to_string()]);
+        assert!(
+            task_writes(&f, "t2").is_empty(),
+            "t2 ran no command, so nothing is credited to it"
+        );
+    }
+
+    /// Two tasks with commands running at the same time: a change that no
+    /// edit tool announced has no knowable author, so both are credited.
+    #[test]
+    fn overlapping_commands_are_both_credited() {
+        let (f, acc) = fixture_with_accumulator();
+        add_task(&f, "t2");
+        f.history.open_snapshot("m1", "t").unwrap();
+        f.history.open_snapshot("m2", "t2").unwrap();
+        f.history.checkpoint_pre_bash("m1").unwrap();
+        f.history.checkpoint_pre_bash("m2").unwrap();
+
+        let out = f.project_root.join("generated.txt");
+        write(&out, b"by one of the two commands");
+        acc.record_modified(&out);
+
+        f.history.record_post_bash_state("m1").unwrap();
+        f.history.record_post_bash_state("m2").unwrap();
+        assert_eq!(task_writes(&f, "t"), vec!["generated.txt".to_string()]);
+        assert_eq!(task_writes(&f, "t2"), vec!["generated.txt".to_string()]);
+    }
+
+    /// Dropped watcher events before a command must not widen its window back
+    /// to the start of the message: the checkpoint is taken with a full walk.
+    #[test]
+    fn lost_events_before_a_command_keep_the_window_at_the_command() {
+        let (f, acc) = fixture_with_accumulator();
+        f.history.open_snapshot("msg", "t").unwrap();
+
+        write(
+            &f.project_root.join("foreign.txt"),
+            b"user edit, event lost",
+        );
+        acc.mark_lost();
+        f.history.checkpoint_pre_bash("msg").unwrap();
+
+        let mine = f.project_root.join("mine.txt");
+        write(&mine, b"bash output");
+        acc.record_modified(&mine);
+
+        let changed = f.history.record_post_bash_state("msg").unwrap();
+        assert_eq!(changed, vec!["mine.txt".to_string()]);
+        assert_eq!(task_writes(&f, "t"), vec!["mine.txt".to_string()]);
     }
 
     /// Reopening the FileHistory mid-task (simulating a process restart)

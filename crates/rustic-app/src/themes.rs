@@ -250,19 +250,26 @@ pub struct Style {
     /// `"solid" | "pill" | "raised" | "brutal" | "glow"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub button: Option<String>,
-    /// App background pattern: `"none" | "grain" | "grid" | "dots" | "scanlines"`.
+    /// App background pattern: `"none" | "grain" | "grid" | "dots" | "scanlines" | "paper"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub texture: Option<String>,
+    /// Outline style: `"none"` or `"sketch"` (controls and panels drawn by hand).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ink: Option<String>,
 }
 
 /// Allowed values for the enum-like style keys.
-const STYLE_ENUMS: [(&str, &[&str]); 6] = [
+const STYLE_ENUMS: [(&str, &[&str]); 7] = [
     ("motion", &["full", "reduced"]),
     ("shadow", &["none", "soft", "strong", "glow", "hard"]),
     ("surface", &["solid", "glass"]),
     ("density", &["compact", "normal", "comfortable"]),
     ("button", &["solid", "pill", "raised", "brutal", "glow"]),
-    ("texture", &["none", "grain", "grid", "dots", "scanlines"]),
+    (
+        "texture",
+        &["none", "grain", "grid", "dots", "scanlines", "paper"],
+    ),
+    ("ink", &["none", "sketch"]),
 ];
 
 /// A theme file.
@@ -292,16 +299,12 @@ fn default_format() -> u32 {
     FORMAT
 }
 
-/// Base each mode's missing slots come from: Obsidian, or Basalt's light set.
+/// Base each mode's missing slots come from: Obsidian, or the neutral light set.
 fn base_for(mode: &str) -> Theme {
     if mode != "light" {
         return Theme::obsidian();
     }
-    serde_json::from_str::<Pack>(PACKS[0].1)
-        .ok()
-        .and_then(|p| p.light)
-        .map(|c| c.over(Theme::graphite_light()))
-        .unwrap_or_else(Theme::graphite_light)
+    Theme::graphite_light()
 }
 
 impl Pack {
@@ -471,6 +474,7 @@ pub fn validate(p: &Pack) -> Result<(), String> {
         ("density", &s.density),
         ("button", &s.button),
         ("texture", &s.texture),
+        ("ink", &s.ink),
     ] {
         if let Some(v) = value {
             if !is_safe_style_value(v) {
@@ -1033,40 +1037,33 @@ pub fn read_file(data_dir: &Path, id: &str) -> Result<(String, Pack, String), St
     Ok((text, pack, h))
 }
 
-/// Built-in theme files (dark + light each), listed after Obsidian. Generated
-/// from OKLCH ladders with contrast targets; also usable as editable examples.
-const PACKS: &[(&str, &str)] = &[
-    ("Basalt", include_str!("../themes/basalt.rustic-theme.json")),
-    ("Hearth", include_str!("../themes/hearth.rustic-theme.json")),
-    ("Petal", include_str!("../themes/petal.rustic-theme.json")),
-    (
-        "Midnight",
-        include_str!("../themes/midnight.rustic-theme.json"),
-    ),
-    ("Onyx", include_str!("../themes/onyx.rustic-theme.json")),
-    (
-        "Neo Brutal",
-        include_str!("../themes/neo-brutal.rustic-theme.json"),
-    ),
-    ("Grove", include_str!("../themes/grove.rustic-theme.json")),
-    (
-        "Neon Grid",
-        include_str!("../themes/neon-grid.rustic-theme.json"),
-    ),
-];
+/// Built-in theme files, listed after Obsidian. Everything else lives in the
+/// Theme Park (the packs retired in v0.8.6 are seeded there).
+const PACKS: &[(&str, &str)] = &[(
+    "Sketchbook",
+    include_str!("../themes/sketchbook.rustic-theme.json"),
+)];
 
 /// Retired built-in ids → (replacement id, color mode to switch to).
 const RENAMED: &[(&str, &str, &str)] = &[
-    ("Luxide Dark", "Midnight", "dark"),
-    ("Verdigris", "Basalt", "dark"),
-    ("Graphite", "Basalt", "dark"),
-    ("Graphite Light", "Basalt", "light"),
-    ("Ink", "Hearth", "dark"),
-    ("Paper", "Hearth", "light"),
-    ("Fjord Night", "Midnight", "dark"),
-    ("Fjord Day", "Midnight", "light"),
-    ("Kiln", "Hearth", "dark"),
-    ("Kiln Light", "Hearth", "light"),
+    ("Luxide Dark", "Obsidian", "dark"),
+    ("Verdigris", "Obsidian", "dark"),
+    ("Graphite", "Obsidian", "dark"),
+    ("Graphite Light", "Obsidian", "dark"),
+    ("Ink", "Obsidian", "dark"),
+    ("Paper", "Obsidian", "dark"),
+    ("Fjord Night", "Obsidian", "dark"),
+    ("Fjord Day", "Obsidian", "dark"),
+    ("Kiln", "Obsidian", "dark"),
+    ("Kiln Light", "Obsidian", "dark"),
+    ("Basalt", "Obsidian", "dark"),
+    ("Hearth", "Obsidian", "dark"),
+    ("Petal", "Obsidian", "dark"),
+    ("Midnight", "Obsidian", "dark"),
+    ("Onyx", "Obsidian", "dark"),
+    ("Neo Brutal", "Obsidian", "dark"),
+    ("Grove", "Obsidian", "dark"),
+    ("Neon Grid", "Obsidian", "dark"),
 ];
 
 /// Replacement `(id, mode)` when `id` is a retired built-in.
@@ -1079,7 +1076,8 @@ fn is_builtin(id: &str) -> bool {
     builtin_pack(id).is_some()
 }
 
-/// Built-in pack for `name`: Obsidian (dark only) or one of [`PACKS`].
+/// Built-in pack for `name`: Obsidian (dark only) or one of [`PACKS`]; a
+/// retired id resolves to its replacement.
 fn builtin_pack(name: &str) -> Option<Pack> {
     let name = renamed(name).map(|r| r.0).unwrap_or(name);
     if let Some((_, text)) = PACKS.iter().find(|(id, _)| *id == name) {
@@ -1109,6 +1107,7 @@ pub fn template() -> String {
             density: Some("normal".into()),
             button: Some("solid".into()),
             texture: Some("none".into()),
+            ink: Some("none".into()),
         },
         css: Some(String::new()),
     };
@@ -1321,7 +1320,8 @@ pub fn apply(state: &AppState, data_dir: &Path, id: &str) -> Result<(), String> 
     write_settings(state, &s)
 }
 
-/// Set the color mode: `"dark"`, `"light"` or `"system"`.
+/// Pick the variant (`"dark"`, `"light"` or `"system"`) shown for themes that
+/// ship both; single-mode themes ignore it.
 pub fn set_mode(state: &AppState, mode: &str) -> Result<(), String> {
     if !matches!(mode, "dark" | "light" | "system") {
         return Err("mode must be dark, light or system".into());
@@ -1377,7 +1377,12 @@ pub fn active(state: &AppState, data_dir: &Path) -> Active {
         .as_deref()
         .filter(|c| !c.trim().is_empty())
         .map(prepare_css);
-    // A single-mode theme still switches: the missing mode uses the default palette.
+    // The theme decides the mode; the stored one only picks between the two
+    // variants of a theme that ships both.
+    let mode = match pack.modes().as_slice() {
+        [only] => only.to_string(),
+        _ => mode,
+    };
     let variant = |m: &str, has: bool| {
         Some(if has || pack.modes().is_empty() {
             pack.resolve(m)
@@ -1584,17 +1589,19 @@ mod tests {
     }
 
     #[test]
-    fn families_carry_both_modes_and_template_is_valid() {
-        let p = builtin_pack("Paper").unwrap();
-        assert_eq!(p.name, "Hearth", "retired ids resolve to their replacement");
-        assert_eq!(p.modes(), vec!["dark", "light"]);
-        assert_eq!(renamed("Kiln Light"), Some(("Hearth", "light")));
-        assert!(is_builtin("Obsidian") && is_builtin("Onyx") && !is_builtin("Nope"));
-        assert_ne!(
-            base_for("light").bg,
-            Theme::graphite_light().bg,
-            "default light base is Basalt light"
+    fn retired_builtins_resolve_to_obsidian_and_template_is_valid() {
+        for id in ["Paper", "Basalt", "Neon Grid", "Kiln Light"] {
+            let p = builtin_pack(id).unwrap();
+            assert_eq!(p.name, "Obsidian", "{id} resolves to its replacement");
+            assert_eq!(p.modes(), vec!["dark"]);
+            assert_eq!(renamed(id), Some(("Obsidian", "dark")));
+        }
+        assert!(is_builtin("Obsidian") && is_builtin("Sketchbook") && !is_builtin("Nope"));
+        assert!(
+            is_builtin("Onyx") && !is_builtin("onyx"),
+            "a retired id stays reserved, its Theme Park copy installs under a slug"
         );
+        assert_eq!(base_for("light").bg, Theme::graphite_light().bg);
         let t = parse(&template()).unwrap();
         assert_eq!(t.modes(), vec!["dark", "light"]);
         assert!(scan(&t).blocked.is_empty());
@@ -1605,7 +1612,9 @@ mod tests {
     fn starters_are_valid_builtins_and_style_enums_are_checked() {
         for (id, _) in PACKS {
             let p = builtin_pack(id).unwrap_or_else(|| panic!("{id} must parse"));
-            assert_eq!(p.modes(), vec!["dark", "light"], "{id}");
+            assert_eq!(p.modes(), vec!["light"], "{id}");
+            assert_eq!(p.style.ink.as_deref(), Some("sketch"), "{id}");
+            assert!(p.css.is_none(), "{id}: built-ins carry no custom CSS");
             let r = scan(&p);
             assert!(
                 r.blocked.is_empty() && !r.warnings.iter().any(|w| w.code == "contrast"),
@@ -1619,6 +1628,26 @@ mod tests {
         )
         .is_err());
         assert!(parse(r#"{ "format": 2, "name": "X", "css": "a{}", "style": { "texture": "grid", "shadow": "hard" } }"#).is_ok());
+        assert!(parse(r#"{ "format": 2, "name": "X", "css": "a{}", "style": { "texture": "paper", "ink": "sketch" } }"#).is_ok());
+        assert!(parse(
+            r#"{ "format": 2, "name": "X", "css": "a{}", "style": { "ink": "crayon" } }"#
+        )
+        .is_err());
+    }
+
+    // The theme preview (src/lib/theme-pack.js) resolves packs in the browser
+    // from this file; it has to stay equal to the bases used here.
+    #[test]
+    fn frontend_base_palettes_match() {
+        let bases: serde_json::Value =
+            serde_json::from_str(include_str!("../../../src/lib/theme-bases.json")).unwrap();
+        for mode in ["dark", "light"] {
+            assert_eq!(
+                bases[mode],
+                serde_json::to_value(base_for(mode)).unwrap(),
+                "src/lib/theme-bases.json `{mode}` is out of date"
+            );
+        }
     }
 
     #[test]

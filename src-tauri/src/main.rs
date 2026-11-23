@@ -2,5 +2,6 @@
 
 fn main() {
     rustic_agent::tools::pdf_worker::run_worker_if_requested();
+    rustic_agent::tools::pdf_edit::run_worker_if_requested();
     rustic_lib::run();
 }

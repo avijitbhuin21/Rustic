@@ -834,18 +834,22 @@ pub async fn set_device_name(host: &HostRef, lan: &LanState, name: &str) -> Resu
     Ok(())
 }
 
-/// The code this machine shows while pairing with `device_id`.
+/// The code this machine shows while pairing with `device_id`. Mints the
+/// token the pairing request will carry, since the code depends on it.
 pub fn pair_code(lan: &LanState, device_id: &str) -> Result<String, String> {
-    let inner = lan.lock();
-    let me = inner
+    let mut inner = lan.lock();
+    let my_fp = inner
         .identity
         .as_ref()
+        .map(|me| me.fingerprint.clone())
         .ok_or("Turn on local-network sync first")?;
-    if let Some(d) = inner.candidate(device_id) {
-        return Ok(super::pairing_code(&me.fingerprint, &d.fingerprint));
-    }
-    drop(inner);
-    Err("That device is not on the network right now".into())
+    let Some(d) = inner.candidate(device_id) else {
+        return Err("That device is not on the network right now".into());
+    };
+    let token = super::random_token()?;
+    let code = super::pairing_code(&my_fp, &d.fingerprint, &token);
+    inner.pair_tokens.insert(device_id.to_string(), token);
+    Ok(code)
 }
 
 /// The code shown while (re-)pairing a device we already know (paired peers
@@ -858,7 +862,10 @@ pub fn pair_code_for(host: &HostRef, lan: &LanState, device_id: &str) -> Result<
             .clone()
             .ok_or("Turn on local-network sync first")?;
         let peer = paired(host, device_id).map_err(|_| e)?;
-        Ok(super::pairing_code(&me.fingerprint, &peer.fingerprint))
+        let token = super::random_token()?;
+        let code = super::pairing_code(&me.fingerprint, &peer.fingerprint, &token);
+        lan.lock().pair_tokens.insert(device_id.to_string(), token);
+        Ok(code)
     })
 }
 
@@ -987,7 +994,12 @@ pub async fn pair(host: &HostRef, lan: &LanState, device_id: &str) -> Result<Str
         }
     }
     tracing::info!(device = %target.device_id, addr = %target.addr, "peer: sending pairing request");
-    let token_in = super::random_token()?;
+    // The token behind the code already on screen, if one was shown.
+    let minted = lan.lock().pair_tokens.remove(device_id);
+    let token_in = match minted {
+        Some(t) => t,
+        None => super::random_token()?,
+    };
     let cancel = begin_outgoing(lan, device_id);
     let send = client
         .post(format!("{}/lan/pair", super::base_url(&target.addr)))
@@ -1054,9 +1066,14 @@ pub async fn pair(host: &HostRef, lan: &LanState, device_id: &str) -> Result<Str
         .and_then(|v| v.as_str())
         .ok_or("pairing response carried no token")?;
     let dir = host.data_dir()?;
+    // What we shared with this device id carries over only when the machine
+    // that answered is provably the one we paired with before: same pinned
+    // certificate, over a connection that pins it. A URL address is not
+    // pinned, so there the new pairing starts with nothing shared.
     let existing = super::load_peers(&dir)
         .into_iter()
-        .find(|p| p.device_id == target.device_id);
+        .find(|p| p.device_id == target.device_id)
+        .filter(|p| !super::is_url_addr(&target.addr) && p.fingerprint == target.fingerprint);
     let nickname = existing.as_ref().and_then(|p| p.nickname.clone());
     let meta_view = existing.as_ref().is_some_and(|p| p.meta_view);
     let share = existing.map(|p| p.share).unwrap_or_default();

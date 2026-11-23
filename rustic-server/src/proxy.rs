@@ -242,6 +242,7 @@ async fn http_proxy(port: u16, target: &str, req: Request<Body>, rewrite: bool) 
 
     let mut headers = req.headers().clone();
     strip_hop_by_hop(&mut headers);
+    strip_session_cookie(&mut headers);
     if let Ok(h) = HeaderValue::from_str(&format!("localhost:{port}")) {
         headers.insert(header::HOST, h);
     }
@@ -271,6 +272,7 @@ async fn http_proxy(port: u16, target: &str, req: Request<Body>, rewrite: bool) 
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_headers = upstream.headers().clone();
     strip_hop_by_hop(&mut resp_headers);
+    confine_set_cookies(&mut resp_headers, rewrite.then_some(port));
     if rewrite {
         rewrite_location(&mut resp_headers, port);
     }
@@ -396,5 +398,162 @@ fn rewrite_location(headers: &mut HeaderMap, port: u16) {
 
     if let Some(v) = new.and_then(|s| HeaderValue::from_str(&s).ok()) {
         headers.insert(header::LOCATION, v);
+    }
+}
+
+/// Name of a `name=value` cookie pair.
+fn cookie_name(pair: &str) -> &str {
+    pair.split('=').next().unwrap_or("").trim()
+}
+
+/// Drop the IDE's session cookie from a request before it reaches the dev
+/// server, which has no business seeing a token that unlocks the whole IDE.
+fn strip_session_cookie(headers: &mut HeaderMap) {
+    let kept: Vec<String> = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty() && cookie_name(pair) != crate::app::SESSION_COOKIE)
+        .map(str::to_string)
+        .collect();
+    headers.remove(header::COOKIE);
+    if kept.is_empty() {
+        return;
+    }
+    if let Ok(v) = HeaderValue::from_str(&kept.join("; ")) {
+        headers.insert(header::COOKIE, v);
+    }
+}
+
+/// Keep the dev server's cookies from reaching the IDE: its `Set-Cookie` may
+/// not name the session cookie or widen itself with `Domain`, and in path
+/// mode (`port` given) its path is moved under `/proxy/<port>`.
+fn confine_set_cookies(headers: &mut HeaderMap, port: Option<u16>) {
+    let originals: Vec<String> = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect();
+    headers.remove(header::SET_COOKIE);
+    for original in originals {
+        let mut parts = original.split(';').map(str::trim);
+        let Some(pair) = parts.next().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        if cookie_name(pair) == crate::app::SESSION_COOKIE {
+            continue;
+        }
+        let mut out = vec![pair.to_string()];
+        let mut has_path = false;
+        for attr in parts.filter(|a| !a.is_empty()) {
+            let lower = attr.to_ascii_lowercase();
+            if lower.starts_with("domain=") {
+                continue;
+            }
+            match (port, lower.strip_prefix("path=")) {
+                (Some(port), Some(_)) => {
+                    let path = &attr["path=".len()..];
+                    let path = if path.starts_with('/') { path } else { "/" };
+                    out.push(format!("Path=/proxy/{port}{path}"));
+                    has_path = true;
+                }
+                _ => out.push(attr.to_string()),
+            }
+        }
+        if let (Some(port), false) = (port, has_path) {
+            out.push(format!("Path=/proxy/{port}/"));
+        }
+        if let Ok(v) = HeaderValue::from_str(&out.join("; ")) {
+            headers.append(header::SET_COOKIE, v);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{confine_set_cookies, strip_session_cookie};
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    fn set_cookies(input: &[&'static str], port: Option<u16>) -> Vec<String> {
+        let mut headers = HeaderMap::new();
+        for c in input {
+            headers.append(header::SET_COOKIE, HeaderValue::from_static(c));
+        }
+        confine_set_cookies(&mut headers, port);
+        headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn session_cookie_is_not_forwarded() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("theme=dark; rustic_session=secret; sid=1"),
+        );
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("rustic_session=again"),
+        );
+        strip_session_cookie(&mut headers);
+        assert_eq!(headers.get(header::COOKIE).unwrap(), "theme=dark; sid=1");
+
+        let mut only = HeaderMap::new();
+        only.insert(
+            header::COOKIE,
+            HeaderValue::from_static("rustic_session=secret"),
+        );
+        strip_session_cookie(&mut only);
+        assert!(only.get(header::COOKIE).is_none());
+
+        // A cookie that merely shares the prefix is the app's own.
+        let mut other = HeaderMap::new();
+        other.insert(
+            header::COOKIE,
+            HeaderValue::from_static("rustic_session_x=1"),
+        );
+        strip_session_cookie(&mut other);
+        assert_eq!(other.get(header::COOKIE).unwrap(), "rustic_session_x=1");
+    }
+
+    #[test]
+    fn upstream_cookies_are_confined_in_path_mode() {
+        assert_eq!(
+            set_cookies(
+                &[
+                    "sid=1; Path=/; HttpOnly",
+                    "a=b",
+                    "c=d; path=/app; Domain=example.com; Secure",
+                    "rustic_session=evil; Path=/",
+                    "e=f; Path=relative",
+                ],
+                Some(3000),
+            ),
+            vec![
+                "sid=1; Path=/proxy/3000/; HttpOnly",
+                "a=b; Path=/proxy/3000/",
+                "c=d; Path=/proxy/3000/app; Secure",
+                "e=f; Path=/proxy/3000/",
+            ]
+        );
+    }
+
+    #[test]
+    fn subdomain_mode_keeps_paths_but_not_domain_or_the_session_name() {
+        assert_eq!(
+            set_cookies(
+                &[
+                    "sid=1; Path=/; Domain=.preview.example.com",
+                    "rustic_session=evil"
+                ],
+                None,
+            ),
+            vec!["sid=1; Path=/"]
+        );
     }
 }

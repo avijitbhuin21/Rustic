@@ -306,134 +306,15 @@ async fn run_web_fetch_one(params: Value, context: &ToolContext) -> Result<ToolO
         });
     }
 
-    // Upgrade http→https and reject IP-literal private hosts; DNS rebinding is
-    // caught later by resolve_and_check after each redirect hop.
-    let url = match normalize_url(&url_str) {
-        Ok(u) => u,
+    let final_resp = match send_checked(&url_str, FETCH_TIMEOUT_SECS).await {
+        Ok(resp) => resp,
         Err(msg) => {
             return Ok(ToolOutput {
-                content: format!("web_fetch rejected URL: {}", msg),
+                content: format!("web_fetch {}", msg),
                 is_error: true,
                 attachments: Vec::new(),
             });
         }
-    };
-
-    // Manual redirect loop: each Location target is SSRF-checked before following,
-    // preventing DNS-rebinding where the resolver returns a different IP per hop.
-    let mut current_url = url.clone();
-    let mut hops: usize = 0;
-    let final_resp = loop {
-        if hops >= 10 {
-            return Ok(ToolOutput {
-                content: format!("web_fetch refused: too many redirects from {}", url_str),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-
-        let pinned_ip = match resolve_and_check(&current_url).await {
-            Ok(ip) => ip,
-            Err(msg) => {
-                return Ok(ToolOutput {
-                    content: format!("web_fetch rejected URL {}: {}", current_url, msg),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        };
-
-        let host_for_pin = match host_of(&current_url) {
-            Some(h) => h,
-            None => {
-                return Ok(ToolOutput {
-                    content: format!("web_fetch could not parse host from {}", current_url),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        };
-
-        let port = if current_url.starts_with("https://") {
-            443
-        } else {
-            80
-        };
-        let pinned = SocketAddr::new(pinned_ip, port);
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve(&host_for_pin, pinned)
-            .user_agent("Rustic/0.1 (+https://github.com/avijitbhuin21/Rustic)")
-            .build()?;
-
-        let resp = match client.get(&current_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(ToolOutput {
-                    content: format!("web_fetch request failed: {}", e),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        };
-
-        let status = resp.status();
-        if status.is_redirection() {
-            let location = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            let next = match location {
-                Some(loc) => match resolve_redirect(&current_url, &loc) {
-                    Some(u) => u,
-                    None => {
-                        return Ok(ToolOutput {
-                            content: format!(
-                                "web_fetch got redirect with un-resolvable Location {} from {}",
-                                loc, current_url
-                            ),
-                            is_error: true,
-                            attachments: Vec::new(),
-                        });
-                    }
-                },
-                None => {
-                    return Ok(ToolOutput {
-                        content: format!(
-                            "web_fetch got redirect status {} with no Location header from {}",
-                            status, current_url
-                        ),
-                        is_error: true,
-                        attachments: Vec::new(),
-                    });
-                }
-            };
-            current_url = match normalize_url(&next) {
-                Ok(u) => u,
-                Err(msg) => {
-                    return Ok(ToolOutput {
-                        content: format!("web_fetch refused redirect to {}: {}", next, msg),
-                        is_error: true,
-                        attachments: Vec::new(),
-                    });
-                }
-            };
-            hops += 1;
-            continue;
-        }
-
-        if !status.is_success() {
-            return Ok(ToolOutput {
-                content: format!("web_fetch got HTTP {} from {}", status, current_url),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-
-        break resp;
     };
 
     let final_url = final_resp.url().to_string();
@@ -631,6 +512,97 @@ fn small_model_for(model: &str) -> String {
     model.to_string()
 }
 
+/// GET `raw_url` over https with every hop vetted against private and reserved
+/// addresses and pinned to the address that was vetted (so DNS cannot answer
+/// differently between the check and the connect). Returns the first
+/// successful response, or the reason the request was refused or failed.
+pub(crate) async fn send_checked(
+    raw_url: &str,
+    timeout_secs: u64,
+) -> std::result::Result<reqwest::Response, String> {
+    let mut current_url = normalize_url(raw_url).map_err(|msg| format!("rejected URL: {}", msg))?;
+    for _hop in 0..10 {
+        let pinned_ip = resolve_and_check(&current_url)
+            .await
+            .map_err(|msg| format!("rejected URL {}: {}", current_url, msg))?;
+        let host_for_pin = host_of(&current_url)
+            .ok_or_else(|| format!("could not parse host from {}", current_url))?;
+        let port = if current_url.starts_with("https://") {
+            443
+        } else {
+            80
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&host_for_pin, SocketAddr::new(pinned_ip, port))
+            .user_agent("Rustic/0.1 (+https://github.com/avijitbhuin21/Rustic)")
+            .build()
+            .map_err(|e| format!("request failed: {}", e))?;
+        let resp = client
+            .get(&current_url)
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {}", e))?;
+
+        let status = resp.status();
+        if status.is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    format!(
+                        "got redirect status {} with no Location header from {}",
+                        status, current_url
+                    )
+                })?;
+            let next = resolve_redirect(&current_url, location).ok_or_else(|| {
+                format!(
+                    "got redirect with un-resolvable Location {} from {}",
+                    location, current_url
+                )
+            })?;
+            current_url = normalize_url(&next)
+                .map_err(|msg| format!("refused redirect to {}: {}", next, msg))?;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(format!("got HTTP {} from {}", status, current_url));
+        }
+        return Ok(resp);
+    }
+    Err(format!("refused: too many redirects from {}", raw_url))
+}
+
+/// Fetch UTF-8 text from a public URL through [`send_checked`], reading at most `max_bytes`.
+pub(crate) async fn fetch_public_text(
+    url: &str,
+    max_bytes: usize,
+    timeout_secs: u64,
+) -> std::result::Result<String, String> {
+    let mut resp = send_checked(url, timeout_secs).await?;
+    let too_large = || format!("content too large (cap {} bytes)", max_bytes);
+    if resp
+        .content_length()
+        .is_some_and(|len| len as usize > max_bytes)
+    {
+        return Err(too_large());
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("could not read body: {}", e))?
+    {
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| "content is not valid UTF-8 text".to_string())
+}
+
 /// Require https scheme, reject localhost and private-range IP literals (SSRF hardening).
 fn normalize_url(raw: &str) -> std::result::Result<String, String> {
     if raw.len() > 2000 {
@@ -745,27 +717,23 @@ fn ip_addr_is_private(addr: &IpAddr) -> Option<&'static str> {
     }
 }
 
+/// Host of `url` exactly as the HTTP client will see it. Parsed with the URL
+/// parser reqwest itself uses, so a URL cannot name one host to the SSRF
+/// checks and another on the wire (backslashes in the authority, userinfo
+/// tricks, hex or decimal IPv4 forms). IPv6 brackets are stripped.
 fn host_of(url: &str) -> Option<String> {
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let host_end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let host = &after_scheme[..host_end];
-    let bare = host.rsplit('@').next().unwrap_or(host);
-    let host_no_port = if bare.starts_with('[') {
-        match bare.find(']') {
-            Some(end) => &bare[1..end],
-            None => bare,
-        }
-    } else {
-        bare.split(':').next().unwrap_or(bare)
-    };
-    if host_no_port.is_empty() {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if host.is_empty() {
         None
     } else {
-        Some(host_no_port.to_string())
+        Some(host.to_string())
     }
 }
 
@@ -919,4 +887,54 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
     format!("{}…", &s[..end])
+}
+
+#[cfg(test)]
+mod url_guard_tests {
+    use super::{host_of, normalize_url};
+
+    #[test]
+    fn host_is_the_one_the_http_client_connects_to() {
+        for (url, host) in [
+            ("https://example.com/a?b#c", "example.com"),
+            ("https://user:pw@example.com:8443/", "example.com"),
+            ("https://[2001:db8::1]:443/", "2001:db8::1"),
+            // A backslash ends the authority, so the host is the part before it.
+            ("https://127.0.0.1\\@example.com/", "127.0.0.1"),
+            ("https://127.0.0.1\\.example.com/", "127.0.0.1"),
+            // Numeric IPv4 spellings are the address they denote.
+            ("https://2130706433/", "127.0.0.1"),
+            ("https://0x7f.1/", "127.0.0.1"),
+            ("https://EXAMPLE.com/", "example.com"),
+        ] {
+            assert_eq!(host_of(url).as_deref(), Some(host), "{url}");
+        }
+        assert_eq!(host_of("ftp://example.com/"), None);
+        assert_eq!(host_of("not a url"), None);
+    }
+
+    #[test]
+    fn private_targets_are_refused_however_they_are_written() {
+        for url in [
+            "https://localhost/",
+            "http://127.0.0.1/",
+            "https://127.0.0.1\\@example.com/",
+            "https://example.com\\@127.0.0.1/..\\..@10.0.0.1/",
+            "https://2130706433/",
+            "https://0x7f.0.0.1/",
+            "https://[::1]/",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://192.168.1.1/",
+            "file:///etc/passwd",
+        ] {
+            let checked = normalize_url(url);
+            // The second form's host really is example.com; everything else must be refused.
+            if url.starts_with("https://example.com\\") {
+                assert!(checked.is_ok(), "{url}: {checked:?}");
+            } else {
+                assert!(checked.is_err(), "{url} must be refused, got {checked:?}");
+            }
+        }
+        assert!(normalize_url("https://example.com/path").is_ok());
+    }
 }

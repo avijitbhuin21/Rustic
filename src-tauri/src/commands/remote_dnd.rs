@@ -1,8 +1,11 @@
 //! Drag & drop between remote-backend windows.
 //!
-//! Remote windows load an external rustic-server origin, so they get no Tauri
-//! IPC (exposing it to a remote page would hand that page every desktop
-//! command). Instead an injected init script talks to the desktop by starting
+//! Remote windows load an external rustic-server origin and must not reach the
+//! desktop commands. Tauri still injects its IPC bridge into them; what keeps
+//! them out is the ACL: `build.rs` generates the `app-commands` permission and
+//! `capabilities/default.json` grants it to the local `main` window only, so
+//! an invoke from a remote origin is rejected. Do not add a capability with
+//! `remote.urls`. Instead an injected init script talks to the desktop by starting
 //! a navigation to a sentinel host, which `handle_navigation` intercepts and
 //! cancels. The only things a page can ask for:
 //!

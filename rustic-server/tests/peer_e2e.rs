@@ -918,3 +918,147 @@ async fn reconnect_after_restart_and_one_sided_forget() {
         .clone();
     assert_eq!(d["needs_repair"], json!(false), "{d}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_push_prompts_on_the_server_and_can_be_declined() {
+    let a = Arc::new(Node::start().await);
+    let b = Arc::new(Node::start().await);
+    let (b_id, _a_id) = pair(&a, &b).await;
+    let mut b_events = b.shared.ctx.hub.subscribe();
+
+    let peer = rustic_app::peer::load_peers(&a.shared.config.data_dir)
+        .into_iter()
+        .find(|p| p.device_id == b_id)
+        .unwrap();
+    let request = {
+        let url = format!("{}/lan/request", b.base);
+        let token = peer.token_out.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .bearer_auth(token)
+                .header("x-rustic-version", rustic_app::peer::app_version())
+                .json(&json!({
+                    "kind": "push",
+                    "meta": [{ "key": "mcp_server/evil", "category": "mcp_server", "name": "evil" }],
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        })
+    };
+
+    // A paired device's token is not enough: the server's user is asked.
+    let prompt = next_event(&mut b_events, "lan-transfer-request").await;
+    assert_eq!(prompt["kind"], json!("push"), "{prompt}");
+    assert_eq!(
+        prompt["meta"][0]["key"],
+        json!("mcp_server/evil"),
+        "{prompt}"
+    );
+    b.call(
+        "lan_respond_transfer",
+        json!({ "requestId": prompt["request_id"], "accept": false }),
+    )
+    .await;
+
+    let answer = tokio::time::timeout(Duration::from_secs(15), request)
+        .await
+        .expect("request returns once answered")
+        .unwrap();
+    assert_eq!(answer["approved"], json!(false), "{answer}");
+    assert!(
+        answer["ticket"].is_null(),
+        "a declined push gets no ticket: {answer}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_reusing_a_paired_device_id_inherits_nothing() {
+    let a = Arc::new(Node::start().await);
+    let b = Arc::new(Node::start().await);
+    let (_b_id, a_id) = pair(&a, &b).await;
+    let proj_dir = b.shared.config.data_dir.join("granted-proj");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    let project = b
+        .call("add_project", json!({ "path": proj_dir.to_string_lossy() }))
+        .await;
+    let pid = project["id"].as_str().unwrap().to_string();
+    b.call(
+        "lan_set_share",
+        json!({ "deviceId": a_id, "share": { "projects": [pid], "meta": ["provider/x"] } }),
+    )
+    .await;
+    let dir = &b.shared.config.data_dir;
+    let before = rustic_app::peer::load_peers(dir)
+        .into_iter()
+        .find(|p| p.device_id == a_id)
+        .unwrap();
+    assert_eq!(before.share.projects, vec![pid.clone()]);
+
+    // Someone else on the network asks to pair, claiming A's id and fingerprint.
+    let send = |token: &'static str| {
+        let url = format!("{}/lan/pair", b.base);
+        let body = json!({
+            "device_id": a_id,
+            "name": "A (really someone else)",
+            "fingerprint": before.fingerprint,
+            "token": token,
+        });
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("x-rustic-version", rustic_app::peer::app_version())
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        })
+    };
+    let mut b_events = b.shared.ctx.hub.subscribe();
+    let first = send("1111111111111111111111111111111111111111");
+    let prompt = next_event(&mut b_events, "lan-pair-request").await;
+    assert!(
+        prompt["replaces"].is_string(),
+        "the prompt says an existing pairing is replaced: {prompt}"
+    );
+    b.call(
+        "lan_respond_pair",
+        json!({ "requestId": prompt["request_id"], "accept": false }),
+    )
+    .await;
+    assert_eq!(first.await.unwrap()["accepted"], json!(false));
+
+    // A second request with another token shows a different code for the same fingerprints.
+    let second = send("2222222222222222222222222222222222222222");
+    let prompt2 = next_event(&mut b_events, "lan-pair-request").await;
+    assert_ne!(
+        prompt["code"], prompt2["code"],
+        "code is bound to the request token"
+    );
+    b.call(
+        "lan_respond_pair",
+        json!({ "requestId": prompt2["request_id"], "accept": true }),
+    )
+    .await;
+    assert_eq!(second.await.unwrap()["accepted"], json!(true));
+
+    let after = rustic_app::peer::load_peers(dir)
+        .into_iter()
+        .find(|p| p.device_id == a_id)
+        .unwrap();
+    assert!(
+        after.share.projects.is_empty(),
+        "shares are not inherited: {:?}",
+        after.share
+    );
+    assert!(after.share.meta.is_empty());
+    assert!(!after.meta_view);
+    assert!(after.nickname.is_none());
+}

@@ -1,6 +1,7 @@
 mod app_icon;
 mod app_paths;
 mod commands;
+mod film_protocol;
 mod lan;
 mod logging;
 #[cfg(target_os = "macos")]
@@ -8,6 +9,7 @@ mod macos_env;
 #[cfg(target_os = "macos")]
 mod macos_window;
 mod media_protocol;
+mod navigation_guard;
 mod path_scope;
 mod screen_lock;
 mod secrets;
@@ -24,6 +26,8 @@ use state::AppState;
 
 #[allow(clippy::expect_used)] // a failed Tauri run is fatal by design
 pub fn run() {
+    // Before anything opens files: macOS starts GUI apps with 256 descriptors.
+    let fd_limit = rustic_terminal::raise_fd_limit();
     #[cfg(target_os = "macos")]
     macos_env::import_login_shell_path();
     #[cfg(target_os = "macos")]
@@ -37,14 +41,23 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(navigation_guard::init())
         // Streams large audio previews from disk with Range support.
         .register_asynchronous_uri_scheme_protocol(
             media_protocol::SCHEME,
             |ctx, request, responder| {
                 let app = ctx.app_handle().clone();
+                let webview = ctx.webview_label().to_string();
                 std::thread::spawn(move || {
-                    responder.respond(media_protocol::handle(&app, &request))
+                    responder.respond(media_protocol::handle(&app, &webview, &request))
                 });
+            },
+        )
+        // Film view: the one preview that runs a project page's own script, in a sandboxed frame.
+        .register_asynchronous_uri_scheme_protocol(
+            rustic_app::film_preview::SCHEME,
+            |_ctx, request, responder| {
+                std::thread::spawn(move || responder.respond(film_protocol::handle(&request)));
             },
         );
 
@@ -81,7 +94,7 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 // Only the main window defers to the frontend (it may prompt
                 // about dirty buffers). Auxiliary windows — e.g. the
-                // remote-backend thin client, which has no Tauri IPC — must
+                // remote-backend thin client, which the ACL denies every app command — must
                 // close natively, otherwise they can never be dismissed.
                 if window.label() != "main" {
                     return;
@@ -92,7 +105,7 @@ pub fn run() {
                 let _ = window.emit("rustic:close-requested", ());
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             let t_setup = std::time::Instant::now();
             // Use Box<dyn Error> → Tauri shows a native error dialog (not panic).
             let app_data_dir = crate::app_paths::app_data_dir(app.handle())
@@ -102,6 +115,10 @@ pub fn run() {
             // the only readable location for a startup failure.
             if let Err(e) = logging::init(&app_data_dir) {
                 eprintln!("[startup] failed to initialise logging: {}", e);
+            }
+            match fd_limit {
+                Some((before, after)) => tracing::info!(before, after, "open-file limit"),
+                None => tracing::info!("open-file limit not adjustable on this platform"),
             }
 
             // Load the persisted FreeBuff token pool so multi-account failover
@@ -449,6 +466,8 @@ pub fn run() {
             commands::agent::set_source_control_config,
             commands::agent::clear_source_control_config,
             commands::agent::generate_commit_message,
+            commands::agent::inline_edit,
+            commands::agent::cancel_inline_edit,
             commands::agent::set_model_capabilities,
             commands::agent::get_model_capabilities,
             commands::agent::set_openrouter_provider_allowlist,
@@ -617,8 +636,13 @@ pub fn run() {
             commands::preview::sqlite_schema,
             commands::preview::sqlite_rows,
             commands::preview::write_file_base64,
+            commands::preview::pdf_edit,
+            commands::preview::pdf_edit_save,
             commands::preview::read_hex_chunk,
             commands::preview::get_file_size,
+            commands::preview::film_open,
+            commands::preview::film_close,
+            commands::preview::page_preview_open,
             commands::file_history::fh_list_files,
             commands::file_history::fh_file_diff,
             commands::file_history::fh_revert,

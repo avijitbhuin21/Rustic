@@ -463,8 +463,9 @@ export function FileNode({ node, style, dragHandle, tree }) {
           data-explorer-path={node.data.path}
           data-explorer-dir={isFolder ? node.data.path : parentDir}
           className={cn(
-            'explorer-node-enter group/node flex h-6 cursor-pointer items-center gap-1 px-1 text-xs hover:bg-muted/50',
-            coarse && 'touch-longpress h-8',
+            // h-full: the tree owns the row height (see file-tree.jsx).
+            'explorer-node-enter group/node flex h-full cursor-pointer items-center gap-1 px-1 text-xs hover:bg-muted/50',
+            coarse && 'touch-longpress',
             node.isSelected && 'bg-muted text-foreground',
             !node.isSelected && 'text-foreground/80',
             isCutItem && 'opacity-40',

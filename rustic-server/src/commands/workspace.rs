@@ -202,6 +202,9 @@ fn prune_missing_projects(
             watcher.unwatch_project(&p.root_path.to_string_lossy());
         }
     }
+    for p in &missing {
+        ctx.state().workspace_services.drop_project(&p.root_path);
+    }
     Ok(missing)
 }
 
@@ -225,6 +228,12 @@ fn remove_project(ctx: &ServerContext, project_id: &str) -> Result<(), ApiError>
     if let Some(path) = project_path {
         let mut watcher = ctx.state().file_watcher.lock_safe();
         watcher.unwatch_project(&path);
+        drop(watcher);
+        // Free its parse trees and symbol index. A task still running there
+        // holds its own handle, and a later task rebuilds the index.
+        ctx.state()
+            .workspace_services
+            .drop_project(std::path::Path::new(&path));
     }
     Ok(())
 }

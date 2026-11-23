@@ -36,44 +36,92 @@ function layoutFrames(frames) {
 
 /**
  * Owns the pan/zoom viewport state for a Figma-style preview canvas.
+ * `wheel: 'scroll'` makes the wheel scroll (Cmd/Ctrl+wheel or pinch zooms) and keeps the
+ * artboards in view, like the PDF viewer; `fit: 'width'` fits to width, top-aligned.
  */
-export function useCanvasView(frames) {
-  const viewportRef = useRef(null);
-  const [view, setView] = useState({ scale: 1, tx: 0, ty: 0 });
+export function useCanvasView(frames, { wheel = 'zoom', fit = 'contain' } = {}) {
+  // The canvas often mounts after a loading skeleton, so effects follow the element, not mount.
+  const elRef = useRef(null);
+  const [viewportEl, setViewportEl] = useState(null);
+  const viewportRef = useCallback((node) => {
+    elRef.current = node;
+    setViewportEl(node);
+  }, []);
+  const [view, setViewState] = useState({ scale: 1, tx: 0, ty: 0 });
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const [box, setBox] = useState({ w: 0, h: 0 });
   const touchedRef = useRef(false);
+  const scrollMode = wheel === 'scroll';
 
   const layout = useMemo(() => layoutFrames(frames), [frames]);
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
 
-  const fitInto = useCallback((w, h) => {
-    const { width, height } = layoutRef.current;
-    if (!width || !height || w <= 0 || h <= 0) return;
-    const availW = Math.max(1, w - FIT_PADDING * 2);
-    const availH = Math.max(1, h - FIT_PADDING * 2 - LABEL_HEIGHT);
-    const scale = clampScale(Math.min(availW / width, availH / height, 1));
-    setView({
-      scale,
-      tx: (w - width * scale) / 2,
-      ty: Math.max(FIT_PADDING, (h - height * scale) / 2),
-    });
-  }, []);
+  /** In scroll mode, keep the artboards from being scrolled out of the viewport. */
+  const bound = useCallback(
+    (v) => {
+      const el = elRef.current;
+      if (!scrollMode || !el) return v;
+      const span = (t, size, room) => {
+        let lo = room - FIT_PADDING - size;
+        let hi = FIT_PADDING;
+        if (lo > hi) [lo, hi] = [hi, lo];
+        return Math.min(hi, Math.max(lo, t));
+      };
+      const { width, height } = layoutRef.current;
+      return {
+        ...v,
+        tx: span(v.tx, width * v.scale, el.clientWidth),
+        ty: span(v.ty, height * v.scale, el.clientHeight),
+      };
+    },
+    [scrollMode],
+  );
+
+  const setView = useCallback(
+    (update) => {
+      setViewState((prev) => {
+        const next = typeof update === 'function' ? update(prev) : update;
+        return next === prev ? prev : bound(next);
+      });
+    },
+    [bound],
+  );
+
+  const fitInto = useCallback(
+    (w, h) => {
+      const { width, height } = layoutRef.current;
+      if (!width || !height || w <= 0 || h <= 0) return;
+      const availW = Math.max(1, w - FIT_PADDING * 2);
+      if (fit === 'width') {
+        const scale = clampScale(Math.min(availW / width, 1));
+        setViewState({ scale, tx: (w - width * scale) / 2, ty: FIT_PADDING });
+        return;
+      }
+      const availH = Math.max(1, h - FIT_PADDING * 2 - LABEL_HEIGHT);
+      const scale = clampScale(Math.min(availW / width, availH / height, 1));
+      setViewState({
+        scale,
+        tx: (w - width * scale) / 2,
+        ty: Math.max(FIT_PADDING, (h - height * scale) / 2),
+      });
+    },
+    [fit],
+  );
 
   const fitNow = useCallback(() => {
     touchedRef.current = false;
-    const el = viewportRef.current;
+    const el = elRef.current;
     if (el) fitInto(el.clientWidth, el.clientHeight);
   }, [fitInto]);
 
   useLayoutEffect(() => {
-    const el = viewportRef.current;
-    if (!el) return;
+    const el = viewportEl;
+    if (!el) return undefined;
     const measure = () => {
-      const node = viewportRef.current;
-      if (!node) return;
-      const w = node.clientWidth;
-      const h = node.clientHeight;
+      const w = el.clientWidth;
+      const h = el.clientHeight;
       if (w <= 0 || h <= 0) return;
       setBox((prev) => (prev.w === w && prev.h === h ? prev : { w, h }));
       if (!touchedRef.current) fitInto(w, h);
@@ -82,7 +130,7 @@ export function useCanvasView(frames) {
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [fitInto]);
+  }, [viewportEl, fitInto]);
 
   // Re-fit whenever the artboard set changes shape, unless the user has
   // taken manual control of the viewport.
@@ -93,30 +141,33 @@ export function useCanvasView(frames) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signature]);
 
-  const zoomAt = useCallback((nextScale, px, py) => {
-    touchedRef.current = true;
-    setView((prev) => {
-      const scale = clampScale(nextScale);
-      if (scale === prev.scale) return prev;
-      const ratio = scale / prev.scale;
-      return { scale, tx: px - (px - prev.tx) * ratio, ty: py - (py - prev.ty) * ratio };
-    });
-  }, []);
+  const zoomAt = useCallback(
+    (nextScale, px, py) => {
+      touchedRef.current = true;
+      setView((prev) => {
+        const scale = clampScale(nextScale);
+        if (scale === prev.scale) return prev;
+        const ratio = scale / prev.scale;
+        return { scale, tx: px - (px - prev.tx) * ratio, ty: py - (py - prev.ty) * ratio };
+      });
+    },
+    [setView],
+  );
 
   const zoomBy = useCallback(
     (factor) => {
-      const el = viewportRef.current;
+      const el = elRef.current;
       const cx = el ? el.clientWidth / 2 : 0;
       const cy = el ? el.clientHeight / 2 : 0;
+      touchedRef.current = true;
       setView((prev) => {
-        touchedRef.current = true;
         const scale = clampScale(prev.scale * factor);
         if (scale === prev.scale) return prev;
         const ratio = scale / prev.scale;
         return { scale, tx: cx - (cx - prev.tx) * ratio, ty: cy - (cy - prev.ty) * ratio };
       });
     },
-    [],
+    [setView],
   );
 
   const setScale = useCallback(
@@ -126,19 +177,114 @@ export function useCanvasView(frames) {
     [zoomBy, view.scale],
   );
 
-  const panBy = useCallback((dx, dy) => {
-    touchedRef.current = true;
-    setView((prev) => ({ ...prev, tx: prev.tx + dx, ty: prev.ty + dy }));
-  }, []);
+  const panBy = useCallback(
+    (dx, dy) => {
+      touchedRef.current = true;
+      setView((prev) => ({ ...prev, tx: prev.tx + dx, ty: prev.ty + dy }));
+    },
+    [setView],
+  );
 
-  return { viewportRef, view, box, layout, zoomAt, zoomBy, setScale, panBy, fitNow };
+  // Wheel input, batched to one update per frame so a fast trackpad stream doesn't
+  // re-render per event (that read as jitter).
+  const pendingRef = useRef(null);
+  const rafRef = useRef(0);
+  useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
+  const flushWheel = useCallback(() => {
+    rafRef.current = 0;
+    const p = pendingRef.current;
+    pendingRef.current = null;
+    if (!p) return;
+    touchedRef.current = true;
+    setView((prev) => {
+      let v = prev;
+      if (p.zoom !== 1) {
+        const scale = clampScale(prev.scale * p.zoom);
+        const r = scale / prev.scale;
+        v = { scale, tx: p.cx - (p.cx - prev.tx) * r, ty: p.cy - (p.cy - prev.ty) * r };
+      }
+      if (p.dx || p.dy) v = { ...v, tx: v.tx + p.dx, ty: v.ty + p.dy };
+      return v;
+    });
+  }, [setView]);
+
+  /** Apply one wheel event; `cx`/`cy` are viewport coordinates of the pointer. */
+  const wheelInput = useCallback(
+    ({ dx = 0, dy = 0, ctrl = false, meta = false, shift = false, cx = 0, cy = 0 }) => {
+      const p = pendingRef.current || (pendingRef.current = { zoom: 1, dx: 0, dy: 0, cx: 0, cy: 0 });
+      const zoomTo = (k) => {
+        p.zoom *= Math.exp(-dy * k);
+        p.cx = cx;
+        p.cy = cy;
+      };
+      if (scrollMode) {
+        // A trackpad pinch arrives as ctrl+wheel with small deltas; a mouse notch is ~100.
+        if (ctrl || meta) zoomTo(ctrl && Math.abs(dy) < 50 ? 0.012 : 0.0022);
+        else if (shift && !dx) p.dx -= dy;
+        else {
+          p.dx -= dx;
+          p.dy -= dy;
+        }
+      } else if (shift) {
+        p.dy -= dy;
+      } else if (Math.abs(dx) > Math.abs(dy) && !ctrl) {
+        p.dx -= dx;
+      } else {
+        zoomTo(ctrl ? 0.012 : 0.0022);
+      }
+      if (!rafRef.current) rafRef.current = requestAnimationFrame(flushWheel);
+    },
+    [scrollMode, flushWheel],
+  );
+
+  /** Apply a wheel event reported from inside a frame, in that frame's page coordinates. */
+  const wheelFromFrame = useCallback(
+    (frameId, m) => {
+      const frame = layoutRef.current.placed.find((f) => f.id === frameId);
+      if (!frame) return;
+      const v = viewRef.current;
+      wheelInput({
+        ...m,
+        cx: v.tx + (frame.x + (Number(m.x) || 0)) * v.scale,
+        cy: v.ty + (frame.y + (Number(m.y) || 0)) * v.scale,
+      });
+    },
+    [wheelInput],
+  );
+
+  /** Scroll so page offset `y` of a frame sits at the top of the viewport. */
+  const scrollToFrameY = useCallback(
+    (frameId, y) => {
+      const frame = layoutRef.current.placed.find((f) => f.id === frameId);
+      if (!frame) return;
+      touchedRef.current = true;
+      setView((prev) => ({ ...prev, ty: FIT_PADDING - (frame.y + y) * prev.scale }));
+    },
+    [setView],
+  );
+
+  return {
+    viewportRef,
+    viewportEl,
+    view,
+    box,
+    layout,
+    zoomAt,
+    zoomBy,
+    setScale,
+    panBy,
+    fitNow,
+    wheelInput,
+    wheelFromFrame,
+    scrollToFrameY,
+  };
 }
 
 /**
  * Renders artboards on an infinite pannable / zoomable canvas.
  */
 export function PreviewCanvas({ canvas, renderFrame, className, interactive = false }) {
-  const { viewportRef, view, layout, zoomAt, panBy } = canvas;
+  const { viewportRef, viewportEl, view, layout, panBy, wheelInput } = canvas;
   const [spaceHeld, setSpaceHeld] = useState(false);
   const [modHeld, setModHeld] = useState(false);
   const [panning, setPanning] = useState(false);
@@ -174,48 +320,26 @@ export function PreviewCanvas({ canvas, renderFrame, className, interactive = fa
   // Non-passive so preventDefault sticks: WebView2 otherwise treats
   // Ctrl+wheel as a host page-zoom and shrinks the whole IDE.
   useEffect(() => {
-    const el = viewportRef.current;
-    if (!el) return;
-    // Same model as image/PDF/DOCX: wheel zooms around the cursor; Shift+wheel
-    // or a horizontal swipe pans. Batched to one update per frame so a fast
-    // trackpad stream doesn't re-render per event (that read as jitter).
-    let pending = null;
-    let raf = 0;
-    const flush = () => {
-      raf = 0;
-      const p = pending;
-      pending = null;
-      if (!p) return;
-      if (p.zoom !== 1) zoomAt(viewScaleRef.current * p.zoom, p.cx, p.cy);
-      if (p.dx || p.dy) panBy(p.dx, p.dy);
-    };
+    const el = viewportEl;
+    if (!el) return undefined;
     const onWheel = (e) => {
       e.preventDefault();
       e.stopPropagation();
       const rect = el.getBoundingClientRect();
-      const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
-      const dx = e.deltaMode === 1 ? e.deltaX * 16 : e.deltaX;
-      pending = pending || { zoom: 1, dx: 0, dy: 0, cx: 0, cy: 0 };
-      if (e.shiftKey) {
-        pending.dy -= dy;
-      } else if (Math.abs(dx) > Math.abs(dy) && !e.ctrlKey) {
-        pending.dx -= dx;
-      } else {
-        pending.zoom *= Math.exp(-dy * (e.ctrlKey ? 0.012 : 0.0022));
-        pending.cx = e.clientX - rect.left;
-        pending.cy = e.clientY - rect.top;
-      }
-      if (!raf) raf = requestAnimationFrame(flush);
+      const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? el.clientHeight : 1;
+      wheelInput({
+        dx: e.deltaX * k,
+        dy: e.deltaY * k,
+        ctrl: e.ctrlKey,
+        meta: e.metaKey,
+        shift: e.shiftKey,
+        cx: e.clientX - rect.left,
+        cy: e.clientY - rect.top,
+      });
     };
     el.addEventListener('wheel', onWheel, { passive: false });
-    return () => {
-      el.removeEventListener('wheel', onWheel);
-      cancelAnimationFrame(raf);
-    };
-  }, [viewportRef, zoomAt, panBy]);
-
-  const viewScaleRef = useRef(view.scale);
-  viewScaleRef.current = view.scale;
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [viewportEl, wheelInput]);
 
   const onPointerDown = (e) => {
     const onBackground = e.target === e.currentTarget || e.target.dataset?.canvasBackground === 'true';
@@ -295,7 +419,7 @@ export function PreviewCanvas({ canvas, renderFrame, className, interactive = fa
             >
               <span className="font-medium">{frame.label}</span>
               <span className="opacity-60">
-                {Math.round(frame.width)} × {Math.round(frame.height)}
+                {Math.round(frame.width)} × {Math.round(frame.viewportHeight ?? frame.height)}
               </span>
             </div>
             <div className="h-full w-full overflow-hidden rounded-sm border border-border bg-white shadow-lg">

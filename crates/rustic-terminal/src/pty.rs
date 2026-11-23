@@ -72,6 +72,10 @@ pub struct PtySession {
     /// End marker the in-flight sentinel-wrapped command prints when it
     /// returns; lets the monitor detect completion without process polling.
     pub expected_end: Arc<Mutex<Option<String>>>,
+    /// Set once an agent command sent to this shell has been marked finished,
+    /// by the session monitor or by `run_command` itself. Arms the idle
+    /// auto-close: a monitor cannot rely on having watched the command run.
+    pub command_completed: std::sync::atomic::AtomicBool,
 }
 
 impl PtySession {
@@ -198,11 +202,20 @@ impl PtySession {
             reader: Some(reader),
             child: Some(child),
             output_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(16 * 1024))),
-            emulator: Arc::new(Mutex::new(TerminalEmulator::new(cols, rows))),
+            emulator: Arc::new(Mutex::new(TerminalEmulator::with_scrollback(
+                cols,
+                rows,
+                if is_agent {
+                    crate::emulator::AGENT_SCROLLBACK_LINES
+                } else {
+                    crate::emulator::USER_SCROLLBACK_LINES
+                },
+            ))),
             last_command: Arc::new(Mutex::new(None)),
             task_id: Arc::new(Mutex::new(None)),
             command_in_flight: Arc::new(Mutex::new(None)),
             expected_end: Arc::new(Mutex::new(None)),
+            command_completed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -338,6 +351,77 @@ pub fn append_output(buffer: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
             buf.drain(..drop_n);
         }
     }
+}
+
+/// How long [`reap_shell`] waits for a signalled shell to go away.
+const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// End the shell of a session that has been closed and collect its exit
+/// status. Removing a session only closes our side of the pty, which asks an
+/// idle shell to leave (portable-pty sends it an end-of-file) but does not
+/// stop one that is busy or ignores it, and never collects the exit status:
+/// each closed terminal used to leave a zombie, and sometimes a live shell
+/// still holding its descriptors. Call this once, from the thread that owns
+/// the `Child`, when the session is gone. Bounded so a process that cannot be
+/// signalled never parks the caller.
+pub fn reap_shell(child: &mut BoxedChild) {
+    // `try_wait` collects the status of a shell that already exited.
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    // Unix: SIGHUP, a short grace, then SIGKILL. Windows: TerminateProcess.
+    let _ = child.kill();
+    let deadline = Instant::now() + REAP_TIMEOUT;
+    while Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Raise this process's open-file limit towards what a long session needs.
+/// macOS starts GUI apps at 256, and every terminal costs a few descriptors on
+/// top of the watchers, the database and the sockets; at the limit, terminals
+/// stop spawning and file reads fail. Returns `(before, after)`, or `None`
+/// when the limit could not be read. Child processes inherit the new limit.
+#[cfg(unix)]
+// `rlim_t` is u64 on macOS and Linux but not on every Unix.
+#[allow(clippy::unnecessary_cast)]
+pub fn raise_fd_limit() -> Option<(u64, u64)> {
+    // 10240 is macOS's per-process ceiling (OPEN_MAX); the smaller steps are
+    // for systems configured below it.
+    const TARGETS: [libc::rlim_t; 3] = [10_240, 4_096, 1_024];
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable rlimit for the duration of the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    let before = limit.rlim_cur;
+    for target in TARGETS {
+        let want = target.min(limit.rlim_max);
+        if want <= before {
+            break;
+        }
+        let raised = libc::rlimit {
+            rlim_cur: want,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: `raised` is a valid rlimit; the soft limit never exceeds the hard one.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            return Some((before as u64, want as u64));
+        }
+    }
+    Some((before as u64, before as u64))
+}
+
+/// Windows has no per-process descriptor limit of this kind.
+#[cfg(not(unix))]
+pub fn raise_fd_limit() -> Option<(u64, u64)> {
+    None
 }
 
 /// Does the process `pid` currently have any child process? Used by the

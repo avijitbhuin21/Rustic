@@ -11,6 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AgentState;
 
+/// True when a newer run has replaced `token` as the task's active cancellation token, i.e. the caller is a stale run that no longer speaks for the task.
+pub fn run_superseded(agent: &AgentState, task_id: &str, token: &Arc<AtomicBool>) -> bool {
+    agent
+        .cancellation_tokens
+        .get(task_id)
+        .is_some_and(|active| !Arc::ptr_eq(active, token))
+}
+
 /// Under the caller's single agent lock: returns `true` when a newer run has
 /// replaced `token` (the caller must then skip its writes); otherwise syncs
 /// `task.messages` to `msgs` and returns `false`. Doing the token check and the
@@ -18,19 +26,21 @@ use crate::state::AgentState;
 /// snapshotting stale end-of-last-turn history (which made the next run forget
 /// the in-flight turn). Used by both hosts' persist callback and end-of-turn
 /// writeback.
+///
+/// `msgs` is owned so the caller copies the history BEFORE taking the agent
+/// lock: the lock is global, and copying a long history while holding it
+/// stalls every other command. Inside the lock this is a pointer move.
 pub fn sync_history_if_current(
     agent: &mut AgentState,
     task_id: &str,
     token: &Arc<AtomicBool>,
-    msgs: &[Message],
+    msgs: Vec<Message>,
 ) -> bool {
-    if let Some(active) = agent.cancellation_tokens.get(task_id) {
-        if !Arc::ptr_eq(active, token) {
-            return true;
-        }
+    if run_superseded(agent, task_id, token) {
+        return true;
     }
     if let Some(task) = agent.tasks.get_mut(task_id) {
-        task.messages = msgs.to_vec();
+        task.messages = msgs;
     }
     false
 }
@@ -398,13 +408,28 @@ mod tests {
         let current = Arc::new(AtomicBool::new(false));
         let stale = Arc::new(AtomicBool::new(false));
         // No registered token yet: treated as current.
-        assert!(!sync_history_if_current(&mut agent, "t", &current, &[]));
+        assert!(!sync_history_if_current(
+            &mut agent,
+            "t",
+            &current,
+            Vec::new()
+        ));
+        assert!(!run_superseded(&agent, "t", &current));
         agent
             .cancellation_tokens
             .insert("t".into(), Arc::clone(&current));
-        assert!(!sync_history_if_current(&mut agent, "t", &current, &[]));
+        assert!(!sync_history_if_current(
+            &mut agent,
+            "t",
+            &current,
+            Vec::new()
+        ));
+        assert!(!run_superseded(&agent, "t", &current));
         // A newer run swapped the token: the old run is superseded.
-        assert!(sync_history_if_current(&mut agent, "t", &stale, &[]));
+        assert!(sync_history_if_current(&mut agent, "t", &stale, Vec::new()));
+        assert!(run_superseded(&agent, "t", &stale));
+        // Another task's token says nothing about this one.
+        assert!(!run_superseded(&agent, "other", &stale));
     }
 
     #[test]

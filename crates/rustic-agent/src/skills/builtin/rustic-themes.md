@@ -19,8 +19,8 @@ Rustic's look comes from **theme packs**: one JSON file per theme, machine-wide.
 ## Workflow
 
 1. `list_themes` to see what exists and what's active.
-2. Start from something real: `read_theme` the closest built-in (Basalt quiet neutral, Hearth warm, Petal pastel, Midnight deep blue, Onyx high-contrast, Neo Brutal bold, Grove organic, Neon Grid futuristic) or `read_theme("template")`.
-3. Design both **dark** and **light** unless the user wants one mode.
+2. Start from something real: `read_theme` a built-in (Obsidian: dark, quiet neutral; Sketchbook: light, hand-drawn paper) or `read_theme("template")`.
+3. A theme ships `dark`, `light` or both. A theme with one mode is always shown in that mode; with both, the user picks which one shows. Design the mode(s) the user asked for.
 4. `write_theme`. If the result lists BLOCKED items, fix them and write again; mention any warnings to the user.
 5. Tell the user to review and trust it.
 
@@ -78,16 +78,17 @@ Colors are `#rrggbb` / `#rrggbbaa`, `rgb()/hsl()/oklch()`. Any slot you omit is 
 | Key | Values | Effect |
 |---|---|---|
 | `radius` | e.g. `0px`, `0.5rem`, `1rem` | base corner radius |
-| `font_sans` / `font_mono` | CSS font stacks | UI / code fonts (installed or bundled: Inter, Victor Mono) |
+| `font_sans` / `font_mono` | CSS font stacks | UI / code fonts (installed or bundled: Inter, Victor Mono, and the handwritten Kevin Sans as `"Kevin Sans UI"`, sized for Rustic's small interface text) |
 | `motion` | `full`, `reduced` | reduced disables animations |
 | `border_width` | e.g. `1px`, `2px` | outlined controls + popups |
 | `shadow` | `none`, `soft`, `strong`, `glow`, `hard` | popups / dialogs (`hard` = offset, no blur, outlined) |
 | `surface` | `solid`, `glass` | frosted translucent popups and dialogs |
 | `density` | `compact`, `normal`, `comfortable` | scales all spacing |
 | `button` | `solid`, `pill`, `raised`, `brutal`, `glow` | primary / outline / secondary buttons |
-| `texture` | `none`, `grain`, `grid`, `dots`, `scanlines` | faint overlay on the whole app |
+| `texture` | `none`, `grain`, `grid`, `dots`, `scanlines`, `paper` | faint overlay on the whole app |
+| `ink` | `none`, `sketch` | `sketch` draws buttons, fields, popups and panels by hand (pencil outlines, marker fills, highlighter hovers) in the theme's own colors |
 
-Unknown values are rejected with the allowed list. Match recipes to the mood: bold → `radius: 0px`, `border_width: 2px`, `shadow: hard`, `button: brutal`; organic → large radius, `button: pill`, `texture: grain`, `density: comfortable`; futuristic → `surface: glass`, `shadow: glow`, `button: glow`, `texture: grid`.
+Unknown values are rejected with the allowed list. Match recipes to the mood: bold → `radius: 0px`, `border_width: 2px`, `shadow: hard`, `button: brutal`; organic → large radius, `button: pill`, `texture: grain`, `density: comfortable`; futuristic → `surface: glass`, `shadow: glow`, `button: glow`, `texture: grid`; hand-drawn / cozy → `ink: sketch`, `texture: paper`, `density: comfortable`, a handwriting `font_sans` (bundled: `"Kevin Sans UI"`). With `ink: sketch`, leave `button`, `border_width` and `surface` unset: the drawing replaces borders and fills. It reads best on light, warm backgrounds.
 
 ## Custom CSS (`css`)
 

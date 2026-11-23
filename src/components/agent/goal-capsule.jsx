@@ -13,6 +13,7 @@ const STATUS_LABEL = {
   continuing: 'looping',
   evaluating: 'verifying…',
   unmet: 'looping',
+  blocked: 'blocked',
   error: 'stopped',
 };
 
@@ -26,6 +27,7 @@ export function GoalCapsule({ className }) {
 
   const busy = goal.status === 'evaluating';
   const failed = goal.status === 'error';
+  const blocked = goal.status === 'blocked';
   const label = STATUS_LABEL[goal.status] || 'goal active';
 
   return (
@@ -34,9 +36,9 @@ export function GoalCapsule({ className }) {
         <div
           className={cn(
             'flex h-[22px] max-w-[220px] select-none items-center gap-1 rounded-full border px-2 text-[10px]',
-            failed
-              ? 'border-destructive/50 text-destructive'
-              : 'border-border text-muted-foreground',
+            failed && 'border-destructive/50 text-destructive',
+            blocked && 'border-warning/50 text-warning',
+            !failed && !blocked && 'border-border text-muted-foreground',
             className,
           )}
         >
@@ -63,12 +65,14 @@ export function GoalCapsule({ className }) {
         <div className="font-medium">Goal: {goal.condition}</div>
         {goal.reason && (
           <div className="mt-1 text-muted-foreground">
-            {failed ? 'Stopped: ' : 'Last evaluation: '}
+            {failed ? 'Stopped: ' : blocked ? 'Blocked: ' : 'Last evaluation: '}
             {goal.reason}
           </div>
         )}
         <div className="mt-1 italic text-muted-foreground">
-          The agent keeps working until an evaluator model confirms this condition. Click × or type /goal clear to cancel.
+          {blocked
+            ? 'The agent stopped the loop because it cannot finish this on its own. Send /goal again to restart it; any other message clears the goal.'
+            : 'The agent keeps working until an evaluator model confirms this condition. Sending a message, clicking × or typing /goal clear ends it.'}
         </div>
       </TooltipContent>
     </Tooltip>

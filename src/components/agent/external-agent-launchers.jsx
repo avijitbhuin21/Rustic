@@ -4,7 +4,7 @@ import { toast } from 'sonner';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { confirm } from '@/components/confirm-dialog';
 import { useExternalAgents, launchKey } from '@/state/external-agents';
-import { useRelativeTime } from '@/lib/relative-time';
+import { parseTimestamp, useRelativeTime } from '@/lib/relative-time';
 import { AgentLogo } from '@/components/icons/agent-logos';
 import { useCliBusy } from './cli-activity';
 import { cn } from '@/lib/utils';
@@ -146,8 +146,8 @@ export function ExternalAgentButtons({ project, className }) {
 // click. "Stop" keeps the conversation resumable, the bin deletes it everywhere.
 export function CliSessionRow({ row, active }) {
   const timestampMs = React.useMemo(() => {
-    const t = new Date(row.last_active_at ?? row.created_at ?? 0).getTime();
-    return Number.isFinite(t) && t > 0 ? t : null;
+    const t = parseTimestamp(row.last_active_at ?? row.created_at);
+    return t > 0 ? t : null;
   }, [row.last_active_at, row.created_at]);
   const relative = useRelativeTime(timestampMs);
   const ptySessionId = useExternalAgents((s) => s.ptyBySession[row.id]);

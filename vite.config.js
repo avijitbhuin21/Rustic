@@ -76,6 +76,10 @@ export default defineConfig(({ mode }) => {
   // Listing them here means Vite builds the optimized bundle at server
   // start, so the first file-open is a clean cache hit.
   optimizeDeps: {
+    // The PPTX editor locates harfbuzz.wasm and its substitute fonts with
+    // `new URL(..., import.meta.url)`. Pre-bundling moves the code away from
+    // those files, so the shaper gets index.html instead of the binary.
+    exclude: ['@pptx-editor.dev/react', '@pptx-editor.dev/core', '@pptx-editor.dev/i18n', '@docx-editor.dev/fonts'],
     include: [
       '@univerjs/presets',
       '@univerjs/preset-sheets-core',
@@ -109,6 +113,15 @@ export default defineConfig(({ mode }) => {
     // the old ones — dist had grown to 585 MB / 2000+ stale chunks, bloating the
     // Tauri installer. Force a clean output dir on every build.
     emptyOutDir: true,
+    // Second page: the live theme preview, embedded in an iframe by the theme
+    // browser (and built on its own for the website by
+    // scripts/build-theme-preview.mjs).
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, 'src/index.html'),
+        'theme-preview': path.resolve(__dirname, 'src/theme-preview.html'),
+      },
+    },
     // `ignoreDynamicRequires: true` tells @rollup/plugin-commonjs to
     // leave dynamic `require(...)` calls in place rather than rewriting
     // them to its `commonjsRequire` helper. Several UMD bundles in

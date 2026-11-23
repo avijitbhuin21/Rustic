@@ -17,6 +17,7 @@ pub mod cloud_sync;
 pub mod config;
 pub mod context;
 pub mod external_agents;
+pub mod film_preview;
 pub mod github_download;
 pub mod host_ops;
 pub mod meta_sync;

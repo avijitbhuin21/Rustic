@@ -36,7 +36,7 @@ pub struct Shared {
     pub tickets: auth::TicketStore,
 }
 
-const SESSION_COOKIE: &str = "rustic_session";
+pub(crate) const SESSION_COOKIE: &str = "rustic_session";
 
 /// Build the full application router.
 pub fn build_router(shared: Arc<Shared>) -> Router {
@@ -143,9 +143,83 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         // rejected before any handler runs. Requests without an Origin header
         // (same-origin GETs, curl, webhooks) pass through untouched.
         .layer(from_fn(cors_middleware))
+        // Film view files. Outside the password gate and the Origin gate on purpose:
+        // the frame is sandboxed to an opaque origin, so it sends no cookie and its
+        // requests carry `Origin: null`. The unguessable session id (minted by the
+        // authed `film_open` command) is the credential.
+        .route("/film/:id/*path", get(film_handler))
         .layer(from_fn_with_state(shared.clone(), host_proxy_middleware))
+        .layer(from_fn_with_state(shared.clone(), loopback_host_middleware))
         .with_state(shared)
         .merge(peer_routes)
+}
+
+/// `GET /film/:id/*path` — one file of a film-view session (see `rustic_app::film_preview`).
+async fn film_handler(
+    AxumPath((id, path)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    use rustic_app::film_preview::{sessions, FilmResponse, Layout};
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let resp = tokio::task::spawn_blocking(move || {
+        sessions().respond(&id, &path, Layout::Path { host: &host })
+    })
+    .await
+    .unwrap_or_else(|_| FilmResponse::error(500, "Film view failed."));
+    let mut out = Response::builder().status(resp.status);
+    for (name, value) in resp.headers() {
+        out = out.header(name, value);
+    }
+    out.body(Body::from(resp.body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Whether a `Host` header value (`name`, `name:port`, `[v6]:port`) names this machine's loopback.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(name, _port)| name),
+    };
+    let name = name.to_ascii_lowercase();
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// DNS-rebinding guard for local instances with a guessable password (see
+/// [`crate::loopback_hosts_only`]): requests addressed to any other host name
+/// are refused before login or any handler runs.
+async fn loopback_host_middleware(
+    State(shared): State<Arc<Shared>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if !crate::loopback_hosts_only(&shared.config) {
+        return next.run(req).await;
+    }
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().host().map(str::to_string));
+    match host {
+        Some(host) if !is_loopback_host(&host) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "This local Rustic server uses a default password and only answers on localhost. Set a real RUSTIC_AUTH_PASSWORD to reach it by another name."
+            })),
+        )
+            .into_response(),
+        _ => next.run(req).await,
+    }
 }
 
 /// Extra allowed origins from `RUSTIC_ALLOWED_ORIGINS` (comma-separated full

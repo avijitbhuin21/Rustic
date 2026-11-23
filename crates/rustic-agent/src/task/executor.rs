@@ -261,6 +261,74 @@ pub(crate) fn coerce_mcp_arguments(
     arguments
 }
 
+/// Decide whether a call to MCP tool `tool_name` may run. Tools their server
+/// marks read-only always may; the rest are refused in Chat mode, run unasked
+/// in FullAuto, and otherwise wait for the user's approval. Returns the
+/// refusal to hand back to the model, or `None` when the call may proceed.
+pub(crate) async fn gate_mcp_call(
+    context: &ToolContext,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Option<ToolOutput> {
+    use crate::task::permissions::PermissionLevel;
+
+    if context.mcp_read_only_tools.contains_key(tool_name) {
+        return None;
+    }
+    let denied = |why: &str| ToolOutput {
+        content: format!("PERMISSION_DENIED: MCP tool `{tool_name}` {why}"),
+        is_error: true,
+        attachments: Vec::new(),
+    };
+    match context.permissions() {
+        PermissionLevel::FullAuto => return None,
+        PermissionLevel::Chat => {
+            return Some(denied(
+                "is not marked read-only by its server, and this task is in Chat mode, \
+                 which allows read-only tools only. Do not retry; tell the user what you \
+                 wanted to do so they can switch modes.",
+            ))
+        }
+        PermissionLevel::ManualEdit | PermissionLevel::AutoEdit => {}
+    }
+
+    let server = match &context.mcp_manager {
+        Some(mcp) => {
+            let (mcp, root, name) = (
+                Arc::clone(mcp),
+                context.project_root.clone(),
+                tool_name.to_string(),
+            );
+            tokio::task::spawn_blocking(move || {
+                let mgr = mcp.lock().unwrap_or_else(|p| p.into_inner());
+                mgr.server_for_tool(Some(&root), &name)
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        None => None,
+    };
+    let approved = context
+        .permission_broker
+        .request(
+            &context.event_tx,
+            &context.task_id,
+            crate::task::PermissionOp::McpTool {
+                tool: tool_name.to_string(),
+                server,
+                arguments: serde_json::to_string_pretty(tool_input)
+                    .unwrap_or_else(|_| tool_input.to_string()),
+            },
+        )
+        .await;
+    if approved {
+        None
+    } else {
+        Some(denied("was not approved by the user. Do not retry it."))
+    }
+}
+
 /// Dispatch one MCP tool call. Single implementation shared by the parallel
 /// read-only phase and the sequential write phase (6.9 — previously
 /// copy-pasted at both sites).
@@ -3350,14 +3418,19 @@ impl TaskExecutor {
                                 attachments: Vec::new(),
                             })
                     } else if let Some(mcp) = &context.mcp_manager {
-                        call_mcp_tool(
-                            mcp,
-                            tool_name,
-                            tool_input.clone(),
-                            &context.mcp_tool_defs,
-                            &context.project_root,
-                        )
-                        .await
+                        match gate_mcp_call(context, tool_name, tool_input).await {
+                            Some(refusal) => refusal,
+                            None => {
+                                call_mcp_tool(
+                                    mcp,
+                                    tool_name,
+                                    tool_input.clone(),
+                                    &context.mcp_tool_defs,
+                                    &context.project_root,
+                                )
+                                .await
+                            }
+                        }
                     } else {
                         ToolOutput {
                             content: format!("Unknown tool: {}", tool_name),
@@ -3708,14 +3781,25 @@ impl TaskExecutor {
             })
             .unwrap_or_default();
 
-        // No completion claim — re-arm without spending an evaluator call.
-        if !crate::task::goal::claims_completion(&last_text) {
-            let turns = bump_turns();
-            emit("continuing", turns, None);
-            return Some(crate::task::goal::continuation_message(
-                &goal.condition,
-                None,
-            ));
+        match crate::task::goal::turn_end(&last_text) {
+            // The worker cannot go on. Stop without an evaluator call and
+            // leave the goal set, so the capsule keeps showing the reason
+            // until the user sends a message or a new /goal.
+            crate::task::goal::TurnEnd::Blocked(reason) => {
+                tracing::info!(task_id = %task_id, turns = goal.turns, "[goal] loop stopped: worker reported it is blocked");
+                emit("blocked", goal.turns, Some(reason));
+                return None;
+            }
+            // No completion claim — re-arm without spending an evaluator call.
+            crate::task::goal::TurnEnd::Continue => {
+                let turns = bump_turns();
+                emit("continuing", turns, None);
+                return Some(crate::task::goal::continuation_message(
+                    &goal.condition,
+                    None,
+                ));
+            }
+            crate::task::goal::TurnEnd::Claimed => {}
         }
 
         // Completion claimed — audit it with the evaluator before ending the
@@ -4835,6 +4919,295 @@ mod context_opt_tests {
             message_anchor_sig(&mk("full body")),
             message_anchor_sig(&mk("[stub]"))
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_gate_tests {
+    use super::gate_mcp_call;
+    use crate::task::permission_broker::NativePermissionDecision;
+    use crate::task::permissions::PermissionLevel;
+    use crate::task::TaskEvent;
+    use crate::tools::ToolContext;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn ctx(level: PermissionLevel) -> (ToolContext, tokio::sync::mpsc::Receiver<TaskEvent>) {
+        let dir = std::env::temp_dir();
+        let (mut ctx, rx) = ToolContext::new_test(dir);
+        ctx.shared_permissions.set_level(level);
+        ctx.mcp_read_only_tools = Arc::new(
+            [("list_emails".to_string(), "mail".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        (ctx, rx)
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_never_prompt() {
+        for level in [
+            PermissionLevel::Chat,
+            PermissionLevel::ManualEdit,
+            PermissionLevel::AutoEdit,
+            PermissionLevel::FullAuto,
+        ] {
+            let (ctx, mut rx) = ctx(level.clone());
+            assert!(gate_mcp_call(&ctx, "list_emails", &json!({}))
+                .await
+                .is_none());
+            assert!(rx.try_recv().is_err(), "{level:?} must not prompt");
+        }
+    }
+
+    #[tokio::test]
+    async fn writing_tools_are_refused_in_chat_and_free_in_full_auto() {
+        let (chat, mut rx) = ctx(PermissionLevel::Chat);
+        let out = gate_mcp_call(&chat, "send_email", &json!({ "to": "a@b.c" }))
+            .await
+            .expect("refused in Chat");
+        assert!(
+            out.is_error && out.content.starts_with("PERMISSION_DENIED"),
+            "{}",
+            out.content
+        );
+        assert!(rx.try_recv().is_err(), "Chat refuses without asking");
+
+        let (auto, mut rx) = ctx(PermissionLevel::FullAuto);
+        assert!(gate_mcp_call(&auto, "send_email", &json!({}))
+            .await
+            .is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn writing_tools_prompt_per_tool_in_edit_modes() {
+        for level in [PermissionLevel::ManualEdit, PermissionLevel::AutoEdit] {
+            let (ctx, mut rx) = ctx(level);
+            let ctx = Arc::new(ctx);
+            let args = json!({ "to": "a@b.c", "body": "hello" });
+
+            // Denied.
+            let call = {
+                let (ctx, args) = (ctx.clone(), args.clone());
+                tokio::spawn(async move { gate_mcp_call(&ctx, "send_email", &args).await })
+            };
+            let Some(TaskEvent::PermissionRequest {
+                request_id,
+                operation,
+                description,
+                preview,
+                ..
+            }) = rx.recv().await
+            else {
+                panic!("expected a permission request");
+            };
+            assert_eq!(operation, "mcp:send_email");
+            assert_eq!(description, "Call MCP tool send_email");
+            assert!(
+                preview.unwrap().contains("\"body\": \"hello\""),
+                "arguments are shown"
+            );
+            ctx.permission_broker
+                .respond_with_decision(&request_id, NativePermissionDecision::Deny);
+            let out = call.await.unwrap().expect("denied call is refused");
+            assert!(
+                out.content.starts_with("PERMISSION_DENIED"),
+                "{}",
+                out.content
+            );
+
+            // Approved for the session: that tool stops prompting, others still do.
+            let call = {
+                let (ctx, args) = (ctx.clone(), args.clone());
+                tokio::spawn(async move { gate_mcp_call(&ctx, "send_email", &args).await })
+            };
+            let Some(TaskEvent::PermissionRequest { request_id, .. }) = rx.recv().await else {
+                panic!("expected a permission request");
+            };
+            ctx.permission_broker
+                .respond_with_decision(&request_id, NativePermissionDecision::AcceptForSession);
+            assert!(call.await.unwrap().is_none());
+            assert!(gate_mcp_call(&ctx, "send_email", &args).await.is_none());
+            assert!(
+                rx.try_recv().is_err(),
+                "session-approved tool does not prompt again"
+            );
+
+            let other = {
+                let ctx = ctx.clone();
+                tokio::spawn(async move { gate_mcp_call(&ctx, "delete-service", &json!({})).await })
+            };
+            let Some(TaskEvent::PermissionRequest {
+                request_id,
+                operation,
+                ..
+            }) = rx.recv().await
+            else {
+                panic!("a different tool still prompts");
+            };
+            assert_eq!(operation, "mcp:delete-service");
+            ctx.permission_broker
+                .respond_with_decision(&request_id, NativePermissionDecision::Deny);
+            assert!(other.await.unwrap().is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod goal_loop_tests {
+    use super::TaskExecutor;
+    use crate::provider::{
+        AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role,
+        StreamCallback, ToolDef,
+    };
+    use crate::task::goal::{new_goal_slot, GoalState};
+    use crate::task::TaskEvent;
+    use crate::tools::ToolContext;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    /// Provider that counts calls and fails them: the paths under test must
+    /// decide without reaching the evaluator.
+    struct CountingProvider(Arc<AtomicU32>);
+
+    #[async_trait::async_trait]
+    impl AiProvider for CountingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _config: &ProviderConfig,
+            _stream_cb: Option<StreamCallback>,
+        ) -> anyhow::Result<AiResponse> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("the evaluator must not be called")
+        }
+
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        fn available_models(&self) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+    }
+
+    fn text(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn harness(
+        turns: u32,
+    ) -> (
+        TaskExecutor,
+        ToolContext,
+        tokio::sync::mpsc::Receiver<TaskEvent>,
+        Arc<AtomicU32>,
+    ) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let config: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "api_key": "k", "model": "m", "max_tokens": 10, "temperature": 0.7,
+            "base_url": null, "system_prompt": "sys"
+        }))
+        .unwrap();
+        let executor = TaskExecutor::new(Arc::new(CountingProvider(calls.clone())), config);
+        let (mut ctx, rx) = ToolContext::new_test(std::env::temp_dir());
+        let slot = new_goal_slot();
+        *slot.lock().unwrap() = Some(GoalState {
+            condition: "ship the release".to_string(),
+            turns,
+        });
+        ctx.goal_state = Some(slot);
+        (executor, ctx, rx, calls)
+    }
+
+    #[tokio::test]
+    async fn blocked_marker_stops_the_loop_and_keeps_the_goal() {
+        let (executor, ctx, mut rx, calls) = harness(3);
+        // The blocked marker sits next to a completion claim on purpose: the
+        // claim must not send the turn to the evaluator.
+        let messages = vec![
+            text(Role::User, "GOAL MODE"),
+            text(Role::Assistant, "Working on it."),
+            text(Role::User, "[Goal loop — the goal is still active]"),
+            text(
+                Role::Assistant,
+                "Built and tested. <goal_complete>\n<goal_blocked reason=\"needs the signing key\">",
+            ),
+        ];
+
+        let directive = executor.goal_continuation(&ctx, &messages).await;
+        assert!(
+            directive.is_none(),
+            "a blocked turn must not re-arm the loop"
+        );
+
+        let Ok(TaskEvent::GoalUpdate {
+            task_id,
+            status,
+            condition,
+            turns,
+            reason,
+        }) = rx.try_recv()
+        else {
+            panic!("expected a goal update");
+        };
+        assert_eq!(task_id, "test-task");
+        assert_eq!(status, "blocked");
+        assert_eq!(condition, "ship the release");
+        assert_eq!(turns, 3, "a blocked turn is not counted as a forced turn");
+        assert_eq!(reason.as_deref(), Some("needs the signing key"));
+        assert!(rx.try_recv().is_err(), "exactly one event");
+
+        let goal = ctx.goal_state.as_ref().unwrap().lock().unwrap().clone();
+        let goal = goal.expect("the goal stays set after a block");
+        assert_eq!(goal.condition, "ship the release");
+        assert_eq!(goal.turns, 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no evaluator call");
+    }
+
+    #[tokio::test]
+    async fn turn_without_a_marker_re_arms_and_counts_the_turn() {
+        let (executor, ctx, mut rx, calls) = harness(3);
+        let messages = vec![
+            text(Role::User, "GOAL MODE"),
+            text(Role::Assistant, "Half way there."),
+        ];
+
+        let directive = executor
+            .goal_continuation(&ctx, &messages)
+            .await
+            .expect("an unfinished turn re-arms the loop");
+        assert!(directive.contains("ship the release"), "{directive}");
+
+        let Ok(TaskEvent::GoalUpdate { status, turns, .. }) = rx.try_recv() else {
+            panic!("expected a goal update");
+        };
+        assert_eq!((status.as_str(), turns), ("continuing", 4));
+        let goal = ctx.goal_state.as_ref().unwrap().lock().unwrap().clone();
+        assert_eq!(goal.map(|g| g.turns), Some(4));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cleared_goal_ends_the_loop_silently() {
+        let (executor, ctx, mut rx, calls) = harness(3);
+        // What the host does when the user sends a message mid-loop.
+        *ctx.goal_state.as_ref().unwrap().lock().unwrap() = None;
+        let messages = vec![text(Role::Assistant, "Half way there.")];
+
+        assert!(executor.goal_continuation(&ctx, &messages).await.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "no goal event once the goal is gone"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
 

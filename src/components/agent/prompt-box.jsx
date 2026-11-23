@@ -912,11 +912,18 @@ function ProviderGroup({
   );
 }
 
-function ModelPopover({ open, onOpenChange }) {
+// Model picker. By default it drives the chat's model (agent store + the
+// active task). Pass `onSelect` to use it detached: the pick is reported to
+// the caller, `selection` ({ provider, modelId }) is shown as current, and the
+// chat's model, task and thinking rail are left alone.
+export function ModelPopover({ open, onOpenChange, selection, onSelect, side = 'top', align = 'start' }) {
+  const detached = typeof onSelect === 'function';
   const builtinModels = useAgent((s) => s.models);
   const providersConfig = useAgent((s) => s.providersConfig);
-  const selectedModel = useAgent((s) => s.selectedModel);
-  const selectedProvider = useAgent((s) => s.selectedProvider);
+  const agentModel = useAgent((s) => s.selectedModel);
+  const agentProvider = useAgent((s) => s.selectedProvider);
+  const selectedModel = detached ? selection?.modelId ?? null : agentModel;
+  const selectedProvider = detached ? selection?.provider ?? null : agentProvider;
   const activeTaskId = useAgent((s) => s.activeTaskId);
   const setSelectedModel = useAgent((s) => s.setSelectedModel);
   const refreshProvidersConfig = useAgent((s) => s.refreshProvidersConfig);
@@ -1191,6 +1198,11 @@ function ModelPopover({ open, onOpenChange }) {
     if (provider === 'OpenRouter') {
       await autoRegisterOpenRouter(modelId);
     }
+    if (detached) {
+      onSelect(provider, modelId);
+      onOpenChange?.(false);
+      return;
+    }
     setSelectedModel(provider, modelId);
     // Intentionally do NOT close the popover here — the footer hosts the
     // thinking-tier rail, so the user can pick a model and a reasoning level in
@@ -1228,7 +1240,7 @@ function ModelPopover({ open, onOpenChange }) {
               'flex h-7 max-w-[200px] items-center gap-1 px-2 text-xs font-medium transition-colors hover:bg-muted',
               // "the color of the thing": tint the model name by the active
               // reasoning tier. Off stays neutral so an idle pill isn't loud.
-              thinkingTier !== 'off' ? tint.text : 'text-foreground/90 hover:text-foreground',
+              !detached && thinkingTier !== 'off' ? tint.text : 'text-foreground/90 hover:text-foreground',
             )}
           >
             <span className="truncate">
@@ -1238,8 +1250,8 @@ function ModelPopover({ open, onOpenChange }) {
           </button>
         </PopoverTrigger>
         <PopoverContent
-          side="top"
-          align="start"
+          side={side}
+          align={align}
           className="flex max-h-[60vh] w-80 flex-col overflow-hidden p-0"
         >
           <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto p-3">
@@ -1315,7 +1327,9 @@ function ModelPopover({ open, onOpenChange }) {
             </div>
           </div>
           {/* Footer strip — mirrors the edit-model modal's footer. Holds the
-              reasoning-level node rail, pinned below the scrollable model list. */}
+              reasoning-level node rail, pinned below the scrollable model list.
+              Detached pickers have no reasoning setting, so they omit it. */}
+          {!detached && (
           <div className="shrink-0 border-t border-border/60 px-3 py-2.5">
             <div className="mb-2 flex items-center justify-between">
               <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -1335,6 +1349,7 @@ function ModelPopover({ open, onOpenChange }) {
               <ThinkingNodeRail tiers={tiers} value={thinkingTier} onChange={setThinkingTier} />
             )}
           </div>
+          )}
         </PopoverContent>
       </Popover>
 
@@ -1350,6 +1365,11 @@ function ModelPopover({ open, onOpenChange }) {
           const p = pendingRegister;
           setPendingRegister(null);
           if (!p) return;
+          if (detached) {
+            onSelect(p.providerType, p.modelId);
+            onOpenChange?.(false);
+            return;
+          }
           setSelectedModel(p.providerType, p.modelId);
           // Keep the model popover open after registering too (the Register
           // modal closes itself) so the thinking rail stays reachable.
@@ -1559,6 +1579,26 @@ export function PromptBox({
     window.addEventListener('prompt-insert', onInsert);
     return () => window.removeEventListener('prompt-insert', onInsert);
   }, [variant]);
+
+  // Other panels (film-view notes) append text here without sending it. The first
+  // mounted instance to see the event claims it; see lib/prompt-append.js.
+  useEffect(() => {
+    const onAppend = (e) => {
+      const d = e?.detail;
+      if (!d || d.claimed || typeof d.text !== 'string' || !d.text) return;
+      d.claimed = true;
+      setValue((v) => (v ? `${v}\n\n${d.text}` : d.text));
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (el) {
+          el.focus();
+          el.setSelectionRange(el.value.length, el.value.length);
+        }
+      });
+    };
+    window.addEventListener('prompt-append', onAppend);
+    return () => window.removeEventListener('prompt-append', onAppend);
+  }, []);
 
   const startRecording = useCallback(async () => {
     if (recording) return;
@@ -2285,6 +2325,7 @@ export function PromptBox({
 
   return (
     <div
+      data-ink-frame="prompt"
       className={cn(
         'rounded-3xl border border-border/70 bg-popover p-2 shadow-[0_8px_30px_color-mix(in_oklab,var(--scrim)_24%,transparent)] transition-all duration-300',
         // Flatten the top edge when the dock is sitting above this prompt,

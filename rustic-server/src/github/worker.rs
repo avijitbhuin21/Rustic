@@ -251,6 +251,17 @@ async fn run_comment(
     let body = payload["body"].as_str().unwrap_or("").to_string();
     let author = payload["author"].as_str().unwrap_or("unknown").to_string();
 
+    // Checked again here: the event may have been queued before the allowlist
+    // existed or changed, and an untrusted comment must never answer the agent.
+    let association = payload["association"].as_str().unwrap_or("");
+    if !github::load_global_config(ctx).trusts(&author, association) {
+        tracing::info!(
+            issue = issue.issue_number, author = %author,
+            "github worker: queued comment by an untrusted account dropped"
+        );
+        return Ok(());
+    }
+
     let pending = issue
         .pending_tool_use_id
         .clone()

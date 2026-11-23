@@ -1489,8 +1489,11 @@ impl McpManager {
     }
 
     /// Project tools their server annotates `readOnlyHint`, mapped to the id of
-    /// the server each call is routed to. The hint is server-supplied: use it
-    /// for scheduling only, never for permission decisions.
+    /// the server each call is routed to. The hint is server-supplied and
+    /// unverified. It schedules calls and, by the user's decision (Nov 2026),
+    /// also exempts a tool from the approval prompt: a server the user
+    /// installed is trusted to label its own tools. A server that mislabels a
+    /// writing tool as read-only bypasses the prompt.
     pub fn project_read_only_tools(&self, root: &Path) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for tool in self.project_tools(root) {
@@ -1580,6 +1583,11 @@ impl McpManager {
             }
         }
         None
+    }
+
+    /// Id of the server a call to `name` would be routed to (cache lookup, no IPC).
+    pub fn server_for_tool(&self, root: Option<&Path>, name: &str) -> Option<String> {
+        self.server_id_for_tool(root, name)
     }
 
     /// Resolve the connected client that provides `name`, using the cached

@@ -368,6 +368,69 @@ Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+/// How long an upload destination stays writable after its last chunk.
+const UPLOAD_IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Destinations created by `begin_drop_upload`, with the time of their last
+/// write. `write_upload_chunk` appends to these and to nothing else.
+fn open_uploads(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, std::time::Instant>> {
+    static UPLOADS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    UPLOADS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Record `dest` as an upload in progress, dropping ones that went idle.
+fn register_upload(dest: &str) {
+    let mut uploads = open_uploads();
+    uploads.retain(|_, last| last.elapsed() < UPLOAD_IDLE_LIMIT);
+    uploads.insert(dest.to_string(), std::time::Instant::now());
+}
+
+/// Whether `path` is an upload in progress; refreshes its idle timer when it is.
+fn touch_upload(path: &str) -> bool {
+    match open_uploads().get_mut(path) {
+        Some(last) if last.elapsed() < UPLOAD_IDLE_LIMIT => {
+            *last = std::time::Instant::now();
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::{begin_drop_upload, touch_upload};
+
+    #[tokio::test]
+    async fn chunks_are_accepted_only_for_files_an_upload_created() {
+        let dir = std::env::temp_dir().join(format!("rustic-upload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = dir.join("existing.txt");
+        std::fs::write(&other, "keep").unwrap();
+        assert!(
+            !touch_upload(&other.to_string_lossy()),
+            "an arbitrary file is not an upload"
+        );
+
+        let dest = begin_drop_upload(
+            dir.to_string_lossy().into_owned(),
+            "../../escape.bin".into(),
+        )
+        .await
+        .unwrap();
+        assert!(std::path::Path::new(&dest).starts_with(&dir), "{dest}");
+        assert!(dest.ends_with("escape.bin"));
+        assert!(touch_upload(&dest));
+        assert!(!touch_upload(&format!("{dest}.other")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Create an empty destination file for an externally-dropped file. The
 /// desktop webview receives OS drags as HTML5 drops carrying bytes, not
 /// paths (Tauri's native drag-drop is disabled — it would break the HTML5
@@ -387,14 +450,19 @@ pub async fn begin_drop_upload(dst_dir: String, file_name: String) -> Result<Str
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("Invalid file name: {}", file_name))?;
     let dest = unique_destination(dir, name);
+    validate_writable_path(&dest)?;
     std::fs::write(&dest, []).map_err(|e| format!("Create failed: {}", e))?;
-    Ok(dest.to_string_lossy().to_string())
+    let dest = dest.to_string_lossy().to_string();
+    register_upload(&dest);
+    Ok(dest)
 }
 
 /// Append one chunk to a file created by `begin_drop_upload`. The bytes ride
 /// as the raw IPC body (no JSON/base64 inflation — a video stays binary all
 /// the way); the destination path travels URI-encoded in the `x-file-path`
-/// header because raw-body invokes carry no JSON args.
+/// header because raw-body invokes carry no JSON args. Only a path that
+/// `begin_drop_upload` returned is accepted: the header is caller-supplied and
+/// must not turn this into "append to any file".
 #[tauri::command]
 pub async fn write_upload_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String> {
     use std::io::Write;
@@ -404,6 +472,9 @@ pub async fn write_upload_chunk(request: tauri::ipc::Request<'_>) -> Result<(), 
         .and_then(|v| v.to_str().ok())
         .ok_or("missing x-file-path header")?;
     let path = percent_decode_simple(path_header);
+    if !touch_upload(&path) {
+        return Err(format!("No upload in progress for {}", path));
+    }
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("expected a raw (binary) request body".into());
     };

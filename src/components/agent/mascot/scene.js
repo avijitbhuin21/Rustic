@@ -262,14 +262,25 @@ async function createEngine() {
     ctx.drawImage(glCanvas, 0, glCanvas.height - view.bh, view.bw, view.bh, 0, 0, canvas.width, canvas.height);
   }
 
+  // With the window in the background the mascot is at most glanced at, so it
+  // is drawn at 20 fps instead of the display rate. 50 ms is also the largest
+  // step the rig integrates in one go, so the animation keeps its speed.
+  const BACKGROUND_FRAME_MS = 50;
+  let focused = typeof document === 'undefined' || document.hasFocus();
+  let lastDrawn = 0;
+  window.addEventListener('focus', () => { focused = true; });
+  window.addEventListener('blur', () => { focused = false; });
+
   const frame = (ms) => {
     raf = 0;
+    const draw = focused || ms - lastDrawn >= BACKGROUND_FRAME_MS;
     let live = false;
     for (const view of views) {
       if (view.manual || view.reduced || !view.visible) continue;
       live = true;
-      render(view, ms / 1000);
+      if (draw) render(view, ms / 1000);
     }
+    if (draw) lastDrawn = ms;
     if (live) raf = requestAnimationFrame(frame);
   };
   const kick = () => { if (!raf) raf = requestAnimationFrame(frame); };

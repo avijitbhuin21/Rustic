@@ -216,28 +216,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fetch UTF-8 text from an http(s) URL with a 30s timeout and a 1 MiB cap.
+/// Fetch UTF-8 text from a public URL with a 30s timeout and a 1 MiB cap.
+/// Goes through the same private-address checks as `web_fetch`: the URL comes
+/// from the model, and must not reach localhost or the local network.
 pub async fn fetch_text(url: &str) -> Result<String> {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(anyhow!("only http(s) URLs are supported (got `{}`)", url));
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let resp = client.get(url).send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(anyhow!("fetch failed: HTTP {} from {}", status, url));
-    }
-    let bytes = resp.bytes().await?;
-    if bytes.len() > FETCH_MAX_BYTES {
-        return Err(anyhow!(
-            "content too large: {} bytes (cap {})",
-            bytes.len(),
-            FETCH_MAX_BYTES
-        ));
-    }
-    String::from_utf8(bytes.to_vec()).map_err(|_| anyhow!("content is not valid UTF-8 text"))
+    crate::tools::web_tools::fetch_public_text(url, FETCH_MAX_BYTES, 30)
+        .await
+        .map_err(|e| anyhow!("{}", e))
 }
 
 /// Cap a string for the consent preview, appending a truncation marker.

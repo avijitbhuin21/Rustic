@@ -112,6 +112,27 @@ pub async fn write_file_base64(path: String, data: String) -> Result<u64, String
     preview_ops::write_file_base64(&path, &data)
 }
 
+/// Replay PDF content edits (move, delete, replace text) and return the
+/// page's objects, and the edited document when `want_pdf` is set.
+#[tauri::command]
+pub async fn pdf_edit(
+    path: String,
+    ops: Vec<rustic_agent::tools::pdf_edit::PdfEditOp>,
+    page: u32,
+    want_pdf: Option<bool>,
+) -> Result<preview_ops::PdfEditResponse, String> {
+    blocking(move || preview_ops::pdf_edit(&path, ops, page, want_pdf.unwrap_or(false))).await
+}
+
+/// Replay PDF content edits and overwrite the file with the result.
+#[tauri::command]
+pub async fn pdf_edit_save(
+    path: String,
+    ops: Vec<rustic_agent::tools::pdf_edit::PdfEditOp>,
+) -> Result<u64, String> {
+    blocking(move || preview_ops::pdf_edit_save(&path, ops)).await
+}
+
 /// Read a chunk of a file as hex data for the hex viewer.
 #[tauri::command]
 pub async fn read_hex_chunk(
@@ -144,4 +165,62 @@ fn format_file_size(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+/// Start a film-view session for an HTML page inside a project added to Rustic.
+#[tauri::command]
+pub async fn film_open(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::state::AppState>,
+    path: String,
+) -> Result<rustic_app::film_preview::FilmOpen, String> {
+    // WebView2 injects Tauri's init scripts into every sub-frame, so a film page could
+    // reach the app's command channel there; the scheme's host form also differs.
+    if cfg!(windows) {
+        return Err("Film view is not available in the Windows desktop app yet.".into());
+    }
+    let roots: Vec<std::path::PathBuf> = {
+        use crate::sync_ext::MutexExt;
+        state
+            .workspace
+            .lock_safe()
+            .list_projects()
+            .into_iter()
+            .map(|p| p.root_path)
+            .collect()
+    };
+    let deny: Vec<std::path::PathBuf> = crate::app_paths::app_data_dir(&app).into_iter().collect();
+    rustic_app::film_preview::sessions().open(std::path::Path::new(&path), &roots, &deny, true)
+}
+
+/// End a film-view session.
+#[tauri::command]
+pub async fn film_close(id: String) -> Result<(), String> {
+    rustic_app::film_preview::sessions().close(&id);
+    Ok(())
+}
+
+/// Start a live HTML preview session (page scripts run sandboxed); closed with `film_close`.
+#[tauri::command]
+pub async fn page_preview_open(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::state::AppState>,
+    path: String,
+) -> Result<rustic_app::film_preview::FilmOpen, String> {
+    // Same reason as the film view: WebView2 would hand the page Tauri's init scripts.
+    if cfg!(windows) {
+        return Err("Page scripts can't run in the Windows desktop app yet.".into());
+    }
+    let roots: Vec<std::path::PathBuf> = {
+        use crate::sync_ext::MutexExt;
+        state
+            .workspace
+            .lock_safe()
+            .list_projects()
+            .into_iter()
+            .map(|p| p.root_path)
+            .collect()
+    };
+    let deny: Vec<std::path::PathBuf> = crate::app_paths::app_data_dir(&app).into_iter().collect();
+    rustic_app::film_preview::sessions().open_page(std::path::Path::new(&path), &roots, &deny, true)
 }

@@ -48,7 +48,7 @@ export function SidebarHost() {
   }, [activePanel]);
 
   return (
-    <div className="h-full w-full overflow-hidden bg-sidebar">
+    <div data-ink-frame="panel" className="h-full w-full overflow-hidden bg-sidebar">
       {PANEL_IDS.map(id => {
         if (!everMounted.has(id)) return null;
         return (

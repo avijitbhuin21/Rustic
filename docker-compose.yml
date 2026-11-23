@@ -18,6 +18,14 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Caddy is the only peer that can reach this container, and it overwrites
+      # X-Forwarded-For with the visitor's address, so the login rate limiter
+      # can key on it. Without this every visitor shares Caddy's address and
+      # five wrong passwords from anyone lock everybody out.
+      # REMOVE for topology B: with the port published directly, the header
+      # would come from the visitor and let them dodge the limiter.
+      RUSTIC_TRUSTED_PROXIES: ${RUSTIC_TRUSTED_PROXIES:-172.16.0.0/12,192.168.0.0/16,10.0.0.0/8}
     volumes:
       - rustic-data:/data
     # Not published to the host directly in topology A — Caddy reaches it over

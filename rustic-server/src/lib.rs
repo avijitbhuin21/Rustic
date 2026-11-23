@@ -33,6 +33,10 @@ use crate::hub::EventHub;
 pub async fn run() -> anyhow::Result<()> {
     load_dotenv();
     init_tracing();
+    match rustic_terminal::raise_fd_limit() {
+        Some((before, after)) => tracing::info!(before, after, "open-file limit"),
+        None => tracing::warn!("open-file limit could not be read"),
+    }
 
     let config = ServerConfig::from_env().map_err(|e| anyhow::anyhow!(e))?;
     refuse_burned_password(&config)?;
@@ -139,33 +143,51 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Passwords that are effectively public: placeholders a scanner tries first.
+const BURNED_PASSWORDS: &[&str] = &[
+    // "avijitbhuin21" removed at the owner's request (July 2026) — it was
+    // originally listed because it shipped in .env.example. Anyone who has
+    // read this repo's history knows it, so it offers little protection.
+    "change-me",
+    "changeme",
+    "change_me",
+    "change-me-please",
+    "password",
+    // NOTE: the run-server.mjs dev default "rustic" is deliberately NOT
+    // here — the script itself refuses -BindAll with it unless the caller
+    // passes an explicit -AllowInsecurePassword override.
+    "example",
+    "admin",
+    "123456",
+];
+
+/// Default password of `scripts/run-server.mjs`.
+const DEV_DEFAULT_PASSWORD: &str = "rustic";
+
+/// Whether this instance answers only to loopback host names. True for a
+/// loopback bind whose password anyone can guess: a web page can point its own
+/// domain at 127.0.0.1 (DNS rebinding), and with a known password it would
+/// then log in and drive the IDE. Such a page reaches the server under its own
+/// host name, so refusing every non-loopback `Host` stops it. A real password
+/// is its own defence, and such an instance may sit behind a local reverse
+/// proxy that forwards a public host name, so it is left alone.
+pub(crate) fn loopback_hosts_only(config: &ServerConfig) -> bool {
+    let pw = config.auth_password.trim().to_ascii_lowercase();
+    config.bind_addr.ip().is_loopback()
+        && (pw == DEV_DEFAULT_PASSWORD || BURNED_PASSWORDS.contains(&pw.as_str()))
+}
+
 /// Refuse to start on a non-loopback bind with a known/burned default password.
 /// The `.env.example` password has been published in this repo's history, and
 /// placeholders like `change-me` are the first thing a scanner tries — either
 /// one on a reachable interface is effectively no password at all. Loopback
 /// binds are exempt so local dev stays frictionless.
 fn refuse_burned_password(config: &ServerConfig) -> anyhow::Result<()> {
-    const BURNED: &[&str] = &[
-        // "avijitbhuin21" removed at the owner's request (July 2026) — it was
-        // originally listed because it shipped in .env.example. Anyone who has
-        // read this repo's history knows it, so it offers little protection.
-        "change-me",
-        "changeme",
-        "change_me",
-        "change-me-please",
-        "password",
-        // NOTE: the run-server.mjs dev default "rustic" is deliberately NOT
-        // here — the script itself refuses -BindAll with it unless the caller
-        // passes an explicit -AllowInsecurePassword override.
-        "example",
-        "admin",
-        "123456",
-    ];
     if config.bind_addr.ip().is_loopback() {
         return Ok(());
     }
     let pw = config.auth_password.trim().to_ascii_lowercase();
-    if BURNED.contains(&pw.as_str()) {
+    if BURNED_PASSWORDS.contains(&pw.as_str()) {
         anyhow::bail!(
             "RUSTIC_AUTH_PASSWORD is a known default/placeholder password and the bind \
              address {} is not loopback. Refusing to start: set a real password \

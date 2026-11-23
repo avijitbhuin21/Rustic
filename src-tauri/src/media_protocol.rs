@@ -4,7 +4,8 @@
 //! Mirrors the web server's `/api/asset`.
 //!
 //! Guarded by the shared readable-path check and nothing under Rustic's own
-//! app-data directory; responses carry `sandbox` CSP so a navigated SVG/HTML
+//! app-data directory; served to the app window and origin only (see
+//! `reader_origin`); responses carry `sandbox` CSP so a navigated SVG/HTML
 //! asset can't run script in the app origin.
 
 use std::io::{Read, Seek, SeekFrom};
@@ -17,21 +18,85 @@ pub const SCHEME: &str = "rustic-media";
 /// Largest slice served per request; callers ask for the next range as they read.
 const MAX_CHUNK: u64 = 4 * 1024 * 1024;
 
-/// Serve one `rustic-media://localhost/<encoded path>` request.
-pub fn handle(app: &tauri::AppHandle, req: &Request<Vec<u8>>) -> Response<Vec<u8>> {
-    serve(app, req).unwrap_or_else(|(status, msg)| {
-        Response::builder()
+/// The only window allowed to stream local files.
+const APP_WINDOW: &str = "main";
+
+/// Origins the app's own page is served from (macOS/Linux, then Windows).
+const APP_ORIGINS: &[&str] = &[
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+];
+
+/// Whether `origin` is the app's own page: a bundled origin, or the dev server in `tauri dev`.
+fn is_app_origin(app: &tauri::AppHandle, origin: &str) -> bool {
+    if APP_ORIGINS.contains(&origin) {
+        return true;
+    }
+    app.config()
+        .build
+        .dev_url
+        .as_ref()
+        .is_some_and(|dev| dev.origin().ascii_serialization() == origin)
+}
+
+/// Who may read a response: `Ok(value)` for `Access-Control-Allow-Origin`, or
+/// `Err` when the request must be refused.
+///
+/// A remote-backend window loads a page from another machine and must not read
+/// this machine's files, so only the app window is served. Within it, a
+/// cross-origin `fetch` is answered only for the app's own origin: a sandboxed
+/// preview frame sends `Origin: null` and is refused. Requests without an
+/// `Origin` (`<img>`, `<video>`, fonts) cannot expose bytes to script.
+fn reader_origin(
+    app: &tauri::AppHandle,
+    webview: &str,
+    req: &Request<Vec<u8>>,
+) -> Result<String, (StatusCode, String)> {
+    if webview != APP_WINDOW {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "local files are not served to this window".into(),
+        ));
+    }
+    match req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        None => Ok("*".into()),
+        Some(origin) if is_app_origin(app, origin) => Ok(origin.to_string()),
+        Some(_) => Err((
+            StatusCode::FORBIDDEN,
+            "local files are not served to this origin".into(),
+        )),
+    }
+}
+
+/// Serve one `rustic-media://localhost/<encoded path>` request made by webview `webview`.
+pub fn handle(app: &tauri::AppHandle, webview: &str, req: &Request<Vec<u8>>) -> Response<Vec<u8>> {
+    let failure = |status: StatusCode, msg: String, allow: Option<&str>| {
+        let mut builder = Response::builder()
             .status(status)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(msg.into_bytes())
-            .unwrap_or_default()
-    })
+            .header(header::CONTENT_TYPE, "text/plain");
+        if let Some(origin) = allow {
+            builder = builder
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin)
+                .header(header::VARY, "Origin");
+        }
+        builder.body(msg.into_bytes()).unwrap_or_default()
+    };
+    let allow = match reader_origin(app, webview, req) {
+        Ok(origin) => origin,
+        Err((status, msg)) => return failure(status, msg, None),
+    };
+    serve(app, req, &allow).unwrap_or_else(|(status, msg)| failure(status, msg, Some(&allow)))
 }
 
 fn serve(
     app: &tauri::AppHandle,
     req: &Request<Vec<u8>>,
+    allow_origin: &str,
 ) -> Result<Response<Vec<u8>>, (StatusCode, String)> {
     let raw = req.uri().path().trim_start_matches('/');
     let path = PathBuf::from(
@@ -73,7 +138,8 @@ fn serve(
             .header(header::CONTENT_TYPE, mime)
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::CONTENT_LENGTH, total.to_string())
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin)
+            .header(header::VARY, "Origin")
             .header(header::CONTENT_SECURITY_POLICY, "sandbox")
             .body(buf)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
@@ -99,7 +165,8 @@ fn serve(
             format!("bytes {start}-{end}/{total}"),
         )
         .header(header::CONTENT_LENGTH, len.to_string())
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin)
+        .header(header::VARY, "Origin")
         .header(
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             "Content-Range, Content-Length",

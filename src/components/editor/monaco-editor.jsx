@@ -11,6 +11,7 @@ import { useFileChangeEffect } from '@/lib/use-file-change';
 import { resolveSaveConflict } from './save-conflict-dialog';
 import { getUnsavedBuffer, setUnsavedBuffer, dropUnsavedBuffer } from '@/lib/unsaved-buffers';
 import { UnsupportedFileView } from './unsupported-file-view';
+import { InlineChat } from './inline-chat';
 import { watchMonacoTheme } from '@/lib/monaco-theme';
 import {
   setActiveEditor,
@@ -18,6 +19,8 @@ import {
   formatActiveEditor,
   setActiveSaver,
   clearActiveSaver,
+  setActiveInlineChat,
+  clearActiveInlineChat,
   applyFormattedContent,
   isFormatterUnavailable,
 } from '@/lib/active-editor';
@@ -239,6 +242,36 @@ export default function MonacoEditor({ tab }) {
   const saveRef = useRef(async () => {});
   const stableSaver = useCallback(() => saveRef.current(), []);
 
+  // Inline chat (Ctrl+I): one session per editor, anchored at the selection
+  // (or cursor) it was opened on. Pressing the key again refocuses its prompt.
+  const [inlineChat, setInlineChat] = useState(null);
+  const inlineChatRef = useRef(null);
+  inlineChatRef.current = inlineChat;
+  const inlineChatSeq = useRef(0);
+  const openInlineChat = useCallback(() => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    if (!editor || !monaco || !editor.getModel()) return;
+    if (editor.getOption(monaco.editor.EditorOption.readOnly)) return;
+    if (inlineChatRef.current) {
+      editor.getDomNode()?.querySelector('[data-inline-chat] textarea')?.focus();
+      return;
+    }
+    const sel = editor.getSelection();
+    if (!sel) return;
+    inlineChatSeq.current += 1;
+    setInlineChat({
+      id: inlineChatSeq.current,
+      range: {
+        startLineNumber: sel.startLineNumber,
+        startColumn: sel.startColumn,
+        endLineNumber: sel.endLineNumber,
+        endColumn: sel.endColumn,
+      },
+    });
+  }, []);
+  const closeInlineChat = useCallback(() => setInlineChat(null), []);
+
   const setDirty = useEditor((s) => s.setDirty);
   const setCursor = useEditor((s) => s.setCursor);
   const saveCursorForTab = useEditor((s) => s.saveCursorForTab);
@@ -398,9 +431,11 @@ export default function MonacoEditor({ tab }) {
     // act on the right buffer.
     setActiveEditor(editor, tabRef.current);
     setActiveSaver(stableSaver);
+    setActiveInlineChat(openInlineChat);
     editor.onDidFocusEditorWidget(() => {
       setActiveEditor(editor, tabRef.current);
       setActiveSaver(stableSaver);
+      setActiveInlineChat(openInlineChat);
     });
 
     editor.onDidChangeCursorPosition((e) => {
@@ -411,8 +446,9 @@ export default function MonacoEditor({ tab }) {
     editor.onDidDispose(() => {
       clearActiveEditor(editor);
       clearActiveSaver(stableSaver);
+      clearActiveInlineChat(openInlineChat);
     });
-  }, [applyContent, setCursor, saveCursorForTab, tab.id]);
+  }, [applyContent, setCursor, saveCursorForTab, tab.id, openInlineChat]);
 
   // Reactively push every editor setting to Monaco when settings change.
   // We pass the full options each time — Monaco diffs internally and only
@@ -594,6 +630,16 @@ export default function MonacoEditor({ tab }) {
           options={DEFAULT_EDITOR_OPTIONS}
           loading={<Fallback />}
         />
+        {inlineChat && editorRef.current && monacoRef.current && (
+          <InlineChat
+            key={inlineChat.id}
+            editor={editorRef.current}
+            monaco={monacoRef.current}
+            tab={tab}
+            session={inlineChat}
+            onClose={closeInlineChat}
+          />
+        )}
         {loading && (
           <div className="absolute inset-0 z-10 bg-background">
             <Fallback />

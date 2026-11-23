@@ -63,15 +63,91 @@ fn rel_string(p: &Path) -> String {
         .join("/")
 }
 
-/// Folders hidden from browsing (never transferred implicitly either).
+/// Folders hidden from browsing and never written by a transfer. Compared
+/// without case: `.GIT` is the same folder on macOS and Windows.
 fn hidden(name: &str) -> bool {
-    name == ".git"
+    name.eq_ignore_ascii_case(".git")
+}
+
+/// Whether any component of `path` is a hidden folder.
+pub fn has_hidden_component(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, Component::Normal(s) if hidden(&s.to_string_lossy())))
+}
+
+/// Refuse `path` when a symlink on the way to it leads outside `root`. Works
+/// for paths that don't exist yet: the deepest existing ancestor is resolved,
+/// and a dangling symlink (which a write would follow) is refused.
+pub fn ensure_inside(root: &Path, path: &Path) -> Result<(), String> {
+    let outside = || "that path leads outside the project".to_string();
+    let canon_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let mut probe = path;
+    loop {
+        match std::fs::canonicalize(probe) {
+            Ok(real) if real.starts_with(&canon_root) => return Ok(()),
+            Ok(_) => return Err(outside()),
+            Err(_) => {
+                if std::fs::symlink_metadata(probe).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(outside());
+                }
+                probe = probe.parent().ok_or_else(outside)?;
+            }
+        }
+    }
+}
+
+/// `rel` under `root`, refused when a symlink leads it outside `root`.
+pub fn resolve_inside(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let path = root.join(safe_rel(rel)?);
+    ensure_inside(root, &path)?;
+    Ok(path)
+}
+
+/// Folder `rel` of `root` as an upload destination: inside `root` and not in a hidden folder.
+pub fn resolve_dest_dir(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let rel_path = safe_rel(rel)?;
+    if has_hidden_component(&rel_path) {
+        return Err(format!("{rel} can't receive files"));
+    }
+    let path = root.join(rel_path);
+    ensure_inside(root, &path)?;
+    Ok(path)
+}
+
+/// What the receiving user approved for an incoming upload. The default
+/// restricts nothing and is for transfers this machine started itself.
+#[derive(Debug, Clone, Default)]
+pub struct UploadApproval {
+    /// Top-level names the user saw in the prompt. Only these may replace
+    /// something that already exists; `None` = any name may.
+    pub replaceable: Option<std::collections::HashSet<String>>,
+    /// Most file bytes the upload may write; `None` = no limit.
+    pub max_bytes: Option<u64>,
+}
+
+impl UploadApproval {
+    /// The conflict policy to apply to `top`: `Replace` only for names the user approved.
+    fn policy_for(&self, top: &str, policy: ConflictPolicy) -> ConflictPolicy {
+        match (&self.replaceable, policy) {
+            (Some(names), ConflictPolicy::Replace) if !names.contains(top) => {
+                ConflictPolicy::AutoRename
+            }
+            _ => policy,
+        }
+    }
+
+    /// Byte limit for an upload the sender said would be `declared` bytes.
+    /// Leaves room for files that grew between measuring and sending.
+    pub fn limit_for(declared: u64) -> u64 {
+        declared.saturating_add((declared / 10).max(16 * 1024 * 1024))
+    }
 }
 
 /// Direct children of `rel` under `root`, folders first, then by name.
 pub fn list_dir(root: &Path, rel: &str) -> Result<Vec<FsEntry>, String> {
     let rel_path = safe_rel(rel)?;
     let dir = root.join(&rel_path);
+    ensure_inside(root, &dir)?;
     let rd = std::fs::read_dir(&dir)
         .map_err(|e| format!("Can't open {}: {e}", rel_string(&rel_path)))?;
     let mut out = Vec::new();
@@ -130,6 +206,7 @@ pub fn read_preview(root: &Path, rel: &str) -> Result<Preview, String> {
     use base64::Engine;
     let rel_path = safe_rel(rel)?;
     let path = root.join(&rel_path);
+    ensure_inside(root, &path)?;
     let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     if meta.is_dir() {
         return Err("That's a folder".into());
@@ -511,10 +588,33 @@ pub struct UnpackSummary {
 /// into `dest_dir`. Top-level names that already exist follow `renames`
 /// (explicit, from the user) else `policy`.
 pub fn unpack(
+    source: impl Read,
+    dest_dir: &Path,
+    policy: ConflictPolicy,
+    renames: &HashMap<String, String>,
+    cancel: &dyn Fn() -> bool,
+    progress: &dyn Fn(u64),
+) -> Result<UnpackSummary, String> {
+    unpack_approved(
+        source,
+        dest_dir,
+        policy,
+        renames,
+        &UploadApproval::default(),
+        cancel,
+        progress,
+    )
+}
+
+/// [`unpack`] for an upload from another machine: `approval` bounds what may
+/// be replaced and how much may be written. Nothing is ever written into a
+/// hidden folder or through a symlink that leaves `dest_dir`.
+pub fn unpack_approved(
     mut source: impl Read,
     dest_dir: &Path,
     policy: ConflictPolicy,
     renames: &HashMap<String, String>,
+    approval: &UploadApproval,
     cancel: &dyn Fn() -> bool,
     progress: &dyn Fn(u64),
 ) -> Result<UnpackSummary, String> {
@@ -542,6 +642,7 @@ pub fn unpack(
     });
     let mut summary = UnpackSummary::default();
     let mut mapped: HashMap<String, Option<String>> = HashMap::new();
+    let mut checked_dir: Option<PathBuf> = None;
     for entry in archive.entries().map_err(|e| e.to_string())? {
         if cancel() {
             return Err("cancelled".into());
@@ -549,6 +650,9 @@ pub fn unpack(
         let mut entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
         let rel = safe_rel(&path.to_string_lossy())?;
+        if has_hidden_component(&rel) {
+            return Err(format!("{} can't be written by a transfer", path.display()));
+        }
         let mut comps = rel.components();
         let Some(Component::Normal(top)) = comps.next() else {
             continue;
@@ -565,7 +669,7 @@ pub fn unpack(
                 if !dest_dir.join(&top).exists() {
                     return Some(top.clone());
                 }
-                match policy {
+                match approval.policy_for(&top, policy) {
                     ConflictPolicy::Skip => {
                         summary.skipped.push(top.clone());
                         None
@@ -591,22 +695,50 @@ pub fn unpack(
         let Some(target_top) = target_top else {
             continue;
         };
-        safe_rel(&target_top)?;
+        if has_hidden_component(&safe_rel(&target_top)?) {
+            return Err(format!("{target_top} can't be written by a transfer"));
+        }
         let out = if rest.as_os_str().is_empty() {
             dest_dir.join(&target_top)
         } else {
             dest_dir.join(&target_top).join(&rest)
         };
+        // One containment check per folder, not per file.
+        let parent = out.parent().unwrap_or(dest_dir).to_path_buf();
+        if checked_dir.as_ref() != Some(&parent) {
+            ensure_inside(dest_dir, &out)?;
+            checked_dir = Some(parent);
+        }
         let kind = entry.header().entry_type();
         if kind.is_dir() {
             std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+            checked_dir = None;
         } else if kind.is_file() {
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
+            if std::fs::symlink_metadata(&out).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!(
+                    "{} is a link and can't be overwritten",
+                    out.display()
+                ));
+            }
             let mut f =
                 std::fs::File::create(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-            let n = std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
+            let n = match approval.max_bytes {
+                Some(limit) => {
+                    let left = limit.saturating_sub(summary.bytes);
+                    let n = std::io::copy(&mut (&mut entry).take(left.saturating_add(1)), &mut f)
+                        .map_err(|e| e.to_string())?;
+                    if n > left {
+                        drop(f);
+                        let _ = std::fs::remove_file(&out);
+                        return Err("the upload is larger than what was approved".into());
+                    }
+                    n
+                }
+                None => std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?,
+            };
             summary.files += 1;
             summary.bytes += n;
         }
@@ -711,6 +843,18 @@ pub fn plan_tops(
     policy: ConflictPolicy,
     renames: &HashMap<String, String>,
 ) -> Result<(HashMap<String, Option<String>>, UnpackSummary), String> {
+    plan_tops_approved(dest_dir, tops, policy, renames, &UploadApproval::default())
+}
+
+/// [`plan_tops`] for an upload from another machine: only names in `approval`
+/// may replace something, and no name may be a hidden folder.
+pub fn plan_tops_approved(
+    dest_dir: &Path,
+    tops: &[String],
+    policy: ConflictPolicy,
+    renames: &HashMap<String, String>,
+    approval: &UploadApproval,
+) -> Result<(HashMap<String, Option<String>>, UnpackSummary), String> {
     let mut plan = HashMap::new();
     let mut summary = UnpackSummary::default();
     let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -718,14 +862,19 @@ pub fn plan_tops(
         if plan.contains_key(top) {
             continue;
         }
+        if has_hidden_component(Path::new(top)) {
+            return Err(format!("{top} can't be written by a transfer"));
+        }
         let target = if let Some(new) = renames.get(top).filter(|n| !n.trim().is_empty()) {
-            safe_rel(new)?;
+            if has_hidden_component(&safe_rel(new)?) {
+                return Err(format!("{new} can't be written by a transfer"));
+            }
             summary.renamed.insert(top.clone(), new.clone());
             Some(new.clone())
         } else if !dest_dir.join(top).exists() {
             Some(top.clone())
         } else {
-            match policy {
+            match approval.policy_for(top, policy) {
                 ConflictPolicy::Skip => {
                     summary.skipped.push(top.clone());
                     None
@@ -953,6 +1102,199 @@ mod tests {
             out.len()
         );
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// A plain tar holding `entries` as `(path, content)`.
+    fn tar_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, path, *content).unwrap();
+        }
+        tar.into_inner().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_cannot_lead_reads_or_writes_out_of_the_project() {
+        let d = tmp("symlink");
+        let (root, outside) = (d.join("project"), d.join("outside"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::fs::write(root.join("src/a.txt"), "inside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("src/file-link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("new.txt"), root.join("dangling")).unwrap();
+
+        assert!(list_dir(&root, "src").is_ok());
+        assert!(read_preview(&root, "src/a.txt").is_ok());
+        assert!(list_dir(&root, "link").is_err());
+        assert!(read_preview(&root, "link/secret.txt").is_err());
+        assert!(read_preview(&root, "src/file-link").is_err());
+        assert!(resolve_inside(&root, "link/secret.txt").is_err());
+        assert!(
+            resolve_inside(&root, "dangling").is_err(),
+            "a write would follow it"
+        );
+        assert!(resolve_inside(&root, "src/not-there-yet/x.txt").is_ok());
+        assert!(resolve_dest_dir(&root, "link").is_err());
+
+        // An upload cannot write through a link either.
+        let archive = tar_of(&[("link/planted.txt", b"x")]);
+        let renames = HashMap::from([("link".to_string(), "link".to_string())]);
+        let res = unpack(
+            &archive[..],
+            &root,
+            ConflictPolicy::Skip,
+            &renames,
+            &|| false,
+            &|_| {},
+        );
+        assert!(res.is_err(), "{res:?}");
+        assert!(!outside.join("planted.txt").exists());
+        let archive = tar_of(&[("dangling", b"x")]);
+        let renames = HashMap::from([("dangling".to_string(), "dangling".to_string())]);
+        let res = unpack(
+            &archive[..],
+            &root,
+            ConflictPolicy::Skip,
+            &renames,
+            &|| false,
+            &|_| {},
+        );
+        assert!(res.is_err(), "{res:?}");
+        assert!(!outside.join("new.txt").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn uploads_never_touch_git_and_replace_only_approved_names() {
+        let d = tmp("approval");
+        std::fs::create_dir_all(d.join(".git/hooks")).unwrap();
+        std::fs::write(d.join(".git/HEAD"), "ref").unwrap();
+        std::fs::write(d.join("notes.txt"), "mine").unwrap();
+        std::fs::write(d.join("seen.txt"), "old").unwrap();
+        let none = HashMap::new();
+
+        for path in [".git/hooks/pre-commit", ".GIT/config", "src/.git/config"] {
+            let archive = tar_of(&[(path, b"evil")]);
+            let res = unpack(
+                &archive[..],
+                &d,
+                ConflictPolicy::Replace,
+                &none,
+                &|| false,
+                &|_| {},
+            );
+            assert!(res.is_err(), "{path}: {res:?}");
+        }
+        let archive = tar_of(&[("x/pre-commit", b"evil")]);
+        let renames = HashMap::from([("x".to_string(), ".git/hooks".to_string())]);
+        assert!(unpack(
+            &archive[..],
+            &d,
+            ConflictPolicy::Skip,
+            &renames,
+            &|| false,
+            &|_| {}
+        )
+        .is_err());
+        assert_eq!(std::fs::read_to_string(d.join(".git/HEAD")).unwrap(), "ref");
+        assert!(!d.join(".git/hooks/pre-commit").exists());
+        assert!(resolve_dest_dir(&d, ".git/hooks").is_err());
+        assert!(plan_tops(&d, &[".git".into()], ConflictPolicy::Replace, &none).is_err());
+
+        // Replace applies to the name the user saw; the other one is kept and renamed around.
+        let approval = UploadApproval {
+            replaceable: Some(["seen.txt".to_string()].into_iter().collect()),
+            max_bytes: None,
+        };
+        let archive = tar_of(&[("seen.txt", b"new"), ("notes.txt", b"theirs")]);
+        let s = unpack_approved(
+            &archive[..],
+            &d,
+            ConflictPolicy::Replace,
+            &none,
+            &approval,
+            &|| false,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(s.replaced, vec!["seen.txt".to_string()]);
+        assert_eq!(std::fs::read_to_string(d.join("seen.txt")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(d.join("notes.txt")).unwrap(),
+            "mine"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("notes-1.txt")).unwrap(),
+            "theirs"
+        );
+
+        let (plan, _) = plan_tops_approved(
+            &d,
+            &["notes.txt".into(), "seen.txt".into()],
+            ConflictPolicy::Replace,
+            &none,
+            &approval,
+        )
+        .unwrap();
+        assert_eq!(plan["notes.txt"].as_deref(), Some("notes-2.txt"));
+        assert_eq!(plan["seen.txt"].as_deref(), Some("seen.txt"));
+        assert!(d.join("notes.txt").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_upload_cannot_write_more_than_was_approved() {
+        let d = tmp("limit");
+        let big = vec![b'x'; 4096];
+        let archive = tar_of(&[("a.bin", &big), ("b.bin", &big)]);
+        let approval = UploadApproval {
+            replaceable: None,
+            max_bytes: Some(6000),
+        };
+        let res = unpack_approved(
+            &archive[..],
+            &d,
+            ConflictPolicy::AutoRename,
+            &HashMap::new(),
+            &approval,
+            &|| false,
+            &|_| {},
+        );
+        assert_eq!(
+            res.unwrap_err(),
+            "the upload is larger than what was approved"
+        );
+        assert!(d.join("a.bin").exists());
+        assert!(
+            !d.join("b.bin").exists(),
+            "the file that broke the limit is removed"
+        );
+
+        let roomy = UploadApproval {
+            replaceable: None,
+            max_bytes: Some(UploadApproval::limit_for(8192)),
+        };
+        let d2 = tmp("limit-ok");
+        let s = unpack_approved(
+            &archive[..],
+            &d2,
+            ConflictPolicy::AutoRename,
+            &HashMap::new(),
+            &roomy,
+            &|| false,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!((s.files, s.bytes), (2, 8192));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
     }
 
     #[test]

@@ -17,7 +17,7 @@ resolver = "2"
 # `[workspace]`, so it must be excluded here to avoid a "multiple workspace
 # roots" error. It is still built as a path dependency of rustic-agent; this
 # only keeps it out of our fmt / clippy / test gates.
-exclude = ["vendor/lattice-merge", "vendor/docx-rs", "website"]
+exclude = ["vendor/lattice-merge", "vendor/palimpsest-pdf", "vendor/docx-rs", "website"]
 
 # Single source of truth for every dependency shared by 2+ member crates.
 # Members inherit with `dep = { workspace = true }` and may ADD features via

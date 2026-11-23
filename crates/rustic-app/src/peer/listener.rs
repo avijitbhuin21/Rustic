@@ -447,6 +447,21 @@ async fn pair(
     if let Some(r) = refuse_if_locked(&ctx) {
         return r;
     }
+    if req.device_id.trim().is_empty() || req.fingerprint.trim().is_empty() || req.token.len() < 32
+    {
+        return err(StatusCode::BAD_REQUEST, "incomplete pairing request");
+    }
+    let dir = match data_dir(&ctx) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    // Nothing in this request is proven: the device id and fingerprint are
+    // whatever the caller sent. If the id is already paired, say so in the
+    // prompt, because accepting replaces that pairing.
+    let replaces = super::load_peers(&dir)
+        .into_iter()
+        .find(|p| p.device_id == req.device_id)
+        .map(|p| p.display_name());
     let caller = caller_addr(&headers, remote.map(|axum::Extension(r)| r));
     let (my, request_id, rx) = {
         let mut inner = ctx.lan.lock();
@@ -469,10 +484,10 @@ async fn pair(
         (id, request_id, rx)
     };
     tracing::info!(device = %req.device_id, name = %req.name, caller = ?caller, "peer: incoming pairing request — prompting the user");
-    let code = super::pairing_code(&my.fingerprint, &req.fingerprint);
+    let code = super::pairing_code(&my.fingerprint, &req.fingerprint, &req.token);
     ctx.emit(
         "lan-pair-request",
-        json!({ "request_id": request_id, "device_id": req.device_id, "name": req.name, "code": code }),
+        json!({ "request_id": request_id, "device_id": req.device_id, "name": req.name, "code": code, "replaces": replaces }),
     );
     ctx.host.request_attention();
     let accepted = matches!(
@@ -500,10 +515,6 @@ async fn pair(
         Ok(t) => t,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
-    let dir = match data_dir(&ctx) {
-        Ok(d) => d,
-        Err(r) => return r,
-    };
     let addr = caller.or_else(|| {
         ctx.lan
             .lock()
@@ -511,12 +522,6 @@ async fn pair(
             .get(&req.device_id)
             .map(|d| d.addr.clone())
     });
-    let existing = super::load_peers(&dir)
-        .into_iter()
-        .find(|p| p.device_id == req.device_id);
-    let nickname = existing.as_ref().and_then(|p| p.nickname.clone());
-    let meta_view = existing.as_ref().is_some_and(|p| p.meta_view);
-    let share = existing.map(|p| p.share).unwrap_or_default();
     {
         let mut inner = ctx.lan.lock();
         inner.mark_seen(&req.device_id, addr.clone());
@@ -525,6 +530,9 @@ async fn pair(
             .versions
             .insert(req.device_id.clone(), super::app_version().to_string());
     }
+    // A pairing accepted here never inherits what an earlier pairing with the
+    // same device id was given: the requester has proved nothing, so sharing,
+    // metadata browsing and the nickname all start over.
     let peer = Peer {
         device_id: req.device_id,
         name: req.name,
@@ -532,9 +540,9 @@ async fn pair(
         token_out: req.token,
         token_in: token_in.clone(),
         addr,
-        nickname,
-        share,
-        meta_view,
+        nickname: None,
+        share: super::Share::default(),
+        meta_view: false,
     };
     if let Err(e) = super::upsert_peer(&dir, peer) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e);
@@ -1263,9 +1271,10 @@ fn resolve_items(
     let mut out = Vec::new();
     for it in items {
         let root = shared_root(ctx, peer, &it.project_id)?;
-        let rel = super::files::safe_rel(&it.path).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        let abs = super::files::resolve_inside(&root, &it.path)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
         out.push(super::files::PackItem {
-            abs: root.join(rel),
+            abs,
             name: super::files::top_name(&it.project_name, &it.path),
         });
     }
@@ -1315,8 +1324,8 @@ async fn fs_exists(
         Ok(r) => r,
         Err(r) => return r,
     };
-    let dir = match super::files::safe_rel(&b.dir) {
-        Ok(d) => root.join(d),
+    let dir = match super::files::resolve_inside(&root, &b.dir) {
+        Ok(d) => d,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
     Json(json!({ "existing": super::files::conflicts(&dir, &b.names) })).into_response()
@@ -1446,10 +1455,13 @@ async fn fs_push(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Resp
         Ok(r) => r,
         Err(e) => return err(StatusCode::NOT_FOUND, e),
     };
-    let dir = match super::files::safe_rel(&dest.dir) {
-        Ok(d) => root.join(d),
+    let dir = match super::files::resolve_dest_dir(&root, &dest.dir) {
+        Ok(d) => d,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
+    // The policy and renames arrive after the prompt, so they are bounded by
+    // what the prompt showed: its names and its size.
+    let approval = t.upload_approval(&dest.project_id, &dest.dir);
     tracing::info!(device = %peer.device_id, dir = %dir.display(), "peer: receiving files");
     let (reader, tx) = super::files::ChannelReader::new();
     let handle = crate::transfers::begin(
@@ -1467,11 +1479,12 @@ async fn fs_push(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Resp
     let h = handle.clone();
     let dir_c = dir.clone();
     let unpacker = tokio::task::spawn_blocking(move || {
-        super::files::unpack(
+        super::files::unpack_approved(
             reader,
             &dir_c,
             dest.policy,
             &dest.renames,
+            &approval,
             &|| h.is_cancelled(),
             &|n| h.progress("downloading", n, 0),
         )
@@ -1523,14 +1536,14 @@ async fn fs_manifest(
             Ok(r) => r,
             Err(r) => return r,
         };
-        let rel = match super::files::safe_rel(&it.path) {
+        let abs = match super::files::resolve_inside(&root, &it.path) {
             Ok(r) => r,
             Err(e) => return err(StatusCode::BAD_REQUEST, e),
         };
         specs.push((
             it.project_id.clone(),
             it.path.trim_matches('/').to_string(),
-            root.join(rel),
+            abs,
             super::files::top_name(&it.project_name, &it.path),
         ));
     }
@@ -1576,8 +1589,8 @@ async fn fs_read(
         Ok(r) => r,
         Err(r) => return r,
     };
-    let path = match super::files::safe_rel(&b.path) {
-        Ok(r) => root.join(r),
+    let path = match super::files::resolve_inside(&root, &b.path) {
+        Ok(r) => r,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
     let mut file = match tokio::fs::File::open(&path).await {
@@ -1654,24 +1667,34 @@ async fn upload_begin(
         Ok(r) => r,
         Err(e) => return err(StatusCode::NOT_FOUND, e),
     };
-    let dest = match super::files::safe_rel(&b.dir) {
-        Ok(d) => root.join(d),
+    let dest = match super::files::resolve_dest_dir(&root, &b.dir) {
+        Ok(d) => d,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
+    let approval = t.upload_approval(&b.project_id, &b.dir);
+    let declared: u64 = b.entries.iter().map(|e| e.size).sum();
+    if approval.max_bytes.is_some_and(|limit| declared > limit) {
+        return err(
+            StatusCode::FORBIDDEN,
+            "the upload is larger than what was approved",
+        );
+    }
     let mut tops: Vec<String> = Vec::new();
     for e in &b.entries {
-        if super::files::safe_rel(&e.rel).is_err() {
-            return err(StatusCode::BAD_REQUEST, format!("invalid path: {}", e.rel));
+        match super::files::safe_rel(&e.rel) {
+            Ok(rel) if !super::files::has_hidden_component(&rel) => {}
+            _ => return err(StatusCode::BAD_REQUEST, format!("invalid path: {}", e.rel)),
         }
         let top = e.rel.split('/').next().unwrap_or_default().to_string();
         if !tops.contains(&top) {
             tops.push(top);
         }
     }
-    let (plan, summary) = match super::files::plan_tops(&dest, &tops, b.policy, &b.renames) {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e),
-    };
+    let (plan, summary) =
+        match super::files::plan_tops_approved(&dest, &tops, b.policy, &b.renames, &approval) {
+            Ok(p) => p,
+            Err(e) => return err(StatusCode::BAD_REQUEST, e),
+        };
     for e in b.entries.iter().filter(|e| e.is_dir) {
         if let Ok(Some(p)) = super::files::planned_target(&dest, &plan, &e.rel) {
             let _ = std::fs::create_dir_all(p);
@@ -1787,9 +1810,12 @@ fn upload_target(s: &UploadSession, rel: &str) -> Result<Option<(PathBuf, u64)>,
             format!("{rel} isn't part of this upload"),
         )
     })?;
-    super::files::planned_target(&s.dest, &s.plan, rel)
-        .map(|t| t.map(|t| (t, size)))
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e))
+    let target = super::files::planned_target(&s.dest, &s.plan, rel)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    if let Some(t) = &target {
+        super::files::ensure_inside(&s.dest, t).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    }
+    Ok(target.map(|t| (t, size)))
 }
 
 /// `POST /api/fs/upload/offset` — bytes already received for one file.
@@ -1870,6 +1896,14 @@ async fn upload_chunk(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) ->
                 break;
             }
             let Ok(chunk) = chunk else { break };
+            // A file may not grow past the size its entry declared, which is
+            // what the session's approved total was computed from.
+            if written + chunk.len() as u64 > size {
+                return err(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("{} is larger than its declared size", meta.rel),
+                );
+            }
             if let Err(e) = file.write_all(&chunk) {
                 return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
             }

@@ -1,0 +1,226 @@
+/* ── @pptx-editor.dev theme + layout ─────────────────────────────────
+   The editor declares its own `--background`, `--foreground`, `--border`…
+   as HSL triplets on `.pptx-editor`, shadowing the IDE's oklch tokens of
+   the same names inside that subtree. So the IDE tokens are captured under
+   private `--rp-*` names on the host (outside the editor scope), and the
+   editor's `--doc-*` chrome palette is mapped onto those. Everything here
+   stays under `.rustic-pptx-host`; the editor mounts its menus and tooltips
+   inside `.pptx-editor`, so no rule has to reach `document.body`. */
+.rustic-pptx-host {
+  --rp-bg: var(--background);
+  --rp-fg: var(--foreground);
+  --rp-card: var(--card);
+  --rp-popover: var(--popover);
+  --rp-popover-fg: var(--popover-foreground);
+  --rp-muted: var(--muted);
+  --rp-muted-fg: var(--muted-foreground);
+  --rp-accent: var(--accent);
+  --rp-primary: var(--primary);
+  --rp-primary-fg: var(--primary-foreground);
+  --rp-border: var(--border);
+  --rp-ring: var(--ring);
+  --rp-destructive: var(--destructive);
+  --rp-success: var(--success);
+  --rp-warning: var(--warning);
+  --rp-info: var(--info);
+  background: var(--background);
+  color: var(--foreground);
+}
+
+/* The slide itself is never themed: it keeps the deck's own colors. */
+.rustic-pptx-host .pptx-editor,
+.rustic-pptx-host .pptx-editor.dark {
+  --doc-font-ui: inherit;
+
+  --doc-surface: var(--rp-card);
+  --doc-popover-bg: var(--rp-popover);
+  --doc-popover-fg: var(--rp-popover-fg);
+  --doc-card: var(--rp-card);
+  --doc-bg: var(--rp-bg);
+  --doc-bg-subtle: var(--rp-muted);
+  --doc-bg-hover: color-mix(in oklab, var(--rp-fg) 9%, var(--rp-card));
+  --doc-bg-input: var(--rp-muted);
+
+  --doc-primary: var(--rp-primary);
+  --doc-primary-hover: color-mix(in oklab, var(--rp-primary) 84%, var(--rp-bg));
+  --doc-primary-light: color-mix(in oklab, var(--rp-primary) 16%, var(--rp-card));
+  --doc-accent: var(--rp-primary);
+  --doc-accent-bg: color-mix(in oklab, var(--rp-primary) 12%, var(--rp-card));
+  --doc-on-primary: var(--rp-primary-fg);
+  --doc-toggle-active-bg: color-mix(in oklab, var(--rp-fg) 14%, var(--rp-card));
+  --doc-toggle-active-fg: var(--rp-fg);
+  --doc-tooltip-bg: var(--rp-fg);
+  --doc-tooltip-text: var(--rp-bg);
+
+  --doc-text: var(--rp-fg);
+  --doc-text-muted: var(--rp-muted-fg);
+  --doc-text-subtle: color-mix(in oklab, var(--rp-muted-fg) 70%, var(--rp-card));
+  --doc-text-placeholder: color-mix(in oklab, var(--rp-muted-fg) 70%, var(--rp-card));
+
+  --doc-border: var(--rp-border);
+  --doc-border-light: var(--rp-border);
+  --doc-border-dark: color-mix(in oklab, var(--rp-fg) 22%, var(--rp-border));
+  --doc-border-input: var(--rp-muted-fg);
+
+  --doc-error: var(--rp-destructive);
+  --doc-error-bg: color-mix(in oklab, var(--rp-destructive) 14%, var(--rp-card));
+  --doc-success: var(--rp-success);
+  --doc-success-bg: color-mix(in oklab, var(--rp-success) 14%, var(--rp-card));
+  --doc-warning: var(--rp-warning);
+  --doc-warning-bg: color-mix(in oklab, var(--rp-warning) 14%, var(--rp-card));
+  --doc-warning-text: var(--rp-warning);
+  --doc-link: var(--rp-info);
+
+  --doc-focus-ring: var(--rp-ring);
+  --doc-selection: color-mix(in oklab, var(--rp-primary) 30%, transparent);
+  --doc-refresh-highlight-color: var(--rp-warning);
+}
+
+/* ── Layout (pptx-workspace.jsx) ─────────────────────────────────────
+   Top to bottom: slide, speaker notes (collapsed until asked for), one
+   control row, slide strip. */
+.rustic-pptx-host .pptx-default__main[data-view='slideSorter'] {
+  padding: 0 12px;
+}
+/* Substituted fonts: a warning icon in the control row and the list it opens. */
+.rustic-pptx-host .rustic-pptx-warn {
+  color: var(--doc-warning-text);
+}
+.rustic-pptx-host .pptx-menu.rustic-pptx-fonts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 280px;
+  padding: 12px;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.rustic-pptx-host .rustic-pptx-fonts p {
+  margin: 0;
+}
+.rustic-pptx-host .rustic-pptx-fonts__title {
+  font-weight: 600;
+  color: var(--doc-text);
+}
+.rustic-pptx-host .rustic-pptx-fonts__hint,
+.rustic-pptx-host .rustic-pptx-fonts__substitute {
+  color: var(--doc-text-muted);
+}
+.rustic-pptx-host .rustic-pptx-fonts__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+.rustic-pptx-host .rustic-pptx-fonts__list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.rustic-pptx-host .rustic-pptx-fonts__action {
+  align-self: flex-start;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--doc-border);
+  border-radius: var(--doc-radius-control, 7px);
+  background: var(--doc-bg-subtle);
+  color: var(--doc-text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.rustic-pptx-host .rustic-pptx-fonts__action:hover:not(:disabled) {
+  background: var(--doc-bg-hover);
+}
+.rustic-pptx-host .rustic-pptx-fonts__action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The control row: slide actions on the left; notes, view and zoom on the right. */
+.rustic-pptx-host .rustic-pptx-dock {
+  flex: none;
+  padding: 6px 12px 8px;
+}
+.rustic-pptx-host .pptx-statusbar.rustic-pptx-bar {
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.rustic-pptx-host .rustic-pptx-bar .pptx-zoom {
+  box-shadow: var(--doc-card-shadow);
+}
+.rustic-pptx-host .rustic-pptx-pill {
+  gap: 1px;
+}
+.rustic-pptx-host .rustic-pptx-contents {
+  display: contents;
+}
+.rustic-pptx-host .rustic-pptx-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: var(--doc-border);
+}
+.rustic-pptx-host .rustic-pptx-contents:empty + .rustic-pptx-sep {
+  display: none;
+}
+.rustic-pptx-host .rustic-pptx-chevron {
+  transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.rustic-pptx-host .is-closed .rustic-pptx-chevron {
+  transform: rotate(180deg);
+}
+
+/* Height animation for the notes and the strip: a grid row that goes from
+   0fr to 1fr follows the content's own height, so nothing is measured. */
+.rustic-pptx-host .rustic-pptx-collapse {
+  flex: none;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 240ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 180ms ease;
+}
+.rustic-pptx-host .rustic-pptx-collapse[data-open='true'] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.rustic-pptx-host .rustic-pptx-collapse__body {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+/* The body clips, so each card keeps room for its own shadow. */
+.rustic-pptx-host .rustic-pptx-notes .pptx-notes {
+  margin: 2px 12px 6px;
+}
+.rustic-pptx-host .rustic-pptx-strip .pptx-rail {
+  margin: 2px 12px 10px;
+}
+.rustic-pptx-host .pptx-rail[data-orientation='horizontal'] {
+  --pptx-rail-thumb-width: 128px;
+}
+/* The rail's own action box is empty: its buttons render in the control row. */
+.rustic-pptx-host .pptx-rail .pptx-rail__actions {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rustic-pptx-host .rustic-pptx-collapse,
+  .rustic-pptx-host .rustic-pptx-chevron {
+    transition: none;
+  }
+}

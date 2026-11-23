@@ -1,10 +1,11 @@
-// Palette generator for Rustic built-in themes. Each theme is a handful of
+// Palette generator for the themes Rustic seeds into the Theme Park (they were
+// built-ins until v0.8.6). Each theme is a handful of
 // OKLCH decisions (neutral hue/chroma, base lightness, accent, status hues);
 // every slot is derived from fixed per-mode lightness ladders and then nudged
 // until it meets its contrast target. Run: node scripts/gen-themes.mjs
 import { writeFileSync, readFileSync } from 'node:fs';
 
-const OUT = 'crates/rustic-app/themes';
+const OUT = 'website/seed-themes';
 
 // ── OKLCH → sRGB ──────────────────────────────────────────────────────────
 function oklchToLinear(L, C, h) {

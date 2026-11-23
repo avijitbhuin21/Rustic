@@ -26,7 +26,10 @@ use crate::context::ServerContext;
 /// Idle grace period for the agent-terminal auto-close: once an agent's shell
 /// has run at least one command and then sits at its prompt with no child
 /// process for this long, the monitor reclaims it.
+#[cfg(not(test))]
 const IDLE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const IDLE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the session-monitor thread polls (shell-exit + idle checks).
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the shell must sit at its prompt (no child process) before an
@@ -329,12 +332,23 @@ pub(crate) fn spawn_session_monitor(
             // can run commands in the user's terminal); idle auto-close
             // remains agent-only so a user's shell is never reclaimed.
             if let Some(pid) = pid {
-                let marker = ctx
+                let (marker, completed) = ctx
                     .state()
                     .terminal_manager
                     .lock()
                     .ok()
-                    .and_then(|m| m.command_in_flight_since(session_id));
+                    .map(|m| {
+                        (
+                            m.command_in_flight_since(session_id),
+                            m.command_completed(session_id),
+                        )
+                    })
+                    .unwrap_or((None, false));
+                // `run_command` finishes a fast command itself, off its end
+                // marker, without this thread ever seeing it run.
+                if completed {
+                    seen_running = true;
+                }
                 if marker != cmd_marker {
                     cmd_marker = marker;
                     cmd_seen_running = false;
@@ -428,7 +442,28 @@ pub(crate) fn spawn_session_monitor(
 
             std::thread::sleep(MONITOR_POLL_INTERVAL);
         }
+        // Every way out of the loop means the session is gone. Closing it only
+        // drops our end of the pty; end the shell and collect its status here,
+        // or each closed terminal leaves a zombie (or a live shell) behind.
+        rustic_terminal::reap_shell(&mut child);
     });
+}
+
+/// Close every agent terminal `task_id` started and drop its queued terminal
+/// notices. Called when the task is deleted: nothing is left to read them.
+pub(crate) fn close_task_terminals(ctx: &ServerContext, task_id: &str) {
+    let state = ctx.state();
+    let closed = state
+        .terminal_manager
+        .lock()
+        .map(|mut m| m.destroy_agent_sessions_for_task(task_id))
+        .unwrap_or_default();
+    if let Ok(mut exits) = state.agent_terminal_exits.lock() {
+        exits.remove(task_id);
+    }
+    if !closed.is_empty() {
+        emit_terminal_list_changed(ctx);
+    }
 }
 
 fn state_session_exists(ctx: &ServerContext, session_id: u64) -> bool {
@@ -1058,5 +1093,139 @@ impl AgentTerminals for ServerAgentTerminals {
                 created_at_ms: s.created_at_ms,
             })
             .collect()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod idle_close_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    static SEQ: AtomicU16 = AtomicU16::new(0);
+
+    /// Shared server state on its own data dir, with the runtime it was built under.
+    fn test_shared() -> (tokio::runtime::Runtime, Arc<crate::app::Shared>) {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("rustic-term-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = rustic_app::config::ServerConfig {
+            auth_password: "pw".to_string(),
+            session_secret: b"terminal-test-secret".to_vec(),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.clone(),
+            static_dir: dir,
+            session_ttl_secs: 3600,
+            login_max_attempts: 5,
+            login_lockout_secs: 300,
+            preview_domain: None,
+            cookie_domain: None,
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let shared = {
+            let _guard = rt.enter();
+            crate::build_shared(config).unwrap()
+        };
+        (rt, shared)
+    }
+
+    /// Poll `cond` until it holds or `within` elapses.
+    fn wait_until(within: Duration, cond: impl Fn() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// `run_command` usually sees a fast command's end marker before the
+    /// monitor's next poll and finishes it through `finish_command`. Such a
+    /// command never shows the monitor a child process, and the terminal must
+    /// still be reclaimed once it has sat idle.
+    #[test]
+    fn terminal_whose_command_was_finished_by_the_tool_idle_closes() {
+        let (rt, shared) = test_shared();
+        let ctx = shared.ctx.clone();
+        let broker = ServerAgentTerminals::new(ctx.clone());
+        let id = broker
+            .spawn(std::env::temp_dir(), "t".into(), "task-1", None)
+            .expect("spawn");
+
+        // A shell builtin: nothing is forked, so no poll can observe a child.
+        // No `expect_end`, so the monitor cannot win the race for the marker.
+        let line = " printf '\\137\\137RSTC_E_%s_%d\\n' 77 0";
+        broker
+            .send_command_line(id, "true", line, "task-1")
+            .expect("send");
+        assert!(
+            wait_until(Duration::from_secs(5), || broker
+                .read_output(id, 8 * 1024)
+                .is_ok_and(|o| o.contains("__RSTC_E_77_"))),
+            "end marker never reached the output"
+        );
+        broker.finish_command(id);
+        let pid = ctx
+            .state()
+            .terminal_manager
+            .lock()
+            .ok()
+            .and_then(|m| m.list_sessions().into_iter().find(|s| s.id == id))
+            .and_then(|s| s.pid)
+            .expect("shell pid");
+
+        assert!(
+            wait_until(IDLE_CLOSE_TIMEOUT + Duration::from_secs(5), || {
+                !state_session_exists(&ctx, id)
+            }),
+            "agent terminal was not reclaimed after its command finished"
+        );
+        // Tracker issue #19: the reclaimed shell must be gone, not a zombie.
+        #[cfg(unix)]
+        assert!(
+            wait_until(Duration::from_secs(6), || {
+                !std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            }),
+            "shell {pid} outlived its closed terminal"
+        );
+        let _ = pid;
+
+        drop(broker);
+        drop(ctx);
+        drop(shared);
+        drop(rt);
+    }
+
+    #[test]
+    fn agent_terminal_that_ran_nothing_is_not_reclaimed() {
+        let (rt, shared) = test_shared();
+        let ctx = shared.ctx.clone();
+        let broker = ServerAgentTerminals::new(ctx.clone());
+        let id = broker
+            .spawn(std::env::temp_dir(), "t".into(), "task-1", None)
+            .expect("spawn");
+
+        std::thread::sleep(IDLE_CLOSE_TIMEOUT + Duration::from_secs(2));
+        assert!(
+            state_session_exists(&ctx, id),
+            "a terminal that never ran a command must stay open"
+        );
+
+        broker.kill(id).expect("kill");
+        drop(broker);
+        drop(ctx);
+        drop(shared);
+        drop(rt);
     }
 }

@@ -54,6 +54,15 @@ pub struct TaskInfo {
     /// Active /goal completion condition; `None` when no goal is set.
     #[serde(default)]
     pub goal: Option<String>,
+    /// Extra turns the /goal loop has forced so far.
+    #[serde(default)]
+    pub goal_turns: u32,
+    /// `"blocked"` while the worker has reported it cannot go on.
+    #[serde(default)]
+    pub goal_status: Option<String>,
+    /// The reason that came with `goal_status`.
+    #[serde(default)]
+    pub goal_reason: Option<String>,
 }
 
 /// An `ask_user` call captured instead of executed because the host asked the
@@ -93,6 +102,15 @@ pub enum PermissionOp {
         /// Full content / config preview shown untruncated-enough to audit.
         preview: String,
     },
+    /// Call to an MCP tool its server does not mark read-only (send a
+    /// message, deploy, delete, …). Prompted in every mode but FullAuto.
+    McpTool {
+        tool: String,
+        /// Id of the server the call is routed to, when known.
+        server: Option<String>,
+        /// The call's arguments as pretty JSON, shown in full.
+        arguments: String,
+    },
 }
 
 impl PermissionOp {
@@ -130,15 +148,29 @@ impl PermissionOp {
                 format!("{}_{}", action, kind),
                 format!(
                     "{} {}: {}",
-                    if action == "uninstall" {
-                        "Uninstall"
-                    } else {
-                        "Install"
+                    match action.as_str() {
+                        "uninstall" => "Uninstall",
+                        "download" => "Download",
+                        _ => "Install",
                     },
                     kind.replace('_', " "),
                     name
                 ),
                 Some(preview.clone()),
+            ),
+            // The operation string is per tool, so "always allow" in the
+            // prompt covers that one tool and nothing else.
+            PermissionOp::McpTool {
+                tool,
+                server,
+                arguments,
+            } => (
+                format!("mcp:{tool}"),
+                match server {
+                    Some(server) => format!("Call MCP tool {tool} on server {server}"),
+                    None => format!("Call MCP tool {tool}"),
+                },
+                Some(arguments.clone()),
             ),
         }
     }

@@ -203,7 +203,19 @@ fn process_event(
                         );
                     }
                     let is_news = match action {
-                        "edited" | "reopened" => true,
+                        // The label approved the issue as it stood. A later
+                        // edit or reopen is acted on only from a trusted account.
+                        "edited" | "reopened" => {
+                            let (login, association) = issue_event_actor(payload);
+                            if !cfg.trusts(login, association) {
+                                tracing::info!(
+                                    repo = %repo, number, action, login,
+                                    "github webhook: issue change by an untrusted account ignored"
+                                );
+                                return Ok("ignored-untrusted-author");
+                            }
+                            true
+                        }
                         // Re-adding the label to a finished issue = "run again".
                         "labeled" => matches!(row.status.as_str(), "done" | "failed" | "manual"),
                         _ => false,
@@ -240,9 +252,23 @@ fn process_event(
             let Some(row) = existing else {
                 return Ok("ignored-untracked");
             };
+            // A comment becomes the agent's ask_user answer or extra context on
+            // an unattended FullAuto task, so only trusted accounts get through.
+            let login = payload["comment"]["user"]["login"].as_str().unwrap_or("");
+            let association = payload["comment"]["author_association"]
+                .as_str()
+                .unwrap_or("");
+            if !cfg.trusts(login, association) {
+                tracing::info!(
+                    repo = %repo, number, login, association,
+                    "github webhook: comment by an untrusted account ignored"
+                );
+                return Ok("ignored-untrusted-author");
+            }
             let payload_json = json!({
                 "body": body,
-                "author": payload["comment"]["user"]["login"].as_str().unwrap_or("unknown"),
+                "author": if login.is_empty() { "unknown" } else { login },
+                "association": association,
                 "comment_id": payload["comment"]["id"].as_i64().unwrap_or(0),
             })
             .to_string();
@@ -259,11 +285,93 @@ fn process_event(
     Ok(outcome)
 }
 
+/// Login and repo association of whoever triggered an `issues` event.
+///
+/// The payload carries an association only for the issue's author. GitHub lets
+/// nobody else edit or reopen an issue without triage access to the repo, so a
+/// sender who is not the author is reported as a collaborator.
+fn issue_event_actor(payload: &Value) -> (&str, &str) {
+    let sender = payload["sender"]["login"].as_str().unwrap_or("");
+    let author = payload["issue"]["user"]["login"].as_str().unwrap_or("");
+    if sender.is_empty() {
+        return ("", "");
+    }
+    if sender.eq_ignore_ascii_case(author) {
+        let association = payload["issue"]["author_association"]
+            .as_str()
+            .unwrap_or("");
+        (sender, association)
+    } else {
+        (sender, "COLLABORATOR")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::signature_valid;
+    use super::{issue_event_actor, signature_valid};
+    use crate::github::{normalize_logins, GithubAutoConfig};
     use hmac::{Hmac, Mac};
+    use serde_json::json;
     use sha2::Sha256;
+
+    #[test]
+    fn default_rule_trusts_repo_roles_only() {
+        let cfg = GithubAutoConfig::default();
+        for association in ["OWNER", "MEMBER", "COLLABORATOR", "owner"] {
+            assert!(cfg.trusts("someone", association), "{association}");
+        }
+        for association in [
+            "CONTRIBUTOR",
+            "FIRST_TIME_CONTRIBUTOR",
+            "FIRST_TIMER",
+            "MANNEQUIN",
+            "NONE",
+            "",
+        ] {
+            assert!(!cfg.trusts("someone", association), "{association:?}");
+        }
+    }
+
+    #[test]
+    fn a_login_allowlist_replaces_the_role_rule() {
+        let cfg = GithubAutoConfig {
+            allowed_logins: normalize_logins(&[
+                " @Alice ".to_string(),
+                "alice".to_string(),
+                String::new(),
+                "bob".to_string(),
+            ]),
+            ..GithubAutoConfig::default()
+        };
+        assert_eq!(
+            cfg.allowed_logins,
+            vec!["Alice".to_string(), "bob".to_string()]
+        );
+        assert!(cfg.trusts("alice", "NONE"));
+        assert!(cfg.trusts("BOB", ""));
+        assert!(!cfg.trusts("carol", "OWNER"));
+        assert!(!cfg.trusts("", "OWNER"));
+    }
+
+    #[test]
+    fn issue_edits_use_the_authors_association_only_for_the_author() {
+        let by_author = json!({
+            "sender": { "login": "reporter" },
+            "issue": { "user": { "login": "Reporter" }, "author_association": "NONE" },
+        });
+        assert_eq!(issue_event_actor(&by_author), ("reporter", "NONE"));
+        assert!(!GithubAutoConfig::default().trusts("reporter", "NONE"));
+
+        let by_maintainer = json!({
+            "sender": { "login": "maintainer" },
+            "issue": { "user": { "login": "reporter" }, "author_association": "NONE" },
+        });
+        let (login, association) = issue_event_actor(&by_maintainer);
+        assert!(GithubAutoConfig::default().trusts(login, association));
+
+        assert_eq!(issue_event_actor(&json!({})), ("", ""));
+        assert!(!GithubAutoConfig::default().trusts("", ""));
+    }
 
     #[test]
     fn signature_roundtrip() {

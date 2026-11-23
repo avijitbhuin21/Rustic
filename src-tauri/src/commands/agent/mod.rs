@@ -1,6 +1,7 @@
 // Submodules. Re-exported so existing handler paths like
 // `commands::agent::fetch_ai_models` keep resolving for tauri::generate_handler!.
 mod audio;
+mod inline_edit;
 mod mcp;
 mod memory;
 mod models;
@@ -9,6 +10,7 @@ mod project_defaults;
 mod runtime;
 mod source_control;
 pub use audio::*;
+pub use inline_edit::*;
 pub use mcp::*;
 pub use memory::*;
 pub use models::*;
@@ -344,6 +346,9 @@ pub async fn create_task(
             thinking_tier: None,
             pinned: false,
             goal: None,
+            goal_turns: 0,
+            goal_status: None,
+            goal_reason: None,
         };
 
         // Use project default permissions if available, otherwise in-memory project default
@@ -694,6 +699,9 @@ pub async fn send_message(
                 thinking_tier: None,
                 pinned: false,
                 goal: None,
+                goal_turns: 0,
+                goal_status: None,
+                goal_reason: None,
             })
             .map_err(|e| format!("Failed to persist task: {}", e))?;
         }
@@ -1560,12 +1568,14 @@ pub async fn send_message(
                 // token check and the memory write happen under ONE lock so
                 // a concurrent send (which pushes its user message and swaps
                 // the token inside the same lock) can never interleave.
+                // Copied before the lock is taken: see `sync_history_if_current`.
+                let snapshot = msgs.to_vec();
                 if let Ok(mut agent) = persist_agent_arc.lock() {
                     if rustic_app::host_ops::agent_history::sync_history_if_current(
                         &mut agent,
                         &persist_task_id,
                         &persist_cancel_token,
-                        msgs,
+                        snapshot,
                     ) {
                         tracing::info!(
                             target: "rustic::persist",
@@ -1576,14 +1586,9 @@ pub async fn send_message(
                     }
                 }
                 let persist_t0 = std::time::Instant::now();
-                let Ok(db) = persist_db_arc.lock() else {
-                    tracing::error!(
-                        target: "rustic::persist",
-                        task = %persist_task_id,
-                        "persist callback: db lock failed — messages NOT saved"
-                    );
-                    return;
-                };
+                // Rows are built before the database lock is taken, so the
+                // lock (which every DB-backed command waits on) is held only
+                // for the write itself.
                 let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let mut rows = Vec::with_capacity(msgs.len());
                 let mut skipped = 0usize;
@@ -1624,6 +1629,14 @@ pub async fn send_message(
                     });
                 }
                 let serialize_ms = persist_t0.elapsed().as_millis();
+                let Ok(db) = persist_db_arc.lock() else {
+                    tracing::error!(
+                        target: "rustic::persist",
+                        task = %persist_task_id,
+                        "persist callback: db lock failed — messages NOT saved"
+                    );
+                    return;
+                };
                 let db_t0 = std::time::Instant::now();
                 match db.upsert_messages_for_task(&persist_task_id, &rows) {
                     Ok(()) => {
@@ -1813,6 +1826,7 @@ pub async fn send_message(
             let cost_map = Arc::clone(&task_costs_arc);
             let cost_db = Arc::clone(&db_arc);
             let learn_agent_arc = Arc::clone(&agent_arc);
+            let status_cancel_token = Arc::clone(&cancel_token);
             // Track thinking start time so we can stamp duration_secs on thinking blocks
             let thinking_start: Arc<std::sync::Mutex<Option<std::time::Instant>>> =
                 Arc::new(std::sync::Mutex::new(None));
@@ -1835,8 +1849,18 @@ pub async fn send_message(
             let mut subagent_costs: std::collections::HashMap<(String, String), TaskCost> =
                 std::collections::HashMap::new();
             let mut event_rx = rustic_app::host_ops::stream_coalesce::batch_deltas(event_rx);
+            let output_db = Arc::clone(&cost_db);
+            let mut subagent_output =
+                rustic_app::host_ops::stream_coalesce::SubagentOutputWriter::new(
+                    move |task_id, agent_id, text| {
+                        if let Ok(db) = output_db.lock() {
+                            let _ = db.append_subagent_output(task_id, agent_id, text);
+                        }
+                    },
+                );
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
+                    subagent_output.before(&event);
                     match event {
                         TaskEvent::TextDelta { task_id, text } => {
                             // A text delta means thinking is done — record duration
@@ -1898,7 +1922,22 @@ pub async fn send_message(
                             let _ = app_events.emit("agent-tool-result", AgentToolResultEvent { task_id, tool_use_id, output, is_error });
                         }
                         TaskEvent::StatusChange { task_id, status } => {
-                            let _ = app_events.emit("agent-task-status", AgentStatusEvent { task_id, status });
+                            // A run replaced by a newer send no longer speaks
+                            // for the task: its late Cancelled would mark the
+                            // new run's tool calls stopped in the UI.
+                            let stale = learn_agent_arc
+                                .lock()
+                                .map(|agent| {
+                                    rustic_app::host_ops::agent_history::run_superseded(
+                                        &agent,
+                                        &task_id,
+                                        &status_cancel_token,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if !stale {
+                                let _ = app_events.emit("agent-task-status", AgentStatusEvent { task_id, status });
+                            }
                         }
                         TaskEvent::TaskComplete { task_id, summary } => {
                             let _ = app_events.emit("agent-task-complete", AgentTaskCompleteEvent {
@@ -2087,12 +2126,10 @@ pub async fn send_message(
                             let _ = app_events.emit("agent-subagent-failed", AgentSubagentFailedEvent { task_id, agent_id, error });
                         }
                         TaskEvent::SubagentTextDelta { task_id, agent_id, text } => {
-                            // Append the streamed delta to the durable output
-                            // buffer so the activity panel can replay this
-                            // run after a restart.
-                            if let Ok(db) = cost_db.lock() {
-                                let _ = db.append_subagent_output(&task_id, &agent_id, &text);
-                            }
+                            // Durable so the activity panel can replay this run
+                            // after a restart; written in batches (see
+                            // SubagentOutputWriter).
+                            subagent_output.push(&task_id, &agent_id, &text);
                             let _ = app_events.emit("agent-subagent-text-delta", AgentSubagentTextDeltaEvent { task_id, agent_id, text });
                         }
                         TaskEvent::SubagentThinkingDelta { task_id, agent_id, text } => {
@@ -2220,9 +2257,20 @@ pub async fn send_message(
                             // The executor already cleared the in-memory slot on
                             // "met"; mirror that into the DB so the goal doesn't
                             // resurrect on the next app start.
-                            if status == "met" {
-                                if let Ok(db) = cost_db.lock() {
+                            // Every other status records where the loop
+                            // stands, so a restart shows the same turn count
+                            // and a blocked goal stays blocked.
+                            if let Ok(db) = cost_db.lock() {
+                                if status == "met" {
                                     let _ = db.update_task_goal(&task_id, None);
+                                } else {
+                                    let blocked = status == "blocked";
+                                    let _ = db.update_task_goal_progress(
+                                        &task_id,
+                                        turns,
+                                        blocked.then_some("blocked"),
+                                        if blocked { reason.as_deref() } else { None },
+                                    );
                                 }
                             }
                             let _ = app_events.emit("agent-goal-update", AgentGoalUpdateEvent { task_id, status, condition, turns, reason });
@@ -2296,6 +2344,7 @@ pub async fn send_message(
             // DB write itself stays outside the lock — a stale DB write
             // landing after a newer run's persist is self-healing because
             // the newer run re-persists at every stable point.
+            let snapshot = messages.clone();
             let superseded = match agent_arc.lock() {
                 // Also syncs in-memory task messages with the executor's
                 // complete history (duration-stamped above) when current.
@@ -2303,7 +2352,7 @@ pub async fn send_message(
                     &mut agent,
                     &task_id_clone,
                     &cancel_token,
-                    &messages,
+                    snapshot,
                 ),
                 Err(_) => false,
             };
@@ -2415,7 +2464,13 @@ pub async fn send_message(
             // because the row was only updated to "Running" at task start and
             // never transitioned. The defensive code in list_tasks() used to
             // paper over this — we now fix it at the source.
-            {
+            //
+            // A run replaced by a newer send reports nothing: the task now
+            // belongs to that run, and a late Cancelled from here would mark
+            // it stopped (in memory, in the DB and in the UI) while it works.
+            // Re-checked under the lock because a send can land at any point
+            // after the writeback check above.
+            let stale_run = {
                 let status_str = match final_status {
                     TaskStatus::Preparing => "Preparing",
                     TaskStatus::Completed => "Completed",
@@ -2424,21 +2479,38 @@ pub async fn send_message(
                     TaskStatus::Running => "Running",
                     TaskStatus::WaitingOnSubagents => "Waiting",
                 };
-                if let Ok(db) = db_arc.lock() {
-                    let _ = db.update_task_status(&task_id_clone, status_str);
-                }
                 // Also update the in-memory task info so live UI state matches.
-                if let Ok(mut agent) = agent_arc.lock() {
-                    if let Some(t) = agent.tasks.get_mut(&task_id_clone) {
-                        t.info.status = final_status;
+                let stale = match agent_arc.lock() {
+                    Ok(mut agent) => {
+                        if rustic_app::host_ops::agent_history::run_superseded(
+                            &agent,
+                            &task_id_clone,
+                            &cancel_token,
+                        ) {
+                            true
+                        } else {
+                            if let Some(t) = agent.tasks.get_mut(&task_id_clone) {
+                                t.info.status = final_status;
+                            }
+                            false
+                        }
+                    }
+                    Err(_) => false,
+                };
+                if !stale {
+                    if let Ok(db) = db_arc.lock() {
+                        let _ = db.update_task_status(&task_id_clone, status_str);
                     }
                 }
-            }
+                stale
+            };
 
-            let _ = app_clone.emit("agent-task-status", AgentStatusEvent {
-                task_id: task_id_clone.clone(),
-                status: final_status,
-            });
+            if !stale_run {
+                let _ = app_clone.emit("agent-task-status", AgentStatusEvent {
+                    task_id: task_id_clone.clone(),
+                    status: final_status,
+                });
+            }
 
             // Park watcher: wakes when a child completes/fails/escalates and
             // re-enters send_message with the injection so the orchestrator
@@ -2804,10 +2876,11 @@ pub fn repair_task_history(
 
 #[tauri::command]
 pub async fn delete_task(
-    _app: AppHandle,
+    app: AppHandle,
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<(), String> {
+    crate::commands::terminal::close_task_terminals(&app, &task_id);
     // STEP 1: Signal cancellation BEFORE doing anything else. If the
     // executor is currently mid-turn (waiting on a provider response,
     // backing off after a 429, or running a tool), it polls this token
@@ -2907,7 +2980,7 @@ fn wipe_task_media_dirs(project_root: &str, task_id: &str) {
 
 #[tauri::command]
 pub async fn delete_tasks_for_project(
-    _app: AppHandle,
+    app: AppHandle,
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
@@ -2920,6 +2993,9 @@ pub async fn delete_tasks_for_project(
             .map(|(id, _)| id.clone())
             .collect()
     };
+    for tid in &project_task_ids {
+        crate::commands::terminal::close_task_terminals(&app, tid);
+    }
     // Signal cancel to every per-task executor before anything else; same
     // rationale as in `delete_task`. Without this, an executor mid-retry-
     // backoff (e.g. paused after a 429) would complete its next attempt
@@ -3025,6 +3101,9 @@ pub fn set_task_goal(
         let mut agent = state.agent.lock_safe();
         if let Some(task) = agent.tasks.get_mut(&task_id) {
             task.info.goal = goal.clone();
+            task.info.goal_turns = 0;
+            task.info.goal_status = None;
+            task.info.goal_reason = None;
             if let Ok(mut slot) = task.goal.lock() {
                 *slot = goal
                     .clone()

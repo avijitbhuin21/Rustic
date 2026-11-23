@@ -20,7 +20,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { useAgent, fetchImageDataUrl } from '@/state/agent';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { ToolCallCard } from './tool-call-card';
-import { AskUserInline } from './ask-user-inline';
+import { AskUserInline, AskUserFromTranscript } from './ask-user-inline';
 import { cn } from '@/lib/utils';
 import { useRelativeTime } from '@/lib/relative-time';
 import { activeChatRoot } from '@/lib/file-links';
@@ -106,7 +106,7 @@ function AssistantTextBlock({ block, isStreamingBlock }) {
 // the user can watch the thought form, collapses to a one-line "Reasoned for
 // Ns" once `done` flips true. Sits visually on the turn's dashed connecting
 // line via a punch-through bg on the icon wrapper.
-function ThinkingRow({ text, done, durationSecs, block }) {
+function ThinkingRow({ text, done, interrupted, durationSecs, block }) {
   const [open, setOpen] = useState(false);
   const { full } = useFullBlockField(block, 'thinking', open);
   const body = full ?? text;
@@ -130,7 +130,7 @@ function ThinkingRow({ text, done, durationSecs, block }) {
           </span>
         </span>
         <span className="min-w-0 flex-1 truncate font-medium text-muted-foreground">
-          {done ? `Reasoned for ${durationSecs ?? 0}s` : 'Thinking…'}
+          {interrupted ? 'Thinking stopped' : done ? `Reasoned for ${durationSecs ?? 0}s` : 'Thinking…'}
         </span>
         <ChevronDown
           className={cn(
@@ -868,6 +868,7 @@ function InjectedPromptCapsule({ label, preview, text }) {
 function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
   const { user } = turn;
   const blocks = useMemo(() => coalesceTextBlocks(turn.blocks), [turn.blocks]);
+  const chunks = useMemo(() => chunkBlocks(blocks), [blocks]);
   const { text: strippedText, paths: fileRefs0 } = stripFileRefsFooter(userText(user));
   const imageRefs = useMemo(() => {
     const fromAtt = (user?.attachments || []).map((a) => a?.relativePath || a?.path).filter(Boolean);
@@ -927,7 +928,7 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                 actions={userActions}
               />
             ) : (
-            <div className="rounded-md border border-border/50 bg-muted/60 px-3 py-2 backdrop-blur-sm">
+            <div data-ink-frame="card" className="rounded-md border border-border/50 bg-muted/60 px-3 py-2 backdrop-blur-sm">
               {attachments.length > 0 && (
                 <div className={cn('flex flex-wrap gap-2', text && 'mb-2')}>
                   {attachments.map((att, idx) => (
@@ -986,70 +987,26 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
           <div className="relative">
             <div className="pointer-events-none absolute bottom-2 left-[9px] top-2 border-l-2 border-dashed border-muted-foreground/25" />
             <div className="space-y-1">
-              {blocks.map(({ block, messageId, streaming }, idx) => {
-                if (block.type === 'text') {
-                  const isStreamingBlock = streaming && idx === blocks.length - 1;
-                  return (
-                    <AssistantTextBlock
-                      key={`${messageId}-${idx}`}
-                      block={block}
-                      isStreamingBlock={isStreamingBlock}
+              {chunks
+                ? chunks.map((chunk, ci) => (
+                    <BlockChunk
+                      key={`chunk-${ci}`}
+                      items={chunk}
+                      offset={ci * CHUNK_BLOCKS}
+                      isTail={ci === chunks.length - 1}
+                      eager={ci === 0 || ci === chunks.length - 1}
+                      heightKey={`${taskId}:${blocks[0]?.messageId}:${ci}`}
+                      toolResults={toolResults}
                     />
-                  );
-                }
-                if (block.type === 'thinking') {
-                  return (
-                    <ThinkingRow
-                      key={`${messageId}-${idx}`}
-                      block={block}
-                      text={block.text}
-                      done={!!block.done}
-                      durationSecs={block.durationSecs}
+                  ))
+                : blocks.map((entry, idx) => (
+                    <TurnBlock
+                      key={`${entry.messageId}-${idx}`}
+                      entry={entry}
+                      isLast={idx === blocks.length - 1}
+                      result={entry.block.type === 'tool_use' ? toolResults?.[entry.block.id] : undefined}
                     />
-                  );
-                }
-                if (block.type === 'tool_use') {
-                  const result = toolResults?.[block.id];
-                  return (
-                    <ToolCallCard
-                      key={`${messageId}-${idx}`}
-                      name={block.name}
-                      input={block.input}
-                      output={result?.output}
-                      isError={result?.is_error}
-                      truncated={result?.truncated}
-                      truncatedTaskId={result?.truncatedTaskId}
-                      truncatedSortOrder={result?.truncatedSortOrder}
-                      blockIndex={result?.blockIndex}
-                      timestamp={blocks[idx]?.timestamp}
-                    />
-                  );
-                }
-                if (block.type === 'image') {
-                  return (
-                    <div key={`${messageId}-${idx}`} className="pl-7">
-                      <ImageAttachment
-                        src={block.source?.url || block.url}
-                        galleryRef={block}
-                      />
-                    </div>
-                  );
-                }
-                if (block.type === 'ask_user') {
-                  return (
-                    <AskUserInline
-                      key={`${messageId}-${idx}`}
-                      requestId={block.request_id}
-                      questions={block.questions}
-                      answered={!!block.answered}
-                      answers={block.answers}
-                      cancelled={!!block.cancelled}
-                      interrupted={!!block.interrupted}
-                    />
-                  );
-                }
-                return null;
-              })}
+                  ))}
             </div>
           </div>
         </div>
@@ -1057,6 +1014,276 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
     </div>
   );
 }
+
+/** One assistant block of a turn: text, thinking, tool call, image or question. */
+function TurnBlock({ entry, isLast, result }) {
+  const { block, streaming, timestamp } = entry;
+  if (block.type === 'text') {
+    return <AssistantTextBlock block={block} isStreamingBlock={streaming && isLast} />;
+  }
+  if (block.type === 'thinking') {
+    return (
+      <ThinkingRow
+        block={block}
+        text={block.text}
+        done={!!block.done}
+        interrupted={!!block.interrupted}
+        durationSecs={block.durationSecs}
+      />
+    );
+  }
+  if (block.type === 'tool_use' && block.name === 'ask_user') {
+    return (
+      <>
+        <ToolCallCard
+          name={block.name}
+          input={block.input}
+          output={result?.output}
+          isError={result?.is_error}
+          interrupted={!!block.interrupted}
+          timestamp={timestamp}
+        />
+        <AskUserFromTranscript
+          messageId={entry.messageId}
+          input={block.input}
+          output={result?.output}
+          isError={result?.is_error}
+          interrupted={!!block.interrupted}
+        />
+      </>
+    );
+  }
+  if (block.type === 'tool_use') {
+    return (
+      <ToolCallCard
+        name={block.name}
+        input={block.input}
+        output={result?.output}
+        isError={result?.is_error}
+        interrupted={!!block.interrupted}
+        truncated={result?.truncated}
+        truncatedTaskId={result?.truncatedTaskId}
+        truncatedSortOrder={result?.truncatedSortOrder}
+        blockIndex={result?.blockIndex}
+        timestamp={timestamp}
+      />
+    );
+  }
+  if (block.type === 'image') {
+    return (
+      <div className="pl-7">
+        <ImageAttachment src={block.source?.url || block.url} galleryRef={block} />
+      </div>
+    );
+  }
+  if (block.type === 'ask_user') {
+    return (
+      <AskUserInline
+        requestId={block.request_id}
+        questions={block.questions}
+        answered={!!block.answered}
+        answers={block.answers}
+        cancelled={!!block.cancelled}
+        interrupted={!!block.interrupted}
+      />
+    );
+  }
+  return null;
+}
+
+// A turn can hold hundreds of tool calls. The transcript virtualises whole
+// turns, so such a turn used to mount every card at once. Past
+// WINDOW_MIN_BLOCKS a turn's blocks are grouped into chunks, and a chunk far
+// from the viewport is replaced by an empty box of the same height. The turn
+// keeps its single container, which the sticky user header and the connecting
+// line both depend on.
+const CHUNK_BLOCKS = 24;
+const WINDOW_MIN_BLOCKS = CHUNK_BLOCKS * 2;
+/** How far outside the viewport a chunk stays mounted. */
+const WINDOW_MARGIN_PX = 1200;
+
+// Last measured height per chunk, so a turn that scrolls back into the
+// transcript lays out at its real size instead of an estimate.
+const CHUNK_HEIGHTS = new Map();
+const CHUNK_HEIGHTS_MAX = 4000;
+
+/** Remember a chunk's height, dropping the oldest entry at the cap. */
+function rememberChunkHeight(key, height) {
+  CHUNK_HEIGHTS.delete(key);
+  if (CHUNK_HEIGHTS.size >= CHUNK_HEIGHTS_MAX) {
+    CHUNK_HEIGHTS.delete(CHUNK_HEIGHTS.keys().next().value);
+  }
+  CHUNK_HEIGHTS.set(key, height);
+}
+
+/** Rough height of a chunk that has never been rendered. */
+function estimateChunkHeight(items) {
+  let height = 0;
+  for (const { block } of items) {
+    if (block.type === 'text') {
+      height += Math.min(800, 28 + Math.ceil((block.text?.length || 0) / 80) * 18);
+    } else if (block.type === 'image') {
+      height += 200;
+    } else {
+      height += 30;
+    }
+    height += 4;
+  }
+  return height;
+}
+
+/** Split a turn's blocks into chunks, or `null` when the turn is short enough to render whole. */
+function chunkBlocks(blocks) {
+  if (blocks.length <= WINDOW_MIN_BLOCKS) return null;
+  const chunks = [];
+  for (let i = 0; i < blocks.length; i += CHUNK_BLOCKS) chunks.push(blocks.slice(i, i + CHUNK_BLOCKS));
+  return chunks;
+}
+
+/**
+ * The scroll container a turn is listed in (`scrollRef`) and the list's
+ * pinned-to-bottom flag (`stickRef`). Absent outside a virtual list; turns
+ * then render every block.
+ */
+export const TurnScrollContext = React.createContext(null);
+
+/** Marks a chunk element, so the list can tell a windowed turn from a plain one. */
+export const TURN_CHUNK_ATTR = 'data-turn-chunk';
+
+function BlockChunkInner({ items, offset, isTail, eager, heightKey, toolResults }) {
+  const scroll = React.useContext(TurnScrollContext);
+  const ref = useRef(null);
+  const [near, setNear] = useState(false);
+  // Anything that goes wrong finding the scroll container shows the blocks.
+  const [failOpen, setFailOpen] = useState(false);
+  const shown = eager || near || failOpen || !scroll;
+  const knownHeight = useRef(CHUNK_HEIGHTS.get(heightKey) ?? null);
+  // Height at the last measurement, to tell how much a change added or removed.
+  const lastHeight = useRef(null);
+
+  // Decide before the first paint when the scroll container is already known.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const root = scroll?.scrollRef?.current;
+    if (!el || !root) return;
+    const box = el.getBoundingClientRect();
+    const view = root.getBoundingClientRect();
+    if (box.bottom >= view.top - WINDOW_MARGIN_PX && box.top <= view.bottom + WINDOW_MARGIN_PX) {
+      setNear(true);
+    }
+  }, [scroll]);
+
+  useEffect(() => {
+    if (!scroll) return undefined;
+    const el = ref.current;
+    const root = scroll.scrollRef?.current;
+    if (!el || !root || typeof IntersectionObserver === 'undefined') {
+      setFailOpen(true);
+      return undefined;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => setNear(entries[entries.length - 1].isIntersecting),
+      { root, rootMargin: `${WINDOW_MARGIN_PX}px 0px` },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [scroll]);
+
+  // Keep what the user is looking at in place. The list does not correct the
+  // scroll offset for a windowed turn (it cannot tell where inside the turn a
+  // change happened), so each chunk does: a chunk that lies entirely above
+  // the viewport and changes height moves everything on screen by that much.
+  // A change at or below the top of the viewport needs no correction.
+  const measure = React.useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const height = el.offsetHeight;
+    const previous = lastHeight.current;
+    lastHeight.current = height;
+    if (previous === null || previous === height) return;
+    const root = scroll?.scrollRef?.current;
+    if (!root || scroll.stickRef?.current) return;
+    const wasBottom = el.getBoundingClientRect().top + previous;
+    if (wasBottom <= root.getBoundingClientRect().top) root.scrollTop += height - previous;
+  }, [scroll]);
+
+  // Runs before paint when the chunk swaps between placeholder and content.
+  useLayoutEffect(measure, [shown, measure]);
+
+  // Track the real height while mounted: cards settle and expand after mount.
+  useEffect(() => {
+    const el = ref.current;
+    if (!shown || !el || typeof ResizeObserver === 'undefined') return undefined;
+    const record = () => {
+      measure();
+      knownHeight.current = el.offsetHeight;
+      rememberChunkHeight(heightKey, el.offsetHeight);
+    };
+    record();
+    const observer = new ResizeObserver(record);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [shown, heightKey, measure]);
+
+  const marker = { [TURN_CHUNK_ATTR]: '' };
+  if (!shown) {
+    return (
+      <div
+        ref={ref}
+        {...marker}
+        aria-hidden
+        style={{ height: knownHeight.current ?? estimateChunkHeight(items) }}
+      />
+    );
+  }
+  return (
+    <div ref={ref} {...marker} className="space-y-1">
+      {items.map((entry, i) => (
+        <TurnBlock
+          key={`${entry.messageId}-${offset + i}`}
+          entry={entry}
+          isLast={isTail && i === items.length - 1}
+          result={entry.block.type === 'tool_use' ? toolResults?.[entry.block.id] : undefined}
+        />
+      ))}
+    </div>
+  );
+}
+
+/** True when two block entries render the same, given their tool results. */
+function blockEntryEqual(x, y, prevResults, nextResults) {
+  if (
+    x.block !== y.block ||
+    x.streaming !== y.streaming ||
+    x.messageId !== y.messageId ||
+    x.timestamp !== y.timestamp
+  ) {
+    return false;
+  }
+  return (
+    y.block.type !== 'tool_use' ||
+    toolResultEqual(prevResults?.[y.block.id], nextResults?.[y.block.id])
+  );
+}
+
+/** Lets settled chunks skip the re-render every streaming flush would otherwise cause. */
+function blockChunkPropsEqual(prev, next) {
+  if (
+    prev.offset !== next.offset ||
+    prev.isTail !== next.isTail ||
+    prev.eager !== next.eager ||
+    prev.heightKey !== next.heightKey ||
+    prev.items.length !== next.items.length
+  ) {
+    return false;
+  }
+  for (let i = 0; i < next.items.length; i++) {
+    if (!blockEntryEqual(prev.items[i], next.items[i], prev.toolResults, next.toolResults)) return false;
+  }
+  return true;
+}
+
+const BlockChunk = React.memo(BlockChunkInner, blockChunkPropsEqual);
 
 /** Reference equality for the {output, is_error} entries groupToolResults rebuilds each pass. */
 function toolResultEqual(a, b) {
@@ -1072,26 +1299,9 @@ function chatTurnPropsEqual(prev, next) {
   const b = next.turn;
   if (a !== b) {
     if (a.user !== b.user || a.blocks.length !== b.blocks.length) return false;
-    for (let i = 0; i < a.blocks.length; i++) {
-      const x = a.blocks[i];
-      const y = b.blocks[i];
-      if (
-        x.block !== y.block ||
-        x.streaming !== y.streaming ||
-        x.messageId !== y.messageId ||
-        x.timestamp !== y.timestamp
-      ) {
-        return false;
-      }
-    }
   }
-  for (const { block } of b.blocks) {
-    if (
-      block.type === 'tool_use' &&
-      !toolResultEqual(prev.toolResults?.[block.id], next.toolResults?.[block.id])
-    ) {
-      return false;
-    }
+  for (let i = 0; i < b.blocks.length; i++) {
+    if (!blockEntryEqual(a.blocks[i], b.blocks[i], prev.toolResults, next.toolResults)) return false;
   }
   return true;
 }

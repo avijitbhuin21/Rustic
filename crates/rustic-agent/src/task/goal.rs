@@ -14,6 +14,82 @@ use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, Role};
 /// loop by itself.
 pub const GOAL_COMPLETE_MARKER: &str = "<goal_complete>";
 
+/// Opening of the marker the worker model emits when the goal cannot be
+/// finished by it: `<goal_blocked reason="...">`. It stops the loop without an
+/// evaluator pass and hands the reason to the user. The goal stays set until
+/// the user sends a message (which clears it) or sets a new /goal.
+pub const GOAL_BLOCKED_TAG: &str = "<goal_blocked";
+
+/// What the goal loop should do with the assistant's final message of a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// The worker says it cannot go on; stop and show the reason.
+    Blocked(String),
+    /// The worker claims the goal is met; audit the claim.
+    Claimed,
+    /// Neither marker; re-arm the loop.
+    Continue,
+}
+
+/// Classify the assistant's final text. A blocked marker wins over a
+/// completion claim: a worker that reports a blocker has not finished.
+pub fn turn_end(text: &str) -> TurnEnd {
+    if let Some(reason) = blocked_reason(text) {
+        TurnEnd::Blocked(reason)
+    } else if claims_completion(text) {
+        TurnEnd::Claimed
+    } else {
+        TurnEnd::Continue
+    }
+}
+
+/// The reason carried by the last `<goal_blocked ...>` marker in `text`, or
+/// `None` when there is no marker. Accepts `reason="..."` in either quote
+/// style and the element form `<goal_blocked>reason</goal_blocked>`.
+pub fn blocked_reason(text: &str) -> Option<String> {
+    const FALLBACK: &str = "The agent reported it cannot finish this goal on its own.";
+    let start = text.rfind(GOAL_BLOCKED_TAG)?;
+    let rest = &text[start + GOAL_BLOCKED_TAG.len()..];
+    // `<goal_blocked_x>` or `<goal_blockedness>` is some other tag.
+    if !rest.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/') {
+        return None;
+    }
+    let clean = |s: &str| {
+        let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if s.is_empty() {
+            FALLBACK.to_string()
+        } else {
+            s
+        }
+    };
+
+    let attrs = rest.trim_start();
+    if let Some(value) = attrs.strip_prefix("reason").map(str::trim_start) {
+        if let Some(value) = value.strip_prefix('=').map(str::trim_start) {
+            if let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                let body = &value[1..];
+                // The reason may itself contain quotes or `>`: it ends at the
+                // first quote that is followed by the end of the tag.
+                let end = body.match_indices(quote).map(|(i, _)| i).find(|i| {
+                    let after = body[i + 1..].trim_start();
+                    after.starts_with('>') || after.starts_with("/>")
+                });
+                let reason = match end {
+                    Some(end) => &body[..end],
+                    None => body.lines().next().unwrap_or("").trim_end_matches(quote),
+                };
+                return Some(clean(reason));
+            }
+        }
+    }
+    // Element form, or a bare marker with the explanation after it.
+    let inner = rest.split_once('>').map_or("", |(_, after)| after);
+    let inner = inner.split("</goal_blocked>").next().unwrap_or("");
+    Some(clean(
+        inner.lines().find(|l| !l.trim().is_empty()).unwrap_or(""),
+    ))
+}
+
 /// An active /goal on a task: the completion condition plus loop stats.
 #[derive(Debug, Clone)]
 pub struct GoalState {
@@ -46,8 +122,21 @@ pub fn kickoff_message(condition: &str) -> String {
          output the marker {GOAL_COMPLETE_MARKER} in your final message. An \
          independent evaluator pass audits the transcript; false claims are \
          rejected and cost you a wasted turn.\n\
-         5. If the goal is genuinely impossible, say why in detail and output \
-         {GOAL_COMPLETE_MARKER} anyway so the evaluator can review your reasoning."
+         5. If what remains cannot be done by you at all (it needs a person, an \
+         approval, a credential, or access you do not have), do not keep \
+         looping and do not claim completion. Finish everything you can, then \
+         end your message with {GOAL_BLOCKED_TAG} reason=\"what is blocking and \
+         what the user must do\">. The loop stops and the user is shown the \
+         reason; they decide what happens next. Never use it for work that is \
+         merely hard or slow."
+    )
+}
+
+/// One-line reminder of the blocked marker, appended to loop re-prompts.
+fn blocked_hint() -> String {
+    format!(
+        "If the only thing left needs the user or something you cannot do, stop \
+         repeating yourself and end with {GOAL_BLOCKED_TAG} reason=\"...\"> instead."
     )
 }
 
@@ -60,7 +149,8 @@ pub fn continuation_message(condition: &str, evaluator_reason: Option<&str>) -> 
              The goal is still active: {condition}\n\n\
              Address the gap above with verifiable evidence, then output \
              {GOAL_COMPLETE_MARKER} again when the condition is truly met. \
-             Do not use ask_user; decide autonomously and note assumptions."
+             Do not use ask_user; decide autonomously and note assumptions. {}",
+            blocked_hint()
         ),
         None => format!(
             "[Goal loop — the goal is still active]\n\
@@ -68,7 +158,8 @@ pub fn continuation_message(condition: &str, evaluator_reason: Option<&str>) -> 
              Continue working. Produce verifiable evidence in the transcript \
              (test runs, build output, command results). When the condition is \
              completely true, output {GOAL_COMPLETE_MARKER}. Do not use ask_user; \
-             decide autonomously and note assumptions."
+             decide autonomously and note assumptions. {}",
+            blocked_hint()
         ),
     }
 }
@@ -311,5 +402,75 @@ mod tests {
     fn detects_marker() {
         assert!(claims_completion("done! <goal_complete>"));
         assert!(!claims_completion("still working on it"));
+    }
+
+    #[test]
+    fn blocked_marker_carries_its_reason() {
+        for (text, reason) in [
+            (
+                "All code is done.\n<goal_blocked reason=\"Needs the client's sign-off\">",
+                "Needs the client's sign-off",
+            ),
+            (
+                "<goal_blocked reason='no deploy token' />",
+                "no deploy token",
+            ),
+            (
+                "<goal_blocked reason=\"the check is `a > b`, \"quoted\", and\n  spans lines\">",
+                "the check is `a > b`, \"quoted\", and spans lines",
+            ),
+            (
+                "<goal_blocked>waiting for DNS</goal_blocked>",
+                "waiting for DNS",
+            ),
+            ("<goal_blocked reason = \"spaced\" >", "spaced"),
+            // The last marker is the one that counts.
+            (
+                "<goal_blocked reason=\"old\"> ... <goal_blocked reason=\"new\">",
+                "new",
+            ),
+            // Cut off before the closing quote.
+            ("<goal_blocked reason=\"out of budget", "out of budget"),
+        ] {
+            assert_eq!(blocked_reason(text).as_deref(), Some(reason), "{text}");
+        }
+        for bare in [
+            "<goal_blocked>",
+            "<goal_blocked reason=\"\">",
+            "<goal_blocked />",
+        ] {
+            let reason = blocked_reason(bare).expect("still a blocked marker");
+            assert!(reason.starts_with("The agent reported"), "{bare}: {reason}");
+        }
+        for text in [
+            "still working",
+            "<goal_blocked_by x>",
+            "<goal_blockedness>",
+            "goal_blocked",
+        ] {
+            assert_eq!(blocked_reason(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn turn_end_prefers_blocked_over_a_completion_claim() {
+        assert_eq!(turn_end("working"), TurnEnd::Continue);
+        assert_eq!(turn_end("done <goal_complete>"), TurnEnd::Claimed);
+        assert_eq!(
+            turn_end("<goal_complete> but <goal_blocked reason=\"needs approval\">"),
+            TurnEnd::Blocked("needs approval".into())
+        );
+    }
+
+    #[test]
+    fn every_loop_prompt_names_the_way_out() {
+        for prompt in [
+            kickoff_message("ship it"),
+            continuation_message("ship it", None),
+            continuation_message("ship it", Some("tests missing")),
+        ] {
+            assert!(prompt.contains("<goal_blocked reason=\""), "{prompt}");
+        }
+        assert!(!kickoff_message("x").contains("anyway"));
     }
 }

@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { marked } from 'marked';
-import DOMPurify from 'dompurify';
+import { sanitizeHtml } from '@/lib/sanitize-html';
 import { toast } from 'sonner';
 import CodeMirror from '@uiw/react-codemirror';
 import { python } from '@codemirror/lang-python';
@@ -56,9 +56,9 @@ function stripAnsi(s) {
 
 function renderMarkdown(text) {
   try {
-    return DOMPurify.sanitize(marked.parse(text || '', { gfm: true, breaks: true }));
+    return sanitizeHtml(marked.parse(text || '', { gfm: true, breaks: true }));
   } catch {
-    return DOMPurify.sanitize(text || '');
+    return sanitizeHtml(text || '');
   }
 }
 
@@ -99,7 +99,7 @@ function CellOutput({ output }) {
       );
     }
     if (data['text/html']) {
-      const html = DOMPurify.sanitize(joinSource(data['text/html']));
+      const html = sanitizeHtml(joinSource(data['text/html']));
       return (
         <div
           className="notebook-html-output overflow-x-auto px-3 py-1 text-xs [&_table]:border-collapse [&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-0.5 [&_th]:border [&_th]:border-border [&_th]:bg-muted/50 [&_th]:px-2 [&_th]:py-0.5"

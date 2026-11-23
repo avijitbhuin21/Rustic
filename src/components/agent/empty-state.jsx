@@ -1,5 +1,6 @@
 import React from 'react';
 import { cn } from '@/lib/utils';
+import { Doodle } from '@/components/ui/ink';
 
 // Shared empty-state block for the agent surface (dock tabs, sub-agent wait
 // state) so the icon + title + hint language stays consistent everywhere.
@@ -11,8 +12,9 @@ export function EmptyState({ icon: Icon, title, hint, iconClassName, className }
         className,
       )}
     >
+      <Doodle name="sparkle-trio" size={36} />
       {Icon && <Icon className={cn('size-5 text-muted-foreground/50', iconClassName)} />}
-      {title && <div className="font-medium text-foreground/80">{title}</div>}
+      {title && <div data-ink-title="" className="font-medium text-foreground/80">{title}</div>}
       {hint && <div className="text-[11px] italic leading-snug">{hint}</div>}
     </div>
   );

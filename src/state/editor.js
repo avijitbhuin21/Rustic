@@ -321,13 +321,19 @@ export const useEditor = create((set, get) => ({
       activeGroupId: groupId,
     })),
 
+  // Called on every keystroke. Only a group whose tab actually flips is
+  // rebuilt, and nothing is when the flag is unchanged: a new object for every
+  // group re-rendered every editor pane on each character typed.
   setDirty: (id, dirty) =>
-    set(s => ({
-      groups: (s.groups ?? []).map(g => ({
-        ...g,
-        tabs: g.tabs.map(t => t.id === id ? { ...t, dirty } : t),
-      })),
-    })),
+    set((s) => {
+      let changed = false;
+      const groups = (s.groups ?? []).map((g) => {
+        if (!g.tabs.some((t) => t.id === id && t.dirty !== dirty)) return g;
+        changed = true;
+        return { ...g, tabs: g.tabs.map((t) => (t.id === id ? { ...t, dirty } : t)) };
+      });
+      return changed ? { groups } : s;
+    }),
 
   // Move a tab from one group to another. Inserts before `beforeTabId` if given, else appends.
   moveTabToGroup: (tabId, fromGroupId, toGroupId, beforeTabId = null) => {

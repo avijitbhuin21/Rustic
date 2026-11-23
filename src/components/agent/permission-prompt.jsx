@@ -11,7 +11,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { cn } from '@/lib/utils';
-import { useAgent } from '@/state/agent';
+import { useAgent, canRememberPermission } from '@/state/agent';
 
 const DESTRUCTIVE_RE =
   /(\bdelete\b|\bremove\b|\brm\b|\brmdir\b|\bdel\b|\bdrop\b|--force|-f\b|\bforce\b|reset --hard|\bkill\b|\bterminate\b|\bdestroy\b|\bpurge\b|\buninstall\b|\bformat\b|\bwipe\b)/i;
@@ -140,7 +140,7 @@ export function PermissionPrompt() {
             </pre>
           </div>
         )}
-        {pending?.operation && (
+        {canRememberPermission(pending?.operation) && (
           <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
             <Checkbox
               checked={alwaysAllow}

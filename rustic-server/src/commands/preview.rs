@@ -12,7 +12,7 @@ use crate::api::{ok, parse, ApiError, PathArg};
 use crate::context::ServerContext;
 
 pub async fn dispatch(
-    _ctx: &ServerContext,
+    ctx: &ServerContext,
     command: &str,
     args: &Value,
 ) -> Option<Result<Value, ApiError>> {
@@ -30,6 +30,8 @@ pub async fn dispatch(
             Err(e) => Err(e),
         },
         "write_file_base64" => write_file_base64(args),
+        "pdf_edit" => pdf_edit(args).await,
+        "pdf_edit_save" => pdf_edit_save(args).await,
         "read_hex_chunk" => read_hex_chunk(args),
         "decode_image_preview"
         | "archive_list"
@@ -38,6 +40,9 @@ pub async fn dispatch(
         | "sqlite_rows"
         | "audio_overview"
         | "audio_pcm_chunk" => rich_preview(command, args).await,
+        "film_open" => film_open(ctx, args),
+        "film_close" => film_close(args),
+        "page_preview_open" => page_preview_open(ctx, args),
         _ => return None,
     })
 }
@@ -98,6 +103,59 @@ async fn rich_preview(command: &str, args: &Value) -> Result<Value, ApiError> {
     ok(out?)
 }
 
+/// Start a film-view session for an HTML page inside a project added to Rustic.
+fn film_open(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    use rustic_app::context::AppContext;
+    use rustic_app::sync_ext::MutexExt;
+    let a: PathArg = parse(args)?;
+    let roots: Vec<std::path::PathBuf> = ctx
+        .state()
+        .workspace
+        .lock_safe()
+        .list_projects()
+        .into_iter()
+        .map(|p| p.root_path)
+        .collect();
+    ok(rustic_app::film_preview::sessions().open(
+        std::path::Path::new(&a.path),
+        &roots,
+        &[ctx.data_dir()],
+        false,
+    )?)
+}
+
+/// Start a live HTML preview session (page scripts run sandboxed); closed with `film_close`.
+fn page_preview_open(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    use rustic_app::context::AppContext;
+    use rustic_app::sync_ext::MutexExt;
+    let a: PathArg = parse(args)?;
+    let roots: Vec<std::path::PathBuf> = ctx
+        .state()
+        .workspace
+        .lock_safe()
+        .list_projects()
+        .into_iter()
+        .map(|p| p.root_path)
+        .collect();
+    ok(rustic_app::film_preview::sessions().open_page(
+        std::path::Path::new(&a.path),
+        &roots,
+        &[ctx.data_dir()],
+        false,
+    )?)
+}
+
+/// End a film-view session.
+fn film_close(args: &Value) -> Result<Value, ApiError> {
+    #[derive(serde::Deserialize)]
+    struct A {
+        id: String,
+    }
+    let a: A = parse(args)?;
+    rustic_app::film_preview::sessions().close(&a.id);
+    ok(())
+}
+
 fn write_file_base64(args: &Value) -> Result<Value, ApiError> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -107,6 +165,41 @@ fn write_file_base64(args: &Value) -> Result<Value, ApiError> {
     }
     let a: A = parse(args)?;
     ok(preview_ops::write_file_base64(&a.path, &a.data)?)
+}
+
+async fn pdf_edit(args: &Value) -> Result<Value, ApiError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        path: String,
+        #[serde(default)]
+        ops: Vec<rustic_agent::tools::pdf_edit::PdfEditOp>,
+        page: u32,
+        want_pdf: Option<bool>,
+    }
+    let a: A = parse(args)?;
+    let out = tokio::task::spawn_blocking(move || {
+        preview_ops::pdf_edit(&a.path, a.ops, a.page, a.want_pdf.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| ApiError::from(e.to_string()))?;
+    ok(out?)
+}
+
+/// Replays PDF content edits and overwrites the file with the result.
+async fn pdf_edit_save(args: &Value) -> Result<Value, ApiError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        path: String,
+        #[serde(default)]
+        ops: Vec<rustic_agent::tools::pdf_edit::PdfEditOp>,
+    }
+    let a: A = parse(args)?;
+    let out = tokio::task::spawn_blocking(move || preview_ops::pdf_edit_save(&a.path, a.ops))
+        .await
+        .map_err(|e| ApiError::from(e.to_string()))?;
+    ok(out?)
 }
 
 fn read_hex_chunk(args: &Value) -> Result<Value, ApiError> {

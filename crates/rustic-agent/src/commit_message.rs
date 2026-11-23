@@ -32,7 +32,7 @@ pub struct CommitMessageRequest {
 
 /// Build the provider adapter for a provider-key / type string, mirroring the
 /// routing used for sub-agents (type string decides, never the model name).
-fn provider_for(provider_type: &str) -> Arc<dyn AiProvider> {
+pub(crate) fn provider_for(provider_type: &str) -> Arc<dyn AiProvider> {
     if provider_type == "Claude" {
         Arc::new(ClaudeProvider::new())
     } else if provider_type == "OpenAi" {

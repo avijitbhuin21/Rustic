@@ -108,6 +108,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "028_external_agent_sessions",
         include_str!("migrations/028_external_agent_sessions.sql"),
     ),
+    (
+        "029_messages_task_index",
+        include_str!("migrations/029_messages_task_index.sql"),
+    ),
+    (
+        "030_task_goal_progress",
+        include_str!("migrations/030_task_goal_progress.sql"),
+    ),
 ];
 
 pub struct Database {
@@ -306,6 +314,41 @@ mod tests {
                 )
                 .unwrap();
             assert!(exists, "migration {} did not record", name);
+        }
+    }
+
+    /// The query plan SQLite picks for `sql`, one step per line.
+    fn plan(db: &Database, sql: &str) -> String {
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        rows.join("\n")
+    }
+
+    #[test]
+    fn per_task_message_queries_use_the_index_not_a_table_scan() {
+        let db = Database::in_memory().expect("init");
+        for sql in [
+            "SELECT id, role, content_json FROM messages WHERE task_id = 't' ORDER BY sort_order",
+            "SELECT sort_order, created_at FROM messages WHERE task_id = 't'",
+            "SELECT content_json FROM messages WHERE task_id = 't' AND sort_order = 3",
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE task_id = 't'",
+            "DELETE FROM messages WHERE task_id = 't'",
+            "DELETE FROM messages WHERE task_id = 't' AND sort_order >= 3",
+        ] {
+            let plan = plan(&db, sql);
+            assert!(plan.contains("idx_messages_task_sort"), "{sql}\n{plan}");
+            assert!(!plan.contains("SCAN"), "{sql}\n{plan}");
+            assert!(
+                !plan.contains("TEMP B-TREE"),
+                "sorted without the index: {sql}\n{plan}"
+            );
         }
     }
 }

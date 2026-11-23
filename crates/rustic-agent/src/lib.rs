@@ -7,6 +7,7 @@ pub mod file_history;
 pub mod file_tree;
 pub mod history_dto;
 pub mod index;
+pub mod inline_edit;
 pub mod io_util;
 pub mod mcp;
 pub mod media_maintenance;

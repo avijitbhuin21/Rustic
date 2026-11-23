@@ -65,8 +65,25 @@ pub fn format_terminal_notices(notices: &[AgentTerminalExit]) -> String {
          below and decide whether to verify results, restart, fix a bug, or \
          proceed.\n",
     );
+    // A terminal reclaimed between its command finishing and this batch being
+    // delivered has both a CommandFinished and an Exited notice. Report it
+    // once, as closed: saying "still open" and then "exited" sends the model
+    // to a terminal that is gone.
+    let finished: std::collections::HashSet<u64> = notices
+        .iter()
+        .filter(|n| n.kind == TerminalNoticeKind::CommandFinished)
+        .map(|n| n.session_id)
+        .collect();
+    let exited: std::collections::HashSet<u64> = notices
+        .iter()
+        .filter(|n| n.kind == TerminalNoticeKind::Exited)
+        .map(|n| n.session_id)
+        .collect();
     for n in notices {
         if n.kind == TerminalNoticeKind::Exited && n.output_delivered {
+            if finished.contains(&n.session_id) {
+                continue;
+            }
             body.push_str(&format!(
                 "\n— Terminal #{} ({}): the shell process exited — the terminal is no \
                  longer running. Its last command had already finished and its output \
@@ -76,11 +93,20 @@ pub fn format_terminal_notices(notices: &[AgentTerminalExit]) -> String {
             continue;
         }
         match n.kind {
+            TerminalNoticeKind::CommandFinished if exited.contains(&n.session_id) => {
+                body.push_str(&format!(
+                    "\n— Terminal #{} ({}): command finished, and the terminal has \
+                     since closed. Its last output is below and stays readable with \
+                     read_terminal_output; a new run_command starts a fresh terminal.",
+                    n.session_id, n.label
+                ));
+            }
             TerminalNoticeKind::CommandFinished => {
                 body.push_str(&format!(
                     "\n— Terminal #{} ({}): command finished; the terminal is still \
-                     open (reuse it with run_command or read more output with \
-                     read_terminal_output).",
+                     open for now (reuse it with run_command or read more output with \
+                     read_terminal_output). An idle agent terminal closes on its own \
+                     shortly after; its last output stays readable.",
                     n.session_id, n.label
                 ));
             }
@@ -247,6 +273,42 @@ mod tests {
         assert!(!body.contains("nothing to commit"), "{body}");
         assert!(!body.contains("Last command"), "{body}");
         assert!(!body.contains("Output (tail)"), "{body}");
+    }
+
+    /// Tracker issue #14: a terminal that closed before its finish notice was
+    /// delivered is reported once, as closed — never as "still open".
+    #[test]
+    fn finished_then_closed_terminal_is_reported_once_as_closed() {
+        let body = format_terminal_notices(&[
+            notice(TerminalNoticeKind::CommandFinished, false),
+            notice(TerminalNoticeKind::Exited, true),
+        ]);
+        assert_eq!(body.matches("— Terminal #7").count(), 1, "{body}");
+        assert!(body.contains("has since closed"), "{body}");
+        assert!(!body.contains("still open"), "{body}");
+        assert!(!body.contains("shell process exited"), "{body}");
+        assert!(
+            body.contains("Output (tail):\n```\nnothing to commit\n```"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn finished_notice_for_another_terminal_keeps_its_own_exit_notice() {
+        let mut other = notice(TerminalNoticeKind::Exited, true);
+        other.session_id = 8;
+        let body =
+            format_terminal_notices(&[notice(TerminalNoticeKind::CommandFinished, false), other]);
+        assert!(
+            body.contains(
+                "Terminal #7 (agent: git): command finished; the terminal is still open for now"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("Terminal #8 (agent: git): the shell process exited"),
+            "{body}"
+        );
     }
 
     #[test]
