@@ -24,8 +24,12 @@ WORKDIR /app
 COPY --from=build /build/target/release/rustic-website /usr/local/bin/rustic-website
 COPY static /app/static
 COPY issue-actions.json /app/issue-actions.json
+COPY theme-actions.json /app/theme-actions.json
+COPY seed-themes /app/seed-themes
 ENV WEBSITE_STATIC_DIR=/app/static \
     ISSUE_ACTIONS_FILE=/app/issue-actions.json \
+    THEME_ACTIONS_FILE=/app/theme-actions.json \
+    THEME_SEEDS_DIR=/app/seed-themes \
     PORT=8080
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

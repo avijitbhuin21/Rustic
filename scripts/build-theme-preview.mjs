@@ -35,4 +35,6 @@ await build({
 });
 renameSync(path.join(outDir, 'theme-preview.html'), path.join(outDir, 'index.html'));
 copyFileSync(path.join(root, 'src/theme-preview/host.js'), path.join(park, 'preview-host.js'));
+// Default colors for every slot, used by the Theme Park page.
+copyFileSync(path.join(root, 'src/lib/theme-bases.json'), path.join(park, 'bases.json'));
 console.log(`theme preview -> ${path.relative(root, outDir)}`);

@@ -1,0 +1,47 @@
+/* Theme Park page. Built on the tracker's styles (issues.css) and the site tokens; only what is new lives here. */
+.park-grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }
+.park-grid:empty { display: none; }
+.park-card { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--radius, 0); background: var(--bg-2); overflow: hidden; cursor: pointer; transition: border-color 0.2s, transform 0.2s; }
+.park-card:hover, .park-card:focus-visible { border-color: var(--fg-3); outline: none; transform: translateY(-2px); }
+.park-shot { display: flex; flex-direction: column; gap: 6px; height: 132px; padding: 12px; }
+.park-shot-bar { display: flex; gap: 5px; }
+.park-shot-bar i { width: 26px; height: 6px; border-radius: 3px; }
+.park-shot-lines { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.park-shot-lines i { height: 6px; border-radius: 3px; }
+.park-shot-pill { align-self: flex-start; margin-top: auto; padding: 4px 12px; border-radius: 999px; font-size: 0.7rem; font-family: var(--mono); }
+.park-shots { display: grid; }
+.park-shots.two { grid-template-columns: 1fr 1fr; }
+.park-card-body { padding: 12px 14px 14px; border-top: 1px solid var(--line); }
+.park-card-title { margin: 0; font-size: 1rem; font-weight: 600; overflow-wrap: anywhere; }
+.park-card-desc { margin: 4px 0 0; color: var(--fg-3); font-size: 0.82rem; line-height: 1.45; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.park-skel { height: 220px; border: 1px solid var(--line); border-radius: var(--radius, 0); background: linear-gradient(90deg, transparent, var(--accent-soft), transparent) var(--bg-2); background-size: 200% 100%; animation: iss-shimmer 1.2s linear infinite; }
+
+.park-dialog { width: min(1040px, calc(100% - 32px)); overflow-y: auto; }
+.park-desc { margin: 10px 0 0; color: var(--fg-2); line-height: 1.55; overflow-wrap: anywhere; }
+.park-desc:empty { display: none; }
+.park-bar { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0 12px; }
+.park-preview { border: 1px solid var(--line-2); border-radius: var(--radius-sm, 0); overflow: hidden; background: var(--bg); }
+.park-dialog .iss-note { margin-top: 12px; }
+.park-creator .iss-note { margin: 0; }
+.park-dialog .iss-actions { margin-top: 14px; flex-wrap: wrap; }
+.park-file { cursor: pointer; }
+
+.park-split { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 20px; align-items: start; }
+.park-fields { display: flex; flex-direction: column; gap: 12px; max-height: 62vh; overflow-y: auto; padding-right: 6px; }
+.park-side { position: sticky; top: 0; }
+.park-group { margin: 10px 0 0; font-size: 0.72rem; font-family: var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-3); }
+.park-slots { display: grid; gap: 6px; margin-top: 8px; }
+.park-slot { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 5px 8px; border: 1px solid var(--line-2); border-radius: var(--radius-sm, 0); background: var(--bg); }
+.park-slot.bad { border-color: var(--orange); }
+.park-slot input[type="color"] { flex: none; width: 24px; height: 24px; padding: 0; border: 0; background: none; cursor: pointer; }
+.park-slot span { flex: none; width: 128px; color: var(--fg-3); font-family: var(--mono); font-size: 0.68rem; overflow: hidden; text-overflow: ellipsis; }
+.park-slot input[type="text"] { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--fg); font-family: var(--mono); font-size: 0.74rem; }
+.park-styles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.park-styles .iss-field input, .park-styles .iss-field select { padding: 7px 9px; font-size: 0.82rem; }
+.park-problems { margin: 10px 0 0; padding: 10px 12px 10px 28px; border-radius: var(--radius-sm, 0); background: color-mix(in oklab, var(--orange) 12%, transparent); color: var(--orange); font-size: 0.8rem; line-height: 1.5; }
+
+@media (max-width: 860px) {
+  .park-split { grid-template-columns: 1fr; }
+  .park-fields { max-height: none; }
+  .park-side { position: static; order: -1; }
+}

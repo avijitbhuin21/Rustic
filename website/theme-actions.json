@@ -1,0 +1,4 @@
+{
+  "_help": "Moderation for Theme Park, applied on every deploy. Each action runs once (tracked by its unique id; never reuse one). op: hide | unhide. A hidden theme stays stored, so the same file cannot be shared again. Example: { \"id\": \"2026-11-24-hide-12\", \"op\": \"hide\", \"theme\": 12 }",
+  "actions": []
+}

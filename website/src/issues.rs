@@ -117,6 +117,11 @@ impl IssuesState {
         Self { db: Some(pool), limiter: Arc::default() }
     }
 
+    /// The database pool, for the other APIs that share it.
+    pub fn pool(&self) -> Option<PgPool> {
+        self.db.clone()
+    }
+
     /// True when `ip` may create another issue now (does not record the attempt).
     fn may_create(&self, ip: IpAddr) -> bool {
         let mut map = self.limiter.lock().unwrap_or_else(|p| p.into_inner());
@@ -174,7 +179,7 @@ fn db_err(e: sqlx::Error) -> Response {
 /// Checked against Railway's edge on 23 Nov 2026: it discards a client-sent
 /// `X-Forwarded-For` and `X-Real-IP` and writes its own, so the first hop is
 /// the connecting address. Only `X-Real-IP` is in Railway's documentation.
-fn client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
+pub(crate) fn client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
