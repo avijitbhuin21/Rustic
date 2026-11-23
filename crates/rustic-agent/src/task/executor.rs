@@ -3204,17 +3204,18 @@ impl TaskExecutor {
                 }
             }
 
-            // Smart concurrency: read-only tools run in parallel, write tools run sequentially after.
-            // This prevents race conditions on writes while maximizing throughput for reads.
+            // Smart concurrency: the read-only tools that lead the response run in
+            // parallel, everything from the first write tool on runs one at a time in
+            // the order the model sent it (see `schedule_tool_uses`).
             // MCP tools their server annotates `readOnlyHint` join the parallel batch.
             // The hint only affects scheduling: in plan mode every MCP tool stays in
             // the write set, so the plan-mode gate below still rejects it.
-            let (read_only_tools, mut write_tools): (Vec<_>, Vec<_>) =
-                tool_uses.iter().partition(|(_, name, _)| {
+            let (read_only_tools, mut write_tools) =
+                schedule_tool_uses(&tool_uses, context.is_plan_mode, |name| {
                     BuiltinTools::is_read_only(name)
                         || (!context.is_plan_mode
                             && !BuiltinTools::is_builtin(name)
-                            && context.mcp_read_only_tools.contains_key(name.as_str()))
+                            && context.mcp_read_only_tools.contains_key(name))
                 });
 
             let mut results: Vec<(String, ToolOutput)> = Vec::new();
@@ -5051,6 +5052,105 @@ mod mcp_gate_tests {
                 .respond_with_decision(&request_id, NativePermissionDecision::Deny);
             assert!(other.await.unwrap().is_some());
         }
+    }
+}
+
+/// One tool call of a response: (id, name, input).
+type ToolUse = (String, String, serde_json::Value);
+
+/// Split a response's tool calls into the batch that runs in parallel first and
+/// the list that runs afterwards, one at a time, in the order sent.
+///
+/// Only the read-only calls BEFORE the first write tool are batched. A read
+/// that follows a write stays behind it: the model put it there to see what the
+/// write or command produced, and running it first returns the old content
+/// (tracker #22: a screenshot read sent after the command that re-took it).
+/// In plan mode writes are refused without running, so order cannot matter and
+/// every read is batched.
+fn schedule_tool_uses(
+    tool_uses: &[ToolUse],
+    plan_mode: bool,
+    is_read_only: impl Fn(&str) -> bool,
+) -> (Vec<&ToolUse>, Vec<&ToolUse>) {
+    if plan_mode {
+        return tool_uses
+            .iter()
+            .partition(|(_, name, _)| is_read_only(name));
+    }
+    let first_write = tool_uses
+        .iter()
+        .position(|(_, name, _)| !is_read_only(name))
+        .unwrap_or(tool_uses.len());
+    let (leading, rest) = tool_uses.split_at(first_write);
+    (leading.iter().collect(), rest.iter().collect())
+}
+
+#[cfg(test)]
+mod tool_schedule_tests {
+    use super::{schedule_tool_uses, ToolUse};
+
+    fn calls(names: &[&str]) -> Vec<ToolUse> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (format!("id{i}"), n.to_string(), serde_json::json!({})))
+            .collect()
+    }
+
+    fn ids(list: &[&ToolUse]) -> Vec<String> {
+        list.iter().map(|(id, _, _)| id.clone()).collect()
+    }
+
+    fn is_read(name: &str) -> bool {
+        matches!(name, "read_file" | "grep_search" | "glob")
+    }
+
+    #[test]
+    fn a_read_sent_after_a_command_runs_after_it() {
+        let uses = calls(&["run_command", "read_file", "read_file"]);
+        let (batch, ordered) = schedule_tool_uses(&uses, false, is_read);
+        assert!(batch.is_empty(), "nothing may run before the command");
+        assert_eq!(ids(&ordered), ["id0", "id1", "id2"]);
+    }
+
+    #[test]
+    fn leading_reads_are_batched_and_the_rest_keeps_its_order() {
+        let uses = calls(&[
+            "read_file",
+            "grep_search",
+            "edit_file",
+            "read_file",
+            "run_command",
+            "glob",
+        ]);
+        let (batch, ordered) = schedule_tool_uses(&uses, false, is_read);
+        assert_eq!(ids(&batch), ["id0", "id1"]);
+        assert_eq!(ids(&ordered), ["id2", "id3", "id4", "id5"]);
+    }
+
+    #[test]
+    fn only_reads_or_only_writes() {
+        let reads = calls(&["read_file", "glob", "grep_search"]);
+        let (batch, ordered) = schedule_tool_uses(&reads, false, is_read);
+        assert_eq!((batch.len(), ordered.len()), (3, 0));
+
+        let writes = calls(&["edit_file", "run_command"]);
+        let (batch, ordered) = schedule_tool_uses(&writes, false, is_read);
+        assert_eq!(
+            (batch.len(), ids(&ordered)),
+            (0, vec!["id0".to_string(), "id1".to_string()])
+        );
+
+        let (batch, ordered) = schedule_tool_uses(&[], false, is_read);
+        assert!(batch.is_empty() && ordered.is_empty());
+    }
+
+    #[test]
+    fn plan_mode_batches_every_read_because_writes_never_run() {
+        let uses = calls(&["edit_file", "read_file", "run_command", "glob"]);
+        let (batch, blocked) = schedule_tool_uses(&uses, true, is_read);
+        assert_eq!(ids(&batch), ["id1", "id3"]);
+        assert_eq!(ids(&blocked), ["id0", "id2"]);
     }
 }
 

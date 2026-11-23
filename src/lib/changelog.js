@@ -24,6 +24,7 @@ export const CHANGELOG = [
       { tag: 'fixed', text: 'Agent search: `include` and `exclude` patterns with `{a,b}` alternatives and folder prefixes now match. Theme tools the agent loads on demand no longer fail with "unknown tool".' },
       { tag: 'fixed', text: 'Pasting a screenshot into the chat box works again after a PowerPoint file has been opened.' },
       { tag: 'fixed', text: 'Agent terminal output no longer shows part of Rustic\'s own command wrapper after a long command line.' },
+      { tag: 'fixed', text: 'When the agent sends a command and a file read in one step, the read now runs after the command. It used to run first, so the agent could look at a file or screenshot from before the command changed it.' },
     ],
   },
   {
